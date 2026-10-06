@@ -153,6 +153,27 @@ kbd { font-family: var(--font-mono); font-size: 11px; border: 1px solid currentC
 .car-tag.action:hover { background: #127a3c; }
 .car-tag::after { content: ""; position: absolute; left: 50%; bottom: -5px; width: 10px; height: 10px; background: var(--car); transform: translateX(-50%) rotate(45deg); z-index: -1; }
 
+/* 단계 신호등 */
+:root { --lamp-red: #ff4b3e; --lamp-yellow: #ffc81e; --lamp-green: #3ee06b; --lamp-off: #3a3d42; }
+.sign-row { display: flex; align-items: flex-start; gap: 14px; }
+.lap.l .sign-row { justify-content: flex-end; }
+.tlight { position: relative; isolation: isolate; display: inline-flex; flex-direction: column; gap: 5px; padding: 7px 6px; border-radius: 10px; background: #222428; box-shadow: inset 0 0 0 2px #34373c, 0 4px 0 rgba(0,0,0,.25); margin-top: 2px; }
+.tlight::after { content: ""; position: absolute; z-index: -1; left: 50%; bottom: -30px; width: 8px; height: 32px; transform: translateX(-50%); background: var(--post); border-radius: 0 0 2px 2px; }
+.tlight i { display: block; width: 16px; height: 16px; border-radius: 50%; background: var(--lamp-off); box-shadow: inset 0 2px 3px rgba(0,0,0,.45); }
+.tlight.red .l-red { background: var(--lamp-red); box-shadow: 0 0 10px 2px rgba(255,75,62,.75), inset 0 -2px 3px rgba(0,0,0,.2); }
+.tlight.yellow .l-yellow { background: var(--lamp-yellow); box-shadow: 0 0 10px 2px rgba(255,200,30,.75), inset 0 -2px 3px rgba(0,0,0,.2); }
+.tlight.green .l-green { background: var(--lamp-green); box-shadow: 0 0 10px 2px rgba(62,224,107,.75), inset 0 -2px 3px rgba(0,0,0,.2); }
+.tlight.yellow .l-yellow { animation: lamp-blink 1.6s ease-in-out infinite; }
+@keyframes lamp-blink { 50% { opacity: .55; } }
+.light-legend { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0; font-size: 12.5px; opacity: .9; }
+.light-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.light-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.light-legend .l-red { background: var(--lamp-red); }
+.light-legend .l-yellow { background: var(--lamp-yellow); }
+.light-legend .l-green { background: var(--lamp-green); }
+@media (prefers-reduced-motion: reduce) { .tlight.yellow .l-yellow { animation: none; } }
+@media (max-width: 720px) { .tlight i { width: 13px; height: 13px; } .tlight { gap: 4px; padding: 6px 5px; } }
+
 /* 다음 학습 깃발: 실제로 공부할 차례인 단계 */
 .here-flag { position: absolute; z-index: 2; transform: translate(-50%, -100%); display: flex; align-items: flex-end; gap: 0; pointer-events: none; }
 .here-flag i { display: block; width: 3px; height: 46px; background: #3b3b3b; border-radius: 2px; }

@@ -14,6 +14,19 @@ const SKYLINE = skylineSVG();
 const CAR = carSVG();
 const GROUND = groundSVG();
 
+/** 단계 신호등: 빨강 = 시작 전, 노랑 = 진행 중, 초록 = 완료 */
+function TrafficLight({ done, total }: { done: number; total: number }) {
+  const state = total > 0 && done === total ? 'green' : done > 0 ? 'yellow' : 'red';
+  const label = { red: '시작 전', yellow: `진행 중 (${done}/${total})`, green: '완료' }[state];
+  return (
+    <span className={`tlight ${state}`} role="img" aria-label={`신호: ${label}`} title={label}>
+      <i className="l-red" />
+      <i className="l-yellow" />
+      <i className="l-green" />
+    </span>
+  );
+}
+
 export default function RoadmapHome({ stages }: { stages: Stage[] }) {
   const { learned, ready } = useLearned();
   const router = useRouter();
@@ -105,6 +118,11 @@ export default function RoadmapHome({ stages }: { stages: Stage[] }) {
               )}
             </>
           )}
+          <p className="light-legend">
+            <span><i className="l-red" />시작 전</span>
+            <span><i className="l-yellow" />진행 중</span>
+            <span><i className="l-green" />완료</span>
+          </p>
           <div className="overall">
             <span>
               주행 {done}/{path.length}
@@ -125,11 +143,14 @@ export default function RoadmapHome({ stages }: { stages: Stage[] }) {
             <section key={s.id} id={`stage-${s.id}`} className={`lap ${si % 2 === 0 ? 'r' : 'l'}`}>
               <div className="lap-body">
                 <div className="lap-head">
-                  <div className="sign">
-                    <small>
-                      {si + 1}단계 · {s.level}
-                    </small>
-                    <strong>{s.title}</strong>
+                  <div className="sign-row">
+                    <div className="sign">
+                      <small>
+                        {si + 1}단계 · {s.level}
+                      </small>
+                      <strong>{s.title}</strong>
+                    </div>
+                    <TrafficLight done={dn} total={s.docs.length} />
                   </div>
                   <p className="goal">
                     <b>이 구간의 목표</b>

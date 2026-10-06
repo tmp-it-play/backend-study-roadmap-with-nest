@@ -98,6 +98,13 @@
   $('scrim').onclick = () => document.body.classList.remove('nav-open');
 
 
+  /* 단계 신호등: 빨강 = 시작 전, 노랑 = 진행 중, 초록 = 완료 */
+  function trafficLight(done, total) {
+    const state = total > 0 && done === total ? 'green' : done > 0 ? 'yellow' : 'red';
+    const label = { red: '시작 전', yellow: `진행 중 (${done}/${total})`, green: '완료' }[state];
+    return `<span class="tlight ${state}" role="img" aria-label="신호: ${label}" title="${label}"><i class="l-red"></i><i class="l-yellow"></i><i class="l-green"></i></span>`;
+  }
+
   /* 홈: 하늘 → 도시 → 지그재그 도로 (Next.js RoadmapHome과 같은 마크업) */
   function renderHome() {
     const done = path.filter(p => isDone(p.id)).length;
@@ -116,6 +123,7 @@
       <div class="dash"><div class="dash-inner">
         ${nd ? `<div><p class="label">다음 목적지</p><p class="next-title">${esc(nd.title)}</p><p class="next-meta">${nx.si + 1}단계 ${esc(nx.stage.title)} · ${nx.i + 1}/${nx.n} · 약 ${nd.minutes}분</p></div><a class="go-btn" href="#${nx.id}">출발하기</a>`
              : `<div><p class="label">완주</p><p class="next-title">모든 구간을 달렸습니다</p><p class="next-meta">면접 질문으로 마지막 점검을 해 보세요.</p></div><a class="go-btn" href="#${last.id}">면접 질문</a>`}
+        <p class="light-legend"><span><i class="l-red"></i>시작 전</span><span><i class="l-yellow"></i>진행 중</span><span><i class="l-green"></i>완료</span></p>
         <div class="overall"><span>주행 ${done}/${path.length}</span><div class="bar"><i style="width:${pct}%"></i></div><span>${pct}%</span></div>
       </div></div>
       <div class="track">${stages.map((s, si) => {
@@ -125,7 +133,7 @@
         return `<section id="stage-${s.id}" class="lap ${si % 2 === 0 ? 'r' : 'l'}">
           <div class="lap-body">
             <div class="lap-head">
-              <div class="sign"><small>${si + 1}단계 · ${esc(s.level)}</small><strong>${esc(s.title)}</strong></div>
+              <div class="sign-row"><div class="sign"><small>${si + 1}단계 · ${esc(s.level)}</small><strong>${esc(s.title)}</strong></div>${trafficLight(dn, ids.length)}</div>
               <p class="goal"><b>이 구간의 목표</b>${esc(s.goal)}</p>
               <p class="lap-meta">문서 ${ids.length}개 · 약 ${mins}분 · ${dn}/${ids.length} 완료</p>
             </div>
