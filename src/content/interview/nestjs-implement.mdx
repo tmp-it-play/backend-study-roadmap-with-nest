@@ -1,0 +1,497 @@
+---
+title: "NestJS 꼬리 질문: 직접 구현하기"
+description: "DI 컨테이너 직접 만들기, forwardRef가 필요한 진짜 이유, 요청 파이프라인 재현, 커스텀 데코레이터·가드·인터셉터 구현까지. 'NestJS 써 봤어요' 다음에 오는 질문들."
+order: 6
+---
+
+## 이렇게 활용하세요
+
+NestJS 면접은 "써 봤나요?"보다 **"그게 내부에서 어떻게 동작하나요? 직접 만든다면요?"** 를 많이 묻습니다. 답을 열기 전에 직접 구현해 보세요.
+
+검증 범위도 밝혀 둡니다. **미니 DI 컨테이너, forwardRef 재현, 요청 파이프라인 재현 코드**는 실제로 컴파일하고 실행해서 출력까지 확인했습니다. `@nestjs/*` 패키지를 쓰는 코드는 공식 API 기준으로 작성했지만 이 문서에서 실행해 보지는 않았습니다.
+
+## DI 컨테이너의 원리
+
+**Q. (단골) NestJS의 DI 컨테이너를 직접 만든다면 어떻게 구현하시겠어요?**
+
+**A.** 세 가지 재료로 만듭니다. (1) 데코레이터로 클래스에 **"주입 가능" 표식**을 남기고, (2) TypeScript의 `emitDecoratorMetadata`가 기록해 주는 **`design:paramtypes`(생성자 파라미터 타입 목록)** 을 `reflect-metadata`로 읽고, (3) 그 타입들을 **재귀적으로 resolve**해서 `new Cls(...deps)`로 만든 뒤 **Map에 캐시**합니다. 캐시가 곧 기본 싱글톤 스코프입니다. 여기에 문자열이나 Symbol 토큰을 위한 `@Inject`, 무한 재귀를 막는 **순환 감지**를 더하면 Nest의 Injector와 같은 뼈대가 됩니다.
+
+```ts
+import 'reflect-metadata';
+
+type Ctor<T = any> = new (...args: any[]) => T;
+type Token<T = any> = string | symbol | Ctor<T>;
+
+const INJECTABLE = Symbol('injectable');
+const INJECT_TOKENS = Symbol('inject-tokens');
+
+function Injectable(): ClassDecorator {
+  return (target) => Reflect.defineMetadata(INJECTABLE, true, target);
+}
+
+function Inject(token: Token): ParameterDecorator {
+  return (target, _key, index) => {
+    const tokens = Reflect.getMetadata(INJECT_TOKENS, target) ?? {};
+    tokens[index] = token;
+    Reflect.defineMetadata(INJECT_TOKENS, tokens, target);
+  };
+}
+
+class Container {
+  private providers = new Map<Token, { useClass?: Ctor; useValue?: unknown }>();
+  private instances = new Map<Token, unknown>();   // 싱글톤 캐시
+  private resolving = new Set<Token>();            // 지금 만드는 중인 것들 (순환 감지)
+
+  register(token: Token, provider: { useClass?: Ctor; useValue?: unknown } = {}) {
+    this.providers.set(token, provider.useClass || 'useValue' in provider ? provider : { useClass: token as Ctor });
+    return this;
+  }
+
+  resolve<T>(token: Token<T>): T {
+    if (this.instances.has(token)) return this.instances.get(token) as T;
+    const provider = this.providers.get(token);
+    if (!provider) throw new Error(`No provider for ${String((token as any).name ?? token)}`);
+    if ('useValue' in provider) return provider.useValue as T;
+
+    const Cls = provider.useClass!;
+    if (!Reflect.getMetadata(INJECTABLE, Cls)) throw new Error(`${Cls.name} is not @Injectable()`);
+    if (this.resolving.has(token)) {
+      throw new Error(`Circular dependency: ${[...this.resolving].map((t: any) => t.name).join(' → ')} → ${Cls.name}`);
+    }
+
+    this.resolving.add(token);
+    try {
+      const paramTypes: Ctor[] = Reflect.getMetadata('design:paramtypes', Cls) ?? [];
+      const overrides = Reflect.getMetadata(INJECT_TOKENS, Cls) ?? {};
+      const deps = paramTypes.map((type, i) => this.resolve(overrides[i] ?? type));
+      const instance = new Cls(...deps);
+      this.instances.set(token, instance);
+      return instance as T;
+    } finally {
+      this.resolving.delete(token);
+    }
+  }
+}
+
+// 사용
+const CONFIG = Symbol('CONFIG');
+
+@Injectable() class Logger { log(m: string) {} }
+
+@Injectable() class UsersRepository {
+  constructor(@Inject(CONFIG) private config: { db: string }, private logger: Logger) {}
+}
+
+@Injectable() class UsersService {
+  constructor(private repo: UsersRepository, private logger: Logger) {}
+}
+
+const c = new Container()
+  .register(CONFIG, { useValue: { db: 'postgres://local' } })
+  .register(Logger).register(UsersRepository).register(UsersService);
+
+const svc = c.resolve(UsersService);
+svc === c.resolve(UsersService);   // true (싱글톤)
+// Logger는 UsersService와 UsersRepository가 같은 인스턴스를 공유
+```
+
+> **꼬리 질문**: Nest의 실제 구조와는 무엇이 다른가요? (Nest는 **모듈 단위로 provider를 캡슐화**해서, 자기 모듈과 import한 모듈의 exports에서만 찾습니다. 또 스코프별로 인스턴스를 contextId마다 따로 관리합니다)
+
+**Q. (단골) 생성자 파라미터의 타입을 런타임에 어떻게 알 수 있나요? 인터페이스로 받으면 왜 안 되나요?**
+
+**A.** TypeScript는 원래 컴파일하면 타입을 전부 지웁니다. 그런데 `emitDecoratorMetadata` 옵션을 켜면 **데코레이터가 붙은 클래스에 한해** 생성자 파라미터 타입을 `design:paramtypes` 메타데이터로 **JS 코드에 남겨 줍니다.** 이때 런타임에 존재하는 값(클래스)만 남길 수 있습니다. **인터페이스나 타입 별칭은 런타임에 없어서 `Object`로 기록**됩니다. 그래서 인터페이스로 주입받으려면 `@Inject('TOKEN')`처럼 토큰을 직접 지정해야 합니다.
+
+```js
+// 위 UsersRepository를 tsc로 컴파일한 실제 결과 (일부)
+UsersRepository = __decorate([
+  Injectable(),
+  __param(0, Inject(CONFIG)),
+  __metadata("design:paramtypes", [Object, Logger])   // { db: string } → Object
+], UsersRepository);
+```
+
+> **꼬리 질문**: `import type { Logger }`로 가져오면 어떻게 되나요? (타입 전용 import는 컴파일 때 지워져서 메타데이터에 클래스를 남길 수 없습니다. 결과는 주입 실패입니다)
+
+**Q. (단골) forwardRef는 왜 필요한가요? 그냥 순환 감지만 하면 안 되나요?**
+
+**A.** 순환 의존을 그냥 쓰면 **컨테이너가 동작하기도 전에, 클래스를 정의하는 순간** 에러가 납니다. 데코레이터 메타데이터 `[B]`는 A를 정의할 때 평가되는데, 그때 B는 아직 선언 전이라 **TDZ(Temporal Dead Zone)** 에 걸립니다. 파일이 나뉘어 있으면 순환 import 때문에 B가 **undefined**로 잡힙니다. `forwardRef(() => B)`는 클래스를 **함수로 감싸 평가를 resolve 시점까지 미루는** 장치입니다. 다만 forwardRef는 증상을 피하는 것이지, 설계상의 순환을 없애 주지는 않습니다.
+
+```ts
+@Injectable() class A { constructor(public b: B) {} }
+@Injectable() class B { constructor(public a: A) {} }
+// 실행 결과 → ReferenceError: Cannot access 'B' before initialization
+//   (컴파일된 __metadata("design:paramtypes", [B]) 줄에서 발생)
+
+// forwardRef: 평가를 미루는 래퍼
+const forwardRef = (fn: () => Token) => ({ forwardRef: fn });
+
+@Injectable() class A2 { constructor(@Inject(forwardRef(() => B2)) public b: any) {} }
+@Injectable() class B2 { constructor(public a: A2) {} }
+// 이제 정의는 통과. 미니 컨테이너는 resolve 때 순환을 감지:
+// Error: Circular dependency: A2 → B2 → A2
+```
+
+> **꼬리 질문**: 근본적인 해결은? (공통 로직을 **제3의 provider로 분리**하거나, 한쪽이 직접 호출하는 대신 **이벤트를 발행**하게 바꿉니다. 모듈 간 순환이라면 모듈 경계를 다시 나눕니다)
+
+**Q. REQUEST 스코프 provider는 어떻게 동작하고, 왜 성능 문제가 생기나요?**
+
+**A.** 기본 싱글톤은 앱 시작 때 한 번 만들지만, REQUEST 스코프는 **요청마다 새 인스턴스**를 만듭니다. Nest는 요청마다 **contextId**를 만들고, InstanceWrapper가 contextId별로 인스턴스를 따로 보관합니다. 문제는 **스코프가 위로 전파(bubble up)** 된다는 점입니다. REQUEST 스코프 provider를 주입받는 서비스, 그 서비스를 주입받는 컨트롤러까지 전부 요청마다 새로 만들어집니다. 그래서 요청당 객체 생성 비용이 늘어납니다. 요청별 데이터(사용자, 트랜잭션)가 필요하면 **AsyncLocalStorage(nestjs-cls)** 로 싱글톤을 유지하는 방식이 대안입니다.
+
+```ts
+@Injectable({ scope: Scope.REQUEST })
+export class RequestContext {
+  constructor(@Inject(REQUEST) private readonly req: Request) {}
+  get userId() { return (this.req as any).user?.id; }
+}
+
+@Injectable()   // 기본 스코프로 선언했어도…
+export class OrdersService {
+  constructor(private ctx: RequestContext) {}   // REQUEST 스코프를 주입받는 순간 이 서비스도 요청마다 생성
+}
+```
+
+## 요청 파이프라인
+
+**Q. (단골) 미들웨어, 가드, 인터셉터, 파이프, 예외 필터의 실행 순서를 함수로 재현해 보세요.**
+
+**A.** 순서는 **미들웨어 → 가드 → 인터셉터(전) → 파이프 → 핸들러 → 인터셉터(후) → (예외 시) 필터**입니다. 재현할 때 핵심은 인터셉터입니다. 인터셉터는 순서대로 실행되는 단계가 아니라 **핸들러를 양파처럼 감싸는** 구조라서 `reduceRight`로 `next`를 겹겹이 감싸면 "전"은 바깥부터, "후"는 안쪽부터 실행됩니다. 어디서든 예외가 나면 남은 단계를 건너뛰고 필터로 갑니다.
+
+```js
+class HttpError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+async function handleRequest(req, { middlewares, guards, interceptors, pipes, handler, filter }) {
+  try {
+    // 1) 미들웨어: next()를 불러야 다음으로 진행
+    let i = 0;
+    const runMw = async () => { const mw = middlewares[i++]; if (mw) await mw(req, runMw); };
+    await runMw();
+
+    // 2) 가드: 하나라도 false면 403
+    for (const g of guards) {
+      if (!(await g(req))) throw new HttpError(403, 'Forbidden resource');
+    }
+
+    // 3) 인터셉터가 감싸는 안쪽: 파이프 → 핸들러
+    const callHandler = async () => {
+      let args = req.params;
+      for (const p of pipes) args = await p(args);   // 4) 파이프 (변환·검증)
+      return handler(args);                          // 5) 핸들러
+    };
+
+    // 인터셉터를 바깥 → 안쪽으로 겹겹이 감싸기
+    const chain = interceptors.reduceRight((next, ic) => () => ic(req, next), callHandler);
+    return { status: 200, body: await chain() };
+  } catch (err) {
+    return filter(err);                              // 6) 예외 필터
+  }
+}
+
+// 실제 실행 로그
+// 정상:     mw → guard → ic1:before → ic2:before → pipe → handler → ic2:after → ic1:after  (200)
+// 유저 없음: mw → guard → filter                                                          (403)
+// id='abc': mw → guard → ic1:before → ic2:before → pipe → filter                         (400)
+```
+
+> **꼬리 질문**: 전역, 컨트롤러, 라우트에 같은 종류가 여러 개 있으면 순서는? (가드, 인터셉터, 파이프는 **전역 → 컨트롤러 → 라우트** 순서이고, 예외 필터만 반대로 **라우트 → 컨트롤러 → 전역** 순서로 가장 가까운 필터가 먼저 잡습니다)
+
+**Q. (단골) 인증을 미들웨어가 아니라 가드로 하는 이유는 무엇인가요?**
+
+**A.** 미들웨어는 Express 계층에서 동작해서 **어떤 컨트롤러의 어떤 핸들러가 실행될지 모릅니다.** 가드는 **ExecutionContext**를 받기 때문에 `getHandler()`, `getClass()`로 대상 메서드와 클래스를 알 수 있습니다. 그래서 `@Roles('admin')`, `@Public()` 같은 **메타데이터를 읽어 핸들러별로 다르게 판단**할 수 있습니다. 또 같은 가드를 HTTP, WebSocket, 마이크로서비스에 공통으로 쓸 수 있습니다. 토큰 파싱처럼 라우트와 무관한 전처리는 미들웨어, 접근 허용 판단은 가드로 나누는 것이 일반적입니다.
+
+**Q. (단골) @Roles 데코레이터와 RolesGuard를 직접 구현해 보세요. 전역 가드에서 일부 라우트만 빼려면요?**
+
+**A.** `SetMetadata`로 핸들러나 클래스에 **역할 목록을 메타데이터로 붙이고**, 가드에서 `Reflector`로 읽어 `request.user.roles`와 비교합니다. `getAllAndOverride`는 **메서드에 붙은 값을 우선**하고 없으면 클래스 값을 씁니다. 전역 JWT 가드에서 일부를 빼는 것도 같은 원리입니다. `@Public()` 메타데이터가 있으면 가드가 바로 true를 반환하게 합니다.
+
+```ts
+export const ROLES_KEY = 'roles';
+export const Roles = (...roles: string[]) => SetMetadata(ROLES_KEY, roles);
+export const IS_PUBLIC_KEY = 'isPublic';
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+
+  canActivate(ctx: ExecutionContext): boolean {
+    const targets = [ctx.getHandler(), ctx.getClass()];
+    if (this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, targets)) return true;
+
+    const required = this.reflector.getAllAndOverride<string[]>(ROLES_KEY, targets);
+    if (!required?.length) return true;                       // 역할 지정이 없으면 통과
+
+    const { user } = ctx.switchToHttp().getRequest();
+    return required.some((role) => user?.roles?.includes(role));
+  }
+}
+
+// 전역 등록 (DI가 되도록 APP_GUARD 사용)
+@Module({ providers: [{ provide: APP_GUARD, useClass: RolesGuard }] })
+export class AppModule {}
+
+@Controller('admin')
+@Roles('admin')
+export class AdminController {
+  @Get('stats') stats() {}               // admin만
+  @Public() @Get('health') health() {}   // 누구나
+}
+```
+
+> **꼬리 질문**: `app.useGlobalGuards(new RolesGuard(...))`와 `APP_GUARD`의 차이는? (전자는 모듈 밖에서 직접 new하므로 **DI를 받을 수 없습니다.** APP_GUARD는 provider로 등록되어 Reflector 같은 의존성을 주입받습니다)
+
+**Q. 요청에서 현재 사용자를 꺼내는 @CurrentUser 데코레이터를 만들어 보세요.**
+
+**A.** `createParamDecorator`로 만듭니다. 팩토리는 **데코레이터 인자(data)와 ExecutionContext**를 받아, 반환값을 그 파라미터에 넣어 줍니다. 인자로 필드명을 받으면 `@CurrentUser('id')`처럼 일부만 꺼낼 수도 있습니다. 파라미터 데코레이터 결과에도 파이프가 적용되므로 `@CurrentUser(new ValidationPipe())`도 가능합니다.
+
+```ts
+export const CurrentUser = createParamDecorator(
+  (field: keyof AuthUser | undefined, ctx: ExecutionContext) => {
+    const user: AuthUser = ctx.switchToHttp().getRequest().user;
+    return field ? user?.[field] : user;
+  },
+);
+
+@Get('me')
+me(@CurrentUser() user: AuthUser, @CurrentUser('id') userId: number) {}
+```
+
+**Q. 여러 데코레이터를 하나로 합친 @Auth('admin')을 만들어 보세요.**
+
+**A.** `applyDecorators`로 여러 데코레이터를 **한 번에 적용하는 데코레이터**를 만듭니다. 컨트롤러마다 `@UseGuards`, `@Roles`, Swagger 데코레이터를 반복해서 붙이는 것을 하나로 줄입니다.
+
+```ts
+export function Auth(...roles: string[]) {
+  return applyDecorators(
+    Roles(...roles),
+    UseGuards(JwtAuthGuard, RolesGuard),
+    ApiBearerAuth(),
+    ApiUnauthorizedResponse({ description: 'Unauthorized' }),
+  );
+}
+
+@Auth('admin')
+@Delete(':id')
+remove(@Param('id', ParseIntPipe) id: number) {}
+```
+
+**Q. (단골) 응답 시간을 로깅하고 응답을 `{ data }`로 감싸는 인터셉터를 구현해 보세요.**
+
+**A.** `intercept(context, next)`에서 `next.handle()`이 **핸들러 결과를 담은 Observable**입니다. 호출 전에 시작 시간을 재고, RxJS의 `tap`으로 끝난 시점을 로깅하고, `map`으로 응답 모양을 바꿉니다. `next.handle()`을 **호출하지 않으면 핸들러가 실행되지 않는다**는 점을 이용하면 캐시도 만들 수 있습니다(다음 질문).
+
+```ts
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger('HTTP');
+
+  intercept(ctx: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const req = ctx.switchToHttp().getRequest();
+    const start = Date.now();
+    return next.handle().pipe(
+      tap({
+        next: () => this.logger.log(`${req.method} ${req.url} ${Date.now() - start}ms`),
+        error: (e) => this.logger.warn(`${req.method} ${req.url} failed: ${e.message}`),
+      }),
+      map((data) => ({ data })),
+    );
+  }
+}
+```
+
+**Q. GET 응답을 캐시하는 인터셉터를 직접 만들어 보세요.**
+
+**A.** 캐시에 값이 있으면 **`next.handle()`을 부르지 않고 `of(cached)`를 반환**합니다. 그러면 핸들러가 아예 실행되지 않습니다. 없으면 핸들러를 실행하고 `tap`으로 결과를 저장합니다. 사용자별 데이터는 키에 사용자 id를 넣어야 하고, 수정 요청이 오면 캐시를 무효화해야 합니다. 내장 `CacheInterceptor`가 같은 방식입니다.
+
+```ts
+@Injectable()
+export class SimpleCacheInterceptor implements NestInterceptor {
+  private cache = new Map<string, { value: unknown; expires: number }>();
+
+  intercept(ctx: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const req = ctx.switchToHttp().getRequest();
+    if (req.method !== 'GET') return next.handle();
+
+    const key = req.originalUrl;
+    const hit = this.cache.get(key);
+    if (hit && hit.expires > Date.now()) return of(hit.value);   // 핸들러 실행 안 함
+
+    return next.handle().pipe(
+      tap((value) => this.cache.set(key, { value, expires: Date.now() + 30_000 })),
+    );
+  }
+}
+```
+
+**Q. 모든 에러 응답 형식을 통일하는 예외 필터를 만들어 보세요.**
+
+**A.** `@Catch()`를 인자 없이 쓰면 **모든 예외**를 잡습니다. HttpException이면 그 상태 코드와 메시지를, 아니면 500으로 감싸서 같은 모양으로 응답합니다. Express나 Fastify 어느 쪽이든 동작하도록 응답 객체를 직접 쓰지 않고 **HttpAdapterHost**의 `reply`를 쓰는 것이 공식 문서 방식입니다. 운영에서는 500 에러의 내부 메시지를 그대로 노출하지 않습니다.
+
+```ts
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  constructor(private readonly adapterHost: HttpAdapterHost) {}
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const { httpAdapter } = this.adapterHost;
+    const ctx = host.switchToHttp();
+    const isHttp = exception instanceof HttpException;
+    const status = isHttp ? exception.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR;
+
+    httpAdapter.reply(ctx.getResponse(), {
+      statusCode: status,
+      message: isHttp ? exception.message : 'Internal server error',   // 내부 에러 숨기기
+      path: httpAdapter.getRequestUrl(ctx.getRequest()),
+      timestamp: new Date().toISOString(),
+    }, status);
+  }
+}
+```
+
+**Q. ValidationPipe가 하는 일을 직접 구현해 보세요.**
+
+**A.** 두 단계입니다. (1) `class-transformer`의 `plainToInstance`로 평범한 JSON을 **DTO 클래스 인스턴스로 변환**합니다. 그래야 클래스에 붙은 검증 데코레이터 메타데이터를 쓸 수 있습니다. (2) `class-validator`의 `validate`로 검사해서 에러가 있으면 **BadRequestException**을 던집니다. 파이프는 `metadata.metatype`으로 파라미터의 타입(DTO 클래스)을 알 수 있습니다. `whitelist` 옵션은 DTO에 없는 속성을 지우는 것입니다.
+
+```ts
+@Injectable()
+export class MiniValidationPipe implements PipeTransform {
+  async transform(value: unknown, { metatype }: ArgumentMetadata) {
+    if (!metatype || [String, Number, Boolean, Array, Object].includes(metatype as any)) {
+      return value;                                   // 원시 타입은 검증 대상 아님
+    }
+    const instance = plainToInstance(metatype, value);
+    const errors = await validate(instance, { whitelist: true });
+    if (errors.length) {
+      throw new BadRequestException(
+        errors.flatMap((e) => Object.values(e.constraints ?? {})),
+      );
+    }
+    return instance;                                  // transform: true와 같은 효과
+  }
+}
+```
+
+## 모듈과 실전
+
+**Q. (단골) 동적 모듈 forRoot를 직접 구현해 보세요. 왜 정적 모듈로는 안 되나요?**
+
+**A.** 정적 모듈은 `@Module()`에 고정된 provider만 가집니다. DB 주소나 API 키처럼 **import하는 쪽에서 설정값을 넘겨야 하는** 모듈은 정적 메서드가 **DynamicModule 객체를 반환**하게 만듭니다. 설정값을 `useValue` provider로 등록하고, 내부 서비스가 그 토큰을 주입받습니다. 설정값을 다른 provider(ConfigService)에서 비동기로 받아야 하면 `useFactory`와 `inject`를 쓰는 **forRootAsync**를 추가합니다.
+
+```ts
+export const MAILER_OPTIONS = Symbol('MAILER_OPTIONS');
+
+@Module({})
+export class MailerModule {
+  static forRoot(options: { apiKey: string; from: string }): DynamicModule {
+    return {
+      module: MailerModule,
+      global: true,
+      providers: [{ provide: MAILER_OPTIONS, useValue: options }, MailerService],
+      exports: [MailerService],
+    };
+  }
+
+  static forRootAsync(opts: {
+    imports?: any[];
+    inject?: any[];
+    useFactory: (...args: any[]) => Promise<{ apiKey: string; from: string }> | { apiKey: string; from: string };
+  }): DynamicModule {
+    return {
+      module: MailerModule,
+      global: true,
+      imports: opts.imports ?? [],
+      providers: [
+        { provide: MAILER_OPTIONS, useFactory: opts.useFactory, inject: opts.inject ?? [] },
+        MailerService,
+      ],
+      exports: [MailerService],
+    };
+  }
+}
+
+// 사용
+MailerModule.forRootAsync({
+  imports: [ConfigModule],
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({ apiKey: config.getOrThrow('MAIL_KEY'), from: 'no-reply@app.dev' }),
+});
+```
+
+> **꼬리 질문**: forRoot, forFeature, register는 어떻게 구분하나요? (관례상 forRoot는 앱 전체에 한 번 하는 설정, forFeature는 모듈별 추가 설정(예: 엔티티 등록), register는 import하는 곳마다 다른 설정입니다)
+
+**Q. (단골) 서비스 여러 개에 걸친 작업을 하나의 트랜잭션으로 묶으려면 어떻게 하나요?**
+
+**A.** 방법은 세 가지입니다. (1) **QueryRunner**로 직접 `startTransaction`, `commitTransaction`, `rollbackTransaction`을 호출하는 방식은 제어가 확실하지만 코드가 길어집니다. (2) **`dataSource.transaction(async (manager) => …)`** 은 콜백이 끝나면 커밋, 예외면 롤백을 자동으로 해 줍니다. 다만 두 방식 모두 **같은 EntityManager를 하위 서비스에 인자로 넘겨야** 같은 트랜잭션에 묶입니다. (3) 이 전달이 번거로우면 **AsyncLocalStorage**에 트랜잭션을 담아 두는 `nestjs-cls` 기반 **`@Transactional()`** 을 씁니다.
+
+```ts
+async placeOrder(dto: CreateOrderDto) {
+  return this.dataSource.transaction(async (manager) => {
+    const order = await manager.save(Order, { ...dto, status: 'PENDING' });
+    await this.stockService.decrease(dto.items, manager);   // 같은 manager를 넘겨야 같은 트랜잭션
+    await manager.save(Outbox, { type: 'OrderPlaced', payload: { orderId: order.id } });
+    return order;   // 여기까지 성공하면 커밋, 중간에 throw하면 전부 롤백
+  });
+}
+```
+
+> **꼬리 질문**: 트랜잭션 안에서 외부 API(결제)를 호출하면 어떤 문제가 있나요? (커넥션을 오래 잡고, 롤백돼도 외부 호출은 되돌릴 수 없습니다. 그래서 **Outbox 패턴**으로 커밋 후에 발행합니다)
+
+**Q. TypeORM에서 N+1 문제가 생기는 경우와 해결 방법은?**
+
+**A.** 게시글 목록을 조회한 뒤 각 게시글의 작성자를 반복문에서 따로 조회하면, **목록 쿼리 1번 + 게시글 수 N번**의 쿼리가 나갑니다. lazy relation이나 반복문 안의 `findOne`이 원인입니다. 해결책은 세 가지입니다. **`relations` 옵션이나 QueryBuilder의 `leftJoinAndSelect`** 로 한 번에 JOIN하는 것, 페이지네이션과 함께라면 **id 목록으로 `In()` 조회 후 메모리에서 매핑**하는 것, GraphQL이라면 **DataLoader로 배치**하는 것입니다.
+
+```ts
+// N+1: 게시글 10개면 쿼리 11번
+const posts = await this.postRepo.find();
+for (const p of posts) p.author = await this.userRepo.findOneBy({ id: p.authorId });
+
+// 해결: JOIN 한 번
+const posts2 = await this.postRepo.find({ relations: { author: true }, take: 10 });
+
+// 해결: IN으로 묶어서 2번
+const ids = [...new Set(posts.map((p) => p.authorId))];
+const authors = await this.userRepo.findBy({ id: In(ids) });
+```
+
+**Q. 메서드에 붙인 커스텀 데코레이터(@OnJob 같은)를 앱 시작 시 모두 찾아 등록하려면요?**
+
+**A.** `@nestjs/core`의 **DiscoveryService**로 모든 provider 인스턴스를 가져오고, **MetadataScanner**로 각 인스턴스의 메서드 이름을 훑으면서 **Reflector로 메타데이터가 붙은 메서드만** 골라냅니다. `onModuleInit`에서 실행하면 모든 인스턴스가 만들어진 뒤라 안전합니다. `@nestjs/schedule`의 `@Cron`, `@nestjs/event-emitter`의 `@OnEvent`가 이렇게 동작합니다.
+
+```ts
+export const ON_JOB = 'ON_JOB';
+export const OnJob = (name: string) => SetMetadata(ON_JOB, name);
+
+@Injectable()
+export class JobExplorer implements OnModuleInit {
+  constructor(
+    private discovery: DiscoveryService,
+    private scanner: MetadataScanner,
+    private reflector: Reflector,
+    private registry: JobRegistry,
+  ) {}
+
+  onModuleInit() {
+    for (const wrapper of this.discovery.getProviders()) {
+      const { instance } = wrapper;
+      if (!instance || typeof instance !== 'object') continue;
+      const proto = Object.getPrototypeOf(instance);
+      for (const method of this.scanner.getAllMethodNames(proto)) {
+        const job = this.reflector.get<string>(ON_JOB, instance[method]);
+        if (job) this.registry.register(job, instance[method].bind(instance));
+      }
+    }
+  }
+}
+// 모듈 imports에 DiscoveryModule 필요
+```
+
+## 출처
+
+- [NestJS 공식 문서: Custom providers](https://docs.nestjs.com/fundamentals/custom-providers)
+- [Leapcell: Building a Decorator-Driven Dependency Injection Container in TypeScript](https://leapcell.io/blog/building-a-decorator-driven-dependency-injection-container-in-typescript)
+- [Medium: Implement a dependency injection container from scratch](https://medium.com/@vahid.vdn/implement-a-dependency-injection-container-from-scratch-7092c8a0ae7a)
+- [DEV: Dependency Injection in TypeScript](https://dev.to/nehalist/dependency-injection-in-typescript-39nb)
+- [Hyring: Top 60 NestJS Interview Questions](https://hyring.com/jobseeker-toolkit/interview-questions/technical/nestjs)
+- [Second Talent: NestJS developers interview guide](https://www.secondtalent.com/interview-guide/nestjs-developers/)
+- [krtirtho.dev: Modules, Circular Dependency, Guards](https://krtirtho.dev/blog/nestjs-the-framework-of-nodejs-part-2-5ek2)
+- [velog: Nest.js Dependency Injection](https://velog.io/@atoye1/Nest.js-Dependency-Injection)
+- [인프런 Q&A: TypeORM 트랜잭션 관련](https://www.inflearn.com/community/questions/303592/typeorm-트랜잭션-관련)

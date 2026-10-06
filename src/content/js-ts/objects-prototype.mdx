@@ -1,0 +1,560 @@
+---
+title: "객체·프로토타입·클래스"
+description: "객체 리터럴과 참조, 얕은/깊은 복사, 불변성, getter/setter와 property descriptor, 프로토타입 체인, 생성자 함수와 class 문법, instanceof, 믹스인과 합성까지 정리한다."
+order: 3
+---
+
+## 한눈에 보기
+
+- 객체는 **참조**로 다뤄진다. 변수에 담기는 건 객체 자체가 아니라 주소다.
+- spread와 `Object.assign`은 **얕은 복사**, 중첩 구조까지 복사하려면 `structuredClone`을 쓴다. `Object.freeze`도 얕다.
+- 모든 객체는 숨은 링크 `[[Prototype]]`을 가지고, 프로퍼티를 못 찾으면 이 링크를 따라 올라간다(**프로토타입 체인**).
+- `class`는 생성자 함수 + `prototype` 메서드의 **문법 설탕**이다. 단, `#private`, `super`, strict mode 등 추가 기능이 있다.
+- 깊은 상속 트리보다 **합성(composition)** 이 변경에 강하다.
+
+## 1. 객체 기초
+
+> **비유**: 객체는 **라벨이 붙은 서랍장**이다. 각 서랍에는 이름(key)이 붙어 있고 안에 물건(value)이 들어 있다. 서랍을 새로 달거나 떼어낼 수도 있다.
+
+### 객체 리터럴
+
+```js
+const key = "dynamic";
+const name = "Kim";
+
+const user = {
+  name,                      // 단축 프로퍼티 (name: name)
+  age: 30,
+  [key + "Key"]: true,       // 계산된 프로퍼티 이름
+  "favorite-color": "blue",  // 식별자 규칙을 벗어나는 키
+  greet() {                  // 메서드 단축 문법
+    return `Hi, ${this.name}`;
+  },
+};
+
+console.log(user.dynamicKey); // true
+console.log(user.greet());    // "Hi, Kim"
+```
+
+### 프로퍼티 접근
+
+```js
+console.log(user.age);               // 30  점 표기법
+console.log(user["favorite-color"]); // "blue"  대괄호 표기법 (특수 문자 키)
+const field = "age";
+console.log(user[field]);            // 30  변수로 접근
+
+console.log(user.address?.city);     // undefined  옵셔널 체이닝 (에러 없음)
+console.log("age" in user);          // true  프로토타입 체인까지 확인
+console.log(Object.hasOwn(user, "toString")); // false  자기 프로퍼티만 확인
+console.log("toString" in user);              // true  (Object.prototype에서 상속)
+
+delete user.age;
+console.log(user.age); // undefined
+```
+
+| 방법 | 자기 프로퍼티 | 상속 프로퍼티 | 비고 |
+| --- | --- | --- | --- |
+| `key in obj` | O | O | |
+| `Object.hasOwn(obj, key)` | O | X | ES2022, 권장 |
+| `obj.hasOwnProperty(key)` | O | X | `Object.create(null)` 객체엔 없음 |
+| `Object.keys(obj)` | O (열거 가능만) | X | 문자열 키만 |
+
+## 2. 참조 vs 값
+
+> **비유**: 객체를 변수에 대입하는 건 **집 열쇠를 복제해서 건네는 것**이다. 열쇠가 둘이어도 집은 하나라서, 누가 들어가 가구를 옮기든 둘 다 바뀐 집을 본다.
+
+```js
+const a = { score: 1 };
+const b = a;
+b.score = 100;
+console.log(a.score); // 100
+
+// 비교도 참조 비교
+console.log({ x: 1 } === { x: 1 }); // false (서로 다른 객체)
+console.log(a === b);               // true  (같은 객체)
+
+// 함수 인자도 참조가 복사되어 전달된다 (call by sharing)
+function mutate(obj) {
+  obj.score = -1;      // 원본에 영향
+  obj = { score: 999 }; // 지역 변수만 다른 객체를 가리킴, 원본 영향 없음
+}
+mutate(a);
+console.log(a.score); // -1
+```
+
+> **주의**: JavaScript는 "참조에 의한 호출(call by reference)"이 아니다. 참조 **값**이 복사되어 전달된다. 그래서 내부 프로퍼티 변경은 원본에 반영되지만, 매개변수 자체에 재할당하는 건 원본에 영향이 없다.
+
+## 3. 얕은 복사 vs 깊은 복사
+
+> **비유**: 얕은 복사는 **이삿짐 목록만 새로 쓰는 것**이다. 목록(1단계)은 새 종이지만, 목록에 적힌 "옷장"은 여전히 같은 옷장을 가리킨다. 깊은 복사는 **옷장과 그 안의 옷까지 전부 새로 사는 것**이다.
+
+```js
+const original = {
+  name: "Kim",
+  tags: ["a", "b"],
+  profile: { city: "Seoul" },
+};
+
+// 얕은 복사
+const s1 = { ...original };
+const s2 = Object.assign({}, original);
+
+s1.name = "Lee";              // 1단계: 원본 영향 없음
+s1.profile.city = "Busan";    // 2단계: 원본도 바뀜!
+s2.tags.push("c");
+
+console.log(original.name);         // "Kim"
+console.log(original.profile.city); // "Busan"
+console.log(original.tags);         // [ 'a', 'b', 'c' ]
+
+// 깊은 복사
+const deep = structuredClone(original);
+deep.profile.city = "Jeju";
+console.log(original.profile.city); // "Busan"  영향 없음
+```
+
+| 방법 | 깊이 | `Date`/`Map`/`Set` | 순환 참조 | 함수/클래스 인스턴스 |
+| --- | --- | --- | --- | --- |
+| `{ ...obj }` | 얕음 | 참조 공유 | 문제 없음 | 참조 공유 |
+| `Object.assign` | 얕음 | 참조 공유 | 문제 없음 | 참조 공유, setter 호출됨 |
+| `JSON.parse(JSON.stringify())` | 깊음 | `Date`→문자열, `Map`→빈 객체 | 에러 | 함수 누락, 프로토타입 손실 |
+| `structuredClone` | 깊음 | 지원 | 지원 | 함수는 에러, 프로토타입 손실 |
+
+```js
+const withDate = { at: new Date(0), m: new Map([["k", 1]]) };
+const viaJson = JSON.parse(JSON.stringify(withDate));
+console.log(typeof viaJson.at, viaJson.m); // "string" {}
+
+const viaClone = structuredClone(withDate);
+console.log(viaClone.at instanceof Date, viaClone.m.get("k")); // true 1
+
+// structuredClone(() => {}); // DataCloneError
+```
+
+> **포인트**: React/Redux 같은 불변 업데이트에서는 **바뀌는 경로만** spread로 새로 만들고 나머지는 참조를 공유한다. 매번 깊은 복사하는 건 낭비다.
+
+```js
+const state = { user: { name: "Kim", age: 30 }, posts: [] };
+const next = { ...state, user: { ...state.user, age: 31 } };
+console.log(next.posts === state.posts); // true  (바뀌지 않은 부분은 공유)
+console.log(next.user === state.user);   // false
+```
+
+## 4. 불변성: Object.freeze
+
+> **비유**: `Object.freeze`는 **진열장 유리문에 자물쇠를 거는 것**이다. 진열장 안 물건을 빼거나 넣을 순 없지만, 진열된 상자 안쪽까지 잠긴 건 아니다.
+
+```js
+"use strict";
+const cfg = Object.freeze({ port: 3000, db: { host: "localhost" } });
+
+// cfg.port = 4000;     // TypeError (strict) / 조용히 무시 (sloppy)
+cfg.db.host = "remote"; // 중첩 객체는 얼지 않았다!
+console.log(cfg.db.host);          // "remote"
+console.log(Object.isFrozen(cfg)); // true
+console.log(Object.isFrozen(cfg.db)); // false
+
+function deepFreeze(obj) {
+  for (const value of Object.values(obj)) {
+    if (typeof value === "object" && value !== null) deepFreeze(value);
+  }
+  return Object.freeze(obj);
+}
+const locked = deepFreeze({ a: { b: { c: 1 } } });
+console.log(Object.isFrozen(locked.a.b)); // true
+```
+
+| 메서드 | 추가 | 삭제 | 값 수정 | 설정 변경 |
+| --- | --- | --- | --- | --- |
+| `Object.preventExtensions` | X | O | O | O |
+| `Object.seal` | X | X | O | X |
+| `Object.freeze` | X | X | X | X |
+
+> **주의**: `const`는 **변수 재할당**을 막고, `Object.freeze`는 **객체 1단계 변경**을 막는다. 둘 다 깊은 불변을 보장하지 않는다.
+
+## 5. getter / setter와 property descriptor
+
+> **비유**: getter/setter는 **은행 창구 직원**이다. 고객은 금고(내부 값)에 직접 손대지 않고 창구에 요청하며, 직원은 그 사이에 검증과 기록을 끼워 넣는다.
+
+```js
+const temp = {
+  _celsius: 20,
+  get fahrenheit() {
+    return this._celsius * 1.8 + 32;
+  },
+  set fahrenheit(f) {
+    if (typeof f !== "number") throw new TypeError("number only");
+    this._celsius = (f - 32) / 1.8;
+  },
+};
+
+console.log(temp.fahrenheit); // 68
+temp.fahrenheit = 212;        // 함수 호출이 아니라 대입처럼 사용
+console.log(temp._celsius);   // 100
+```
+
+### Property Descriptor
+
+모든 프로퍼티는 값 외에 **숨은 속성(attribute)** 을 가진다.
+
+| 종류 | 속성 | 의미 | 리터럴 기본값 | `defineProperty` 기본값 |
+| --- | --- | --- | --- | --- |
+| 데이터 | `value` | 값 | 지정값 | `undefined` |
+| 데이터 | `writable` | 값 변경 가능 | true | false |
+| 접근자 | `get` / `set` | 접근자 함수 | | `undefined` |
+| 공통 | `enumerable` | `for...in`, `Object.keys`에 노출 | true | false |
+| 공통 | `configurable` | 삭제 및 속성 변경 가능 | true | false |
+
+```js
+const product = { name: "Pen" };
+console.log(Object.getOwnPropertyDescriptor(product, "name"));
+// { value: 'Pen', writable: true, enumerable: true, configurable: true }
+
+Object.defineProperty(product, "id", {
+  value: "P-001",
+  // writable, enumerable, configurable 생략 → 모두 false
+});
+
+product.id = "X";               // 무시됨 (strict면 TypeError)
+console.log(product.id);        // "P-001"
+console.log(Object.keys(product)); // [ 'name' ]  id는 열거 안 됨
+console.log(JSON.stringify(product)); // {"name":"Pen"}
+
+Object.defineProperty(product, "label", {
+  get() { return `[${this.id}] ${this.name}`; },
+  enumerable: true,
+});
+console.log(product.label); // "[P-001] Pen"
+```
+
+> **포인트**: `Object.freeze`의 실체는 모든 프로퍼티를 `writable: false`, `configurable: false`로 바꾸고 확장을 막는 것이다.
+
+## 6. 프로토타입 체인
+
+> **비유**: 프로토타입 체인은 **가족에게 물건 빌리기**다. 내 방에 가위가 없으면 부모님 방을 보고, 거기도 없으면 조부모님 방을 본다. 끝(`null`)까지 가도 없으면 `undefined`다. 그리고 빌린 물건을 고치는 게 아니라 **내 방에 새로 하나 두면**(shadowing) 이후엔 그걸 쓴다.
+
+### 세 가지 용어 구분
+
+| 용어 | 누가 가짐 | 의미 |
+| --- | --- | --- |
+| `[[Prototype]]` | 모든 객체 | 내부 슬롯. 상위 프로토타입 객체를 가리키는 숨은 링크 |
+| `__proto__` | 모든 객체 (`Object.prototype`의 접근자) | `[[Prototype]]`을 읽고 쓰는 레거시 접근자 |
+| `prototype` | 함수(생성자)만 | `new`로 만들 인스턴스의 `[[Prototype]]`이 될 객체 |
+
+```js
+const animal = {
+  eats: true,
+  describe() {
+    return `eats: ${this.eats}`;
+  },
+};
+
+const rabbit = Object.create(animal); // rabbit.[[Prototype]] = animal
+rabbit.jumps = true;
+
+console.log(rabbit.jumps);      // true   자기 프로퍼티
+console.log(rabbit.eats);       // true   animal에서 찾음
+console.log(rabbit.describe()); // "eats: true"  this는 rabbit
+console.log(Object.getPrototypeOf(rabbit) === animal);           // true
+console.log(Object.getPrototypeOf(animal) === Object.prototype); // true
+console.log(Object.getPrototypeOf(Object.prototype));            // null
+
+// 쓰기는 체인을 타지 않는다 → 자기 프로퍼티로 생성 (shadowing)
+rabbit.eats = false;
+console.log(rabbit.eats, animal.eats); // false true
+```
+
+프로퍼티 조회 흐름:
+
+1. 객체 자신에게 해당 key가 있는지 확인한다.
+2. 없으면 `[[Prototype]]`이 가리키는 객체에서 확인한다.
+3. 체인 끝(`null`)에 도달할 때까지 반복한다.
+4. 끝까지 없으면 `undefined`를 반환한다.
+
+```text
+rabbit  ──[[Prototype]]──▶  animal  ──[[Prototype]]──▶  Object.prototype  ──▶  null
+ jumps                       eats                         toString
+                             describe                     hasOwnProperty
+```
+
+> **주의**: `__proto__`는 레거시다. 읽기는 `Object.getPrototypeOf`, 생성은 `Object.create`를 쓰자. 이미 만든 객체의 프로토타입을 `Object.setPrototypeOf`로 바꾸는 건 엔진 최적화를 깨뜨려 느려진다.
+
+```js
+// 프로토타입이 없는 순수 딕셔너리
+const dict = Object.create(null);
+dict.key = "v";
+console.log("toString" in dict); // false  (상속 프로퍼티 오염 없음)
+```
+
+## 7. 생성자 함수
+
+> **비유**: 생성자 함수는 **붕어빵 틀**이고 `prototype`은 **틀 옆에 붙은 공용 소스통**이다. 붕어빵(인스턴스)마다 팥(인스턴스 데이터)은 따로 들어가지만, 소스는 공용통 하나를 같이 쓴다.
+
+```js
+function User(name) {
+  this.name = name; // 인스턴스마다 따로
+}
+User.prototype.hello = function () { // 모든 인스턴스가 공유
+  return `Hello, ${this.name}`;
+};
+
+const u1 = new User("Kim");
+const u2 = new User("Lee");
+console.log(u1.hello());                // "Hello, Kim"
+console.log(u1.hello === u2.hello);     // true  (메서드 공유)
+console.log(Object.getPrototypeOf(u1) === User.prototype); // true
+console.log(User.prototype.constructor === User);          // true
+```
+
+`new User("Kim")`이 내부에서 하는 일:
+
+1. 빈 객체를 만든다.
+2. 그 객체의 `[[Prototype]]`을 `User.prototype`으로 연결한다.
+3. `this`를 그 객체로 바인딩해 `User`를 실행한다.
+4. 함수가 객체를 명시적으로 반환하지 않으면 새 객체를 반환한다.
+
+```js
+function myNew(Ctor, ...args) {
+  const obj = Object.create(Ctor.prototype);  // 1, 2
+  const result = Ctor.apply(obj, args);       // 3
+  return result !== null && typeof result === "object" ? result : obj; // 4
+}
+const u3 = myNew(User, "Park");
+console.log(u3.hello(), u3 instanceof User); // "Hello, Park" true
+```
+
+## 8. class 문법
+
+> **비유**: `class`는 **같은 붕어빵 틀에 깔끔한 사용 설명서를 붙인 것**이다. 틀(프로토타입 메커니즘)은 그대로인데 사용법이 읽기 쉬워지고, 설명서에만 있는 안전장치(`#private`, 강제 `new`)가 몇 개 추가됐다.
+
+```js
+class Animal {
+  static count = 0;      // 클래스 자체의 프로퍼티
+  #secret = "hidden";    // 진짜 private 필드
+  sound = "...";         // public 인스턴스 필드
+
+  constructor(name) {
+    this.name = name;
+    Animal.count++;
+  }
+
+  speak() {
+    return `${this.name} says ${this.sound}`;
+  }
+
+  get secretLength() {   // getter
+    return this.#secret.length;
+  }
+
+  static create(name) {  // static 메서드
+    return new this(name);
+  }
+}
+
+class Dog extends Animal {
+  sound = "woof";
+
+  constructor(name, breed) {
+    super(name);         // this 사용 전에 반드시 호출
+    this.breed = breed;
+  }
+
+  speak() {
+    return `${super.speak()}!`; // 부모 메서드 호출
+  }
+}
+
+const d = new Dog("Bori", "Jindo");
+console.log(d.speak());        // "Bori says woof!"
+console.log(d.secretLength);   // 6
+console.log(Animal.count);     // 1
+console.log(Dog.create("Choco").name); // "Choco"  (this = Dog)
+console.log(Animal.count);     // 2
+// console.log(d.#secret);     // SyntaxError: 클래스 밖에서 접근 불가
+```
+
+> **주의**: 파생 클래스 생성자에서 `super()` 전에 `this`를 쓰면 `ReferenceError`가 난다. 부모 생성자가 객체를 만들어야 `this`가 생기기 때문이다.
+
+### class는 프로토타입의 문법 설탕: 증명
+
+```js
+class Cat {
+  constructor(name) { this.name = name; }
+  meow() { return `${this.name}: meow`; }
+}
+
+console.log(typeof Cat);                                   // "function"
+console.log(Object.getOwnPropertyNames(Cat.prototype));    // [ 'constructor', 'meow' ]
+console.log(Cat.prototype.constructor === Cat);            // true
+
+const kitty = new Cat("Nabi");
+console.log(Object.getPrototypeOf(kitty) === Cat.prototype); // true
+console.log(Object.hasOwn(kitty, "meow"));                 // false (프로토타입에 있음)
+
+// 프로토타입에 메서드를 추가하면 class 인스턴스도 바로 쓴다
+Cat.prototype.purr = function () { return "purr"; };
+console.log(kitty.purr()); // "purr"
+
+// extends는 두 개의 프로토타입 체인을 연결한다
+class Lion extends Cat {}
+console.log(Object.getPrototypeOf(Lion.prototype) === Cat.prototype); // true (인스턴스 메서드 상속)
+console.log(Object.getPrototypeOf(Lion) === Cat);                     // true (static 상속)
+```
+
+같은 걸 생성자 함수로 쓰면:
+
+```js
+function Cat2(name) { this.name = name; }
+Cat2.prototype.meow = function () { return `${this.name}: meow`; };
+
+function Lion2(name) { Cat2.call(this, name); }
+Object.setPrototypeOf(Lion2.prototype, Cat2.prototype);
+Object.setPrototypeOf(Lion2, Cat2);
+
+console.log(new Lion2("Simba").meow()); // "Simba: meow"
+```
+
+그래도 "100% 똑같지는 않은" 차이점:
+
+| 차이 | class | 생성자 함수 |
+| --- | --- | --- |
+| `new` 없이 호출 | `TypeError` | 그냥 실행됨 (`this` 오염) |
+| 본문 strict mode | 항상 | 선택 |
+| 메서드 열거 | `enumerable: false` | 직접 할당하면 true |
+| 호이스팅 | TDZ 적용 | 함수 선언문은 통째로 |
+| private `#field` | 지원 | 없음 (클로저로 흉내) |
+
+## 9. instanceof의 원리
+
+> **비유**: `instanceof`는 **족보 확인**이다. "이 사람 조상 중에 김씨 가문 시조(`Ctor.prototype`)가 있나?"를 위로 거슬러 올라가며 확인한다. 실제로 그 가문 틀로 태어났는지는 보지 않는다.
+
+`obj instanceof Ctor`는 `obj`의 프로토타입 체인에 `Ctor.prototype`이 있는지 검사한다.
+
+```js
+function myInstanceOf(obj, Ctor) {
+  let proto = Object.getPrototypeOf(obj);
+  while (proto !== null) {
+    if (proto === Ctor.prototype) return true;
+    proto = Object.getPrototypeOf(proto);
+  }
+  return false;
+}
+
+console.log(myInstanceOf(d, Dog), myInstanceOf(d, Animal), myInstanceOf(d, Array));
+// true true false
+
+// 체인만 보기 때문에 속일 수 있다
+const fake = Object.create(Dog.prototype);
+console.log(fake instanceof Dog); // true (생성자는 실행된 적 없음)
+```
+
+> **주의**: iframe이나 다른 realm에서 온 배열은 `Array.prototype`이 달라 `instanceof Array`가 false다. 배열 판별은 `Array.isArray`를 쓰자.
+
+## 10. 믹스인과 합성
+
+> **비유**: 상속은 **혈통**이라 한 번 정하면 바꾸기 어렵고 부모의 모든 것을 물려받는다. 합성은 **레고 조립**이라 필요한 부품(기능)만 골라 끼우고 언제든 교체할 수 있다.
+
+### 상속의 문제
+
+```text
+Animal
+ ├─ FlyingAnimal  (fly)
+ │    └─ Bird
+ └─ SwimmingAnimal (swim)
+      └─ Fish
+
+Duck은 날고 헤엄친다 → 어느 쪽을 상속해야 하나? (다중 상속 불가)
+```
+
+### 믹스인
+
+```js
+const CanFly = (Base) => class extends Base {
+  fly() { return `${this.name} flies`; }
+};
+const CanSwim = (Base) => class extends Base {
+  swim() { return `${this.name} swims`; }
+};
+
+class Creature {
+  constructor(name) { this.name = name; }
+}
+
+class Duck extends CanSwim(CanFly(Creature)) {}
+const duck = new Duck("Donald");
+console.log(duck.fly(), "/", duck.swim()); // "Donald flies / Donald swims"
+
+// 객체 믹스인 (Object.assign으로 프로토타입에 복사)
+const Serializable = {
+  toJSONString() { return JSON.stringify(this); },
+};
+Object.assign(Duck.prototype, Serializable);
+console.log(duck.toJSONString()); // {"name":"Donald"}
+```
+
+### 합성 (Composition)
+
+```js
+const flyer = (state) => ({ fly: () => `${state.name} flies` });
+const swimmer = (state) => ({ swim: () => `${state.name} swims` });
+const quacker = (state) => ({ quack: () => `${state.name}: quack` });
+
+function createDuck(name) {
+  const state = { name };
+  return { ...flyer(state), ...swimmer(state), ...quacker(state) };
+}
+
+function createPenguin(name) {
+  const state = { name };
+  return { ...swimmer(state) }; // 필요한 능력만 조립
+}
+
+console.log(createDuck("Daisy").quack());   // "Daisy: quack"
+console.log(createPenguin("Pingu").swim()); // "Pingu swims"
+console.log("fly" in createPenguin("Pingu")); // false
+```
+
+| 관점 | 상속 (is-a) | 합성 (has-a) |
+| --- | --- | --- |
+| 관계 | "Dog는 Animal이다" | "Car는 Engine을 가진다" |
+| 결합도 | 높음 (부모 변경이 자식에 전파) | 낮음 |
+| 유연성 | 컴파일 시 고정된 계층 | 런타임에 조립/교체 가능 |
+| 코드 재사용 | 계층을 따라 수직적 | 부품 단위로 수평적 |
+| 적합한 경우 | 얕고 안정적인 계층, 프레임워크 확장 | 기능 조합이 다양할 때 |
+
+> **포인트**: "상속보다 합성을 선호하라(Favor composition over inheritance)." 상속은 1~2단계의 명확한 is-a 관계에만 쓰고, 기능 공유는 합성이나 믹스인으로 해결하자. React가 클래스 상속 대신 컴포넌트 합성과 Hooks를 택한 것도 같은 맥락이다.
+
+## 셀프 체크
+
+**Q1. `const copy = { ...obj }` 후 `copy.nested.x = 1`을 하면 원본은 어떻게 되는가?**
+
+**A.** 원본의 `nested.x`도 1이 된다. spread는 1단계만 복사하는 얕은 복사라 `nested`는 같은 객체를 참조한다. 중첩까지 분리하려면 `structuredClone`을 쓰거나 바뀌는 경로를 각각 spread해야 한다.
+
+**Q2. `__proto__`와 `prototype`의 차이는?**
+
+**A.** `__proto__`는 모든 객체가 가진 `[[Prototype]]` 접근자로 "내 상위 프로토타입"을 가리킨다. `prototype`은 함수만 가진 프로퍼티로 "이 함수를 `new`로 호출했을 때 생길 인스턴스의 프로토타입"이 될 객체다. 즉 `new F()`의 `__proto__`가 `F.prototype`이다.
+
+**Q3. class가 프로토타입의 문법 설탕이라는 근거 두 가지를 대라.**
+
+**A.** `typeof Cls`가 `"function"`이고, class 메서드가 인스턴스가 아닌 `Cls.prototype`에 정의되어 `Object.getPrototypeOf(instance) === Cls.prototype`이 성립한다. 또 `Cls.prototype`에 메서드를 추가하면 기존 인스턴스도 즉시 사용할 수 있다.
+
+**Q4. `obj instanceof C`는 무엇을 검사하는가?**
+
+**A.** `obj`의 프로토타입 체인 어딘가에 `C.prototype`이 있는지를 검사한다. 생성자가 실제로 실행됐는지는 확인하지 않으므로 `Object.create(C.prototype)`도 true가 된다.
+
+**Q5. `Object.freeze`한 객체의 중첩 객체 프로퍼티를 바꿀 수 있는가?**
+
+**A.** 바꿀 수 있다. `Object.freeze`는 1단계 프로퍼티만 `writable: false`, `configurable: false`로 만든다. 깊게 얼리려면 재귀적으로 freeze하는 `deepFreeze`를 구현해야 한다.
+
+## 핵심 정리
+
+- 객체는 참조로 전달되고, 비교도 참조 비교다. 함수 인자는 참조 값이 복사되는 call by sharing이다.
+- spread, `Object.assign`은 얕은 복사, `structuredClone`은 깊은 복사(함수, 프로토타입은 복사 불가)다.
+- `const`는 재할당, `Object.freeze`는 1단계 변경만 막는다.
+- 프로퍼티에는 `writable`, `enumerable`, `configurable` 같은 descriptor가 있고, getter/setter로 접근을 제어할 수 있다.
+- 조회는 프로토타입 체인을 따라 올라가고, 쓰기는 자기 프로퍼티에 생성된다(shadowing).
+- `new`는 객체 생성 → 프로토타입 연결 → `this` 바인딩 실행 → 반환의 4단계다.
+- `class`는 생성자 함수와 `prototype`의 문법 설탕이지만, `new` 강제, strict mode, `#private` 등 추가 보호 장치가 있다.
+- `instanceof`는 프로토타입 체인에서 `C.prototype`을 찾는 연산이다.
+- 기능 조합이 다양하면 상속보다 믹스인과 합성을 우선한다.

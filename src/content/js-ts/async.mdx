@@ -1,0 +1,682 @@
+---
+title: "콜백 → Promise → async/await"
+description: "콜백 지옥에서 시작해 Promise, async/await, 병렬 실행, 동시성 제한, 취소(AbortController)까지 JS 비동기 처리의 흐름을 정리한다."
+order: 6
+---
+
+## 한눈에 보기
+
+- 콜백의 진짜 문제는 중첩이 아니라 **제어권을 남에게 넘기는 것**(제어의 역전)과 **에러 처리가 어렵다는 것**이다.
+- Promise는 "미래의 결과를 담은 영수증"이다. 상태는 `pending` → `fulfilled` / `rejected`로 딱 한 번만 바뀐다.
+- async/await는 Promise를 동기 코드처럼 읽히게 해주는 문법이고, 에러는 `try/catch`로 잡는다.
+- 서로 독립적인 작업은 하나씩 `await` 하지 말고 `Promise.all`로 **동시에** 돌린다. `forEach`는 async를 기다려주지 않는다.
+- 대량 요청은 동시성 제한, 취소는 `AbortController`로 처리한다.
+
+## 왜 비동기가 필요한가
+
+> **비유**: 카페 직원이 한 명뿐이라고 해보자. 손님 A의 커피가 추출되는 3분 동안 계산대 앞에서 멍하니 기다리면 뒤 손님들은 전부 멈춘다. 대신 "추출 버튼만 눌러두고 다음 손님 주문을 받고, 커피가 나오면 진동벨로 알려주는" 방식이 비동기다.
+
+JavaScript는 싱글 스레드로 동작한다. 네트워크 요청, 파일 읽기, 타이머처럼 시간이 걸리는 작업을 동기적으로 기다리면 그동안 화면이 멈추거나 서버가 다른 요청을 처리하지 못한다. 그래서 "작업을 맡겨두고, 끝나면 알려줘" 방식의 비동기 처리가 필요하다.
+
+비동기 처리 방식은 다음 순서로 발전해왔다.
+
+| 세대 | 방식 | 대표 문법 |
+| --- | --- | --- |
+| 1세대 | Callback | `fs.readFile(path, cb)` |
+| 2세대 | Promise (ES2015) | `fetch(url).then(...)` |
+| 3세대 | async/await (ES2017) | `const res = await fetch(url)` |
+
+## 1. Callback
+
+> **비유**: 식당에 전화번호를 남기고 "자리 나면 이 번호로 전화 주세요"라고 하는 것. 전화(콜백)가 언제 올지, 혹은 실수로 두 번 올지는 식당 마음이다.
+
+### 기본 형태
+
+콜백은 "나중에 호출될 함수"를 인자로 넘기는 방식이다.
+
+```js
+function getUser(id, callback) {
+  setTimeout(() => {
+    callback({ id, name: "Kim" });
+  }, 100);
+}
+
+getUser(1, (user) => {
+  console.log(user.name); // Kim
+});
+console.log("먼저 실행됨");
+// 출력 순서: 먼저 실행됨 → Kim
+```
+
+### Node.js의 error-first callback
+
+Node.js 표준 API는 **첫 번째 인자에 에러, 두 번째 인자에 결과**를 넘기는 규약을 따른다.
+
+```js
+const fs = require("fs");
+
+fs.readFile("./config.json", "utf8", (err, data) => {
+  if (err) {
+    console.error("읽기 실패:", err.message);
+    return; // return을 빼먹으면 아래 코드까지 실행되는 버그 발생
+  }
+  console.log(JSON.parse(data));
+});
+```
+
+> **주의**: error-first 콜백에서 `if (err)` 분기 뒤 `return`을 빠뜨리면, 에러가 났는데도 아래의 정상 처리 코드가 `data = undefined`인 채로 실행된다.
+
+### 콜백 지옥 (Callback Hell)
+
+비동기 작업이 서로 의존하면 중첩이 깊어진다.
+
+```js
+getUser(1, (err, user) => {
+  if (err) return handle(err);
+  getOrders(user.id, (err, orders) => {
+    if (err) return handle(err);
+    getOrderDetail(orders[0].id, (err, detail) => {
+      if (err) return handle(err);
+      getShipping(detail.shippingId, (err, shipping) => {
+        if (err) return handle(err);
+        console.log(shipping.status);
+      });
+    });
+  });
+});
+```
+
+### 콜백의 진짜 문제점
+
+들여쓰기가 깊어지는 건 사실 표면적인 문제다. 더 근본적인 문제는 다음 두 가지다.
+
+**1) 제어의 역전 (Inversion of Control)**
+
+콜백을 넘기는 순간, 내 코드의 실행 제어권을 상대 라이브러리에 넘겨준다. 그 라이브러리가 다음과 같이 행동해도 막을 방법이 없다.
+
+- 콜백을 **두 번** 호출한다 (결제가 두 번 처리됨)
+- 콜백을 **아예 호출하지 않는다**
+- 콜백을 동기적으로 호출했다가 비동기적으로 호출했다가 한다 (Zalgo 문제)
+- 에러를 삼켜버린다
+
+```js
+// 신뢰할 수 없는 서드파티
+thirdPartyCharge(amount, () => {
+  chargeCard(); // 서드파티 버그로 두 번 호출되면? 
+});
+```
+
+**2) 에러 처리의 어려움**
+
+비동기 콜백 안에서 던진 에러는 바깥의 `try/catch`로 잡히지 않는다. 콜백이 실행되는 시점에는 이미 바깥 함수의 Call Stack이 사라졌기 때문이다.
+
+```js
+try {
+  setTimeout(() => {
+    throw new Error("boom");
+  }, 0);
+} catch (e) {
+  console.log("잡혔다!"); // 절대 실행되지 않음
+}
+// Uncaught Error: boom
+```
+
+그래서 모든 단계마다 `if (err) return ...`을 반복해야 한다.
+
+## 2. Promise
+
+> **비유**: 카페에서 주문하면 받는 **진동벨**. 지금 당장 커피는 없지만 "나중에 커피를 받을 권리"를 손에 쥐고 있다. 진동벨은 대기 중 → 완료(커피 나옴) 또는 실패(재료 소진) 중 하나로 **딱 한 번만** 바뀐다. 그리고 벨을 들고 있는 건 나라서, 언제 무엇을 할지는 내가 정한다.
+
+Promise는 **"미래에 완료될 값"을 표현하는 객체**다. 콜백을 넘기는 대신 결과를 담은 객체를 돌려받으므로 제어권이 다시 내 쪽으로 돌아온다.
+
+### Promise의 상태
+
+| 상태 | 의미 | 전이 |
+| --- | --- | --- |
+| `pending` | 대기 중 | 초기 상태 |
+| `fulfilled` | 성공 | `resolve(value)` 호출 시 |
+| `rejected` | 실패 | `reject(reason)` 호출 또는 executor에서 throw 시 |
+
+`fulfilled`와 `rejected`를 합쳐 **settled** 상태라고 부른다. 한 번 settled 되면 **절대 상태가 바뀌지 않는다**. 이 성질 덕분에 "두 번 호출" 문제가 해결된다.
+
+```js
+const p = new Promise((resolve, reject) => {
+  resolve(1);
+  resolve(2);       // 무시됨
+  reject(new Error()); // 무시됨
+});
+
+p.then(console.log); // 1
+```
+
+### 생성과 소비
+
+```js
+function delay(ms, value) {
+  return new Promise((resolve) => {
+    setTimeout(() => resolve(value), ms);
+  });
+}
+
+delay(100, "done")
+  .then((v) => console.log(v))       // done
+  .catch((e) => console.error(e))
+  .finally(() => console.log("정리")); // 정리
+```
+
+### then 체이닝
+
+> **비유**: 공장 컨베이어 벨트. 각 `then`은 하나의 작업대이고, 앞 작업대가 넘겨준 물건(반환값)을 받아 가공한 뒤 다음 작업대로 넘긴다.
+
+`then`은 **항상 새로운 Promise를 반환**한다. 콜백에서 반환한 값에 따라 다음 Promise가 결정된다.
+
+- 일반 값을 반환 → 그 값으로 fulfilled
+- Promise를 반환 → 그 Promise의 결과를 따라감
+- throw → 그 에러로 rejected
+
+```js
+fetchUser(1)
+  .then((user) => fetchOrders(user.id))      // Promise 반환 → 평탄화
+  .then((orders) => orders[0])               // 일반 값 반환
+  .then((order) => fetchDetail(order.id))
+  .then((detail) => console.log(detail))
+  .catch((err) => console.error("어디서든 실패:", err));
+```
+
+콜백 지옥이 평평한 체인으로 바뀌었다.
+
+### 에러 전파
+
+> **비유**: 컨베이어 벨트 중간에서 불량품이 나오면 남은 작업대를 전부 건너뛰고 **불량품 처리반**(`catch`)으로 바로 보내진다. 처리반이 고쳐서 돌려보내면(값 반환) 다시 정상 라인을 탄다.
+
+체인 중간 어디에서 에러가 나도 다음 `catch`까지 건너뛴다. 동기 코드의 `try/catch`와 비슷하다.
+
+```js
+Promise.resolve(1)
+  .then((v) => {
+    throw new Error("2단계 실패");
+  })
+  .then((v) => console.log("실행 안 됨"))
+  .catch((e) => {
+    console.log(e.message); // 2단계 실패
+    return "복구값";          // catch에서 값을 반환하면 체인이 복구된다
+  })
+  .then((v) => console.log(v)); // 복구값
+```
+
+> **주의**: `then` 안에서 Promise를 반환할 때 `return`을 빠뜨리면 체인이 끊긴다. 다음 `then`은 `undefined`를 받고, 내부 에러는 `catch`로 전파되지 않는다.
+
+```js
+// X return 누락
+fetchUser(1).then((user) => {
+  fetchOrders(user.id); // 기다리지 않음
+}).then((orders) => console.log(orders)); // undefined
+```
+
+### Promise 정적 메서드 비교
+
+> **비유**: 친구 4명에게 동시에 심부름을 시켰다고 하자.
+> - `all`: 4명 **모두** 성공해야 OK. 한 명이라도 실패하면 바로 "실패!"
+> - `allSettled`: 성공이든 실패든 **모두 돌아올 때까지** 기다렸다가 결과 보고서를 받음
+> - `race`: **제일 먼저 돌아온 사람**의 결과(성공이든 실패든)를 채택
+> - `any`: **제일 먼저 성공한 사람**의 결과를 채택. 전원 실패일 때만 실패
+
+| 메서드 | 완료 조건 | 실패 조건 | 결과 |
+| --- | --- | --- | --- |
+| `Promise.all` | 전부 fulfilled | 하나라도 rejected 시 즉시 | 결과 배열 |
+| `Promise.allSettled` | 전부 settled | 실패하지 않음 | `{ status, value \| reason }` 배열 |
+| `Promise.race` | 가장 먼저 settled 된 것 | 가장 먼저 settled 된 것이 rejected | 단일 값 |
+| `Promise.any` | 하나라도 fulfilled | 전부 rejected | 단일 값 / `AggregateError` |
+
+```js
+const ok = (ms, v) => new Promise((r) => setTimeout(() => r(v), ms));
+const fail = (ms, msg) =>
+  new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms));
+
+await Promise.all([ok(100, "a"), ok(50, "b")]);
+// ['a', 'b']  ← 순서는 입력 순서 유지 (완료 순서 아님)
+
+await Promise.all([ok(100, "a"), fail(50, "x")]);
+// Error: x  (50ms 시점에 즉시 reject)
+
+await Promise.allSettled([ok(100, "a"), fail(50, "x")]);
+// [
+//   { status: 'fulfilled', value: 'a' },
+//   { status: 'rejected', reason: Error: x }
+// ]
+
+await Promise.race([ok(100, "a"), fail(50, "x")]);
+// Error: x  (먼저 끝난 게 실패)
+
+await Promise.any([fail(50, "x"), ok(100, "a")]);
+// 'a'  (실패는 무시하고 첫 성공)
+
+await Promise.any([fail(50, "x"), fail(10, "y")]);
+// AggregateError: All promises were rejected
+```
+
+활용 예시:
+
+- `all`: 서로 독립적인 API 여러 개를 동시에 호출하고 모두 필요할 때
+- `allSettled`: 일부 실패해도 나머지 결과는 써야 할 때 (대시보드 위젯 등)
+- `race`: 타임아웃 구현
+- `any`: 여러 미러 서버 중 가장 빠른 성공 응답만 필요할 때
+
+```js
+function withTimeout(promise, ms) {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("Timeout")), ms)
+  );
+  return Promise.race([promise, timeout]);
+}
+```
+
+### promisify
+
+> **비유**: 옛날 "전화번호 남기기"식 가게에 **진동벨 어댑터**를 달아주는 것. 가게가 전화를 걸어오면 어댑터가 그걸 받아 진동벨을 울려준다.
+
+콜백 기반 API를 Promise로 바꾸는 것을 promisify라고 한다.
+
+**Node.js 내장 `util.promisify`**
+
+```js
+const util = require("util");
+const fs = require("fs");
+
+const readFile = util.promisify(fs.readFile);
+const data = await readFile("./a.txt", "utf8");
+
+// 요즘은 대부분 promises API가 따로 있다
+const { readFile: readFileP } = require("fs/promises");
+```
+
+**직접 구현**
+
+```js
+function promisify(fn) {
+  return function (...args) {
+    return new Promise((resolve, reject) => {
+      fn.call(this, ...args, (err, result) => {
+        if (err) reject(err);
+        else resolve(result);
+      });
+    });
+  };
+}
+
+const readFileAsync = promisify(fs.readFile);
+readFileAsync("./a.txt", "utf8").then(console.log);
+```
+
+핵심은 error-first 콜백을 마지막 인자로 붙여서, `err`가 있으면 reject, 없으면 resolve 하는 것이다.
+
+조합 메서드 네 가지가 실제로 어떻게 다르게 동작하는지 직접 실행해 보세요.
+
+```sim
+promise-combinators
+```
+
+## 3. async / await
+
+> **비유**: 요리 레시피를 읽듯이 "물을 끓인다 → (끓을 때까지 기다린다) → 면을 넣는다"를 위에서 아래로 쓰는 것. 다만 기다리는 동안 요리사가 정말 멍하니 서 있는 건 아니고, 이 레시피만 잠시 덮어두고 다른 일을 하다가 물이 끓으면 돌아온다.
+
+async/await는 Promise 위에 얹은 **문법적 설탕(syntactic sugar)** 이다. 비동기 코드를 동기 코드처럼 위에서 아래로 읽히게 만든다.
+
+### 기본 문법
+
+- `async function`은 **항상 Promise를 반환**한다. 일반 값을 return 해도 Promise로 감싸진다.
+- `await`는 Promise가 settled 될 때까지 함수 실행을 **일시 중지**한다. (스레드를 막는 게 아니라 함수만 멈춘다)
+
+```js
+async function foo() {
+  return 1;
+}
+foo().then(console.log); // 1
+console.log(foo());      // Promise { 1 }
+
+async function getShippingStatus(userId) {
+  const user = await fetchUser(userId);
+  const orders = await fetchOrders(user.id);
+  const detail = await fetchDetail(orders[0].id);
+  const shipping = await fetchShipping(detail.shippingId);
+  return shipping.status;
+}
+```
+
+처음의 콜백 지옥이 이렇게 평범한 코드가 됐다.
+
+### try/catch로 에러 처리
+
+await한 Promise가 rejected 되면 그 자리에서 throw 된 것처럼 동작한다. 덕분에 동기 코드와 똑같이 `try/catch`를 쓸 수 있다.
+
+```js
+async function load() {
+  try {
+    const res = await fetch("/api/data");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    console.error("로드 실패:", err.message);
+    return null;
+  } finally {
+    hideSpinner();
+  }
+}
+```
+
+> **주의**: `try` 블록 안에서는 `return promise`가 아니라 `return await promise`를 써야 rejection이 해당 `catch`에서 잡힌다. `try` 바깥이라면 `return await`는 불필요하다.
+
+```js
+async function bad() {
+  try {
+    return fetchThatFails(); // await 없음 → catch를 건너뜀
+  } catch {
+    return "fallback";       // 실행 안 됨
+  }
+}
+```
+
+### 순차 vs 병렬 실행 함정
+
+> **비유**: 라면, 계란, 김치를 사야 하는데 편의점 세 곳에 **한 명이 차례로** 다녀오면 30분, **세 명이 동시에** 다녀오면 10분이다. 서로 기다릴 이유가 없는 일이라면 동시에 출발시키자.
+
+가장 흔한 성능 실수다. 서로 의존하지 않는 작업을 하나씩 `await` 하면 불필요하게 느려진다.
+
+```js
+// X 순차 실행: 약 300ms
+const a = await delay(100, "a");
+const b = await delay(100, "b");
+const c = await delay(100, "c");
+
+// O 병렬 실행: 약 100ms
+const [a2, b2, c2] = await Promise.all([
+  delay(100, "a"),
+  delay(100, "b"),
+  delay(100, "c"),
+]);
+```
+
+배열을 다룰 때도 마찬가지다.
+
+```js
+const ids = [1, 2, 3, 4, 5];
+
+// X for...of + await: 하나 끝나야 다음 시작 (순차)
+const users1 = [];
+for (const id of ids) {
+  users1.push(await fetchUser(id));
+}
+
+// O map으로 Promise를 한꺼번에 만들고 Promise.all
+const users2 = await Promise.all(ids.map((id) => fetchUser(id)));
+```
+
+동작 흐름을 단계별로 보면 다음과 같다.
+
+1. `ids.map(...)`이 실행되는 순간 5개의 요청이 **모두 출발**한다.
+2. `map`은 Promise 5개가 담긴 배열을 반환한다.
+3. `Promise.all`이 그 5개가 전부 끝나길 한 번에 기다린다.
+4. 총 소요 시간 ≈ 가장 느린 요청 하나의 시간.
+
+단, `for...of` + `await`가 **정답인 경우**도 있다.
+
+- 앞 결과가 다음 요청에 필요할 때 (페이지네이션 커서 등)
+- 순서가 중요한 쓰기 작업 (DB 마이그레이션 단계)
+- 외부 API rate limit 때문에 일부러 천천히 보내야 할 때
+
+### forEach + async 함정
+
+> **비유**: 반장이 "숙제 다 하면 알려줘"라고 말하지 않고 그냥 학생들에게 숙제를 나눠준 뒤 바로 "다 끝났다!"고 선생님께 보고하는 상황이다. `forEach`는 각 콜백이 돌려준 Promise(완료 알림)를 받지 않고 버린다.
+
+`forEach`는 콜백의 반환값(Promise)을 무시한다. 그래서 기다려주지 않는다.
+
+```js
+async function processAll(ids) {
+  ids.forEach(async (id) => {
+    await save(id);
+    console.log("saved", id);
+  });
+  console.log("끝!");
+}
+
+await processAll([1, 2, 3]);
+// 끝!          ← 먼저 출력됨
+// saved 1
+// saved 2
+// saved 3
+```
+
+또한 forEach 내부에서 발생한 rejection은 바깥에서 잡을 수 없어 unhandled rejection이 된다. 해결책은 다음 둘 중 하나다.
+
+```js
+// 순차가 필요하면
+for (const id of ids) await save(id);
+
+// 병렬이면
+await Promise.all(ids.map((id) => save(id)));
+```
+
+`map`, `filter`, `reduce`도 같은 이유로 async 콜백을 기다려주지 않는다. 특히 `filter(async ...)`는 콜백이 항상 Promise(truthy)를 반환하므로 **모든 요소가 통과**한다.
+
+```js
+const result = [1, 2, 3].filter(async (n) => n > 2);
+console.log(result); // [1, 2, 3] 
+```
+
+> **주의**: 배열 메서드(`forEach`, `map`, `filter`, `reduce`, `some`)에 async 콜백을 넘기면 기다려주지 않는다. 기다려야 한다면 `for...of` + `await`, 병렬이면 `Promise.all(arr.map(...))`.
+
+### top-level await
+
+ES2022부터 **ES Module의 최상위**에서는 async 함수 없이 `await`를 쓸 수 있다.
+
+```js
+// config.mjs
+const res = await fetch("https://example.com/config.json");
+export const config = await res.json();
+```
+
+- CommonJS(`require`)에서는 사용할 수 없다.
+
+> **주의**: 이 모듈을 import 하는 쪽은 await가 끝날 때까지 평가가 지연된다. 무거운 작업을 넣으면 앱 시작 전체가 느려진다.
+
+## 4. 동시성 제한 (Concurrency Limit)
+
+> **비유**: 마트 계산대가 5개라면 손님 100명이 와도 동시에 계산되는 건 5명뿐이다. 한 계산대가 비면 줄 맨 앞 손님이 그 자리로 간다. 아래 코드의 worker가 바로 "계산대"다.
+
+`Promise.all`로 1만 개 요청을 동시에 보내면 서버나 DB 커넥션 풀이 터진다. 동시에 N개만 실행되도록 제한하는 함수를 직접 만들어보자.
+
+```js
+async function mapWithLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const i = nextIndex++; // 싱글 스레드라 경쟁 조건 없음
+      results[i] = await fn(items[i], i);
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+// 사용
+const ids = Array.from({ length: 100 }, (_, i) => i + 1);
+const users = await mapWithLimit(ids, 5, (id) => fetchUser(id));
+// 항상 최대 5개의 요청만 동시에 진행된다
+```
+
+아이디어는 간단하다.
+
+1. worker(계산대)를 `limit` 개수만큼 띄운다.
+2. 각 worker는 공용 인덱스 `nextIndex`에서 다음 작업을 하나 꺼낸다.
+3. 작업이 끝나면 다시 2번으로 가서 다음 작업을 꺼낸다.
+4. 더 꺼낼 작업이 없으면 worker가 종료되고, 모든 worker가 끝나면 결과를 반환한다. 실무에서는 `p-limit` 같은 라이브러리를 많이 쓴다.
+
+```js
+import pLimit from "p-limit";
+
+const limit = pLimit(5);
+const users = await Promise.all(ids.map((id) => limit(() => fetchUser(id))));
+```
+
+## 5. AbortController로 취소하기
+
+> **비유**: 배달 앱의 **주문 취소 버튼**. `AbortController`는 취소 버튼을 가진 사람(나), `signal`은 가게에 함께 전달되는 "취소 알림 수신기"다. 내가 버튼을 누르면 수신기가 울리고, 가게(fetch)는 하던 일을 멈춘다.
+
+Promise 자체에는 취소 기능이 없다. 대신 표준 `AbortController`로 **취소 신호(signal)** 를 전달한다. 브라우저와 Node.js(15+) 모두 지원한다.
+
+### fetch 취소
+
+```js
+const controller = new AbortController();
+
+fetch("/api/slow", { signal: controller.signal })
+  .then((res) => res.json())
+  .catch((err) => {
+    if (err.name === "AbortError") {
+      console.log("요청이 취소됨");
+    } else {
+      throw err;
+    }
+  });
+
+// 1초 후 취소
+setTimeout(() => controller.abort(), 1000);
+```
+
+### 타임아웃 단축 문법
+
+```js
+// AbortSignal.timeout: 지정 시간 후 자동 abort
+const res = await fetch("/api/slow", {
+  signal: AbortSignal.timeout(3000),
+});
+// 3초 초과 시 TimeoutError
+
+// 여러 signal 조합 (사용자 취소 OR 타임아웃)
+const userCancel = new AbortController();
+const signal = AbortSignal.any([
+  userCancel.signal,
+  AbortSignal.timeout(5000),
+]);
+```
+
+### 직접 만든 비동기 함수에 취소 지원 넣기
+
+```js
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+
+    const id = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(id);       // 리소스 정리
+        reject(signal.reason);
+      },
+      { once: true }
+    );
+  });
+}
+
+const ac = new AbortController();
+sleep(5000, { signal: ac.signal }).catch((e) => console.log(e.name));
+ac.abort(); // AbortError
+```
+
+### React 예시: 언마운트 시 요청 취소
+
+```js
+useEffect(() => {
+  const controller = new AbortController();
+
+  fetch(`/api/users/${id}`, { signal: controller.signal })
+    .then((r) => r.json())
+    .then(setUser)
+    .catch((e) => {
+      if (e.name !== "AbortError") setError(e);
+    });
+
+  return () => controller.abort(); // cleanup에서 취소 → race condition 방지
+}, [id]);
+```
+
+`id`가 빠르게 바뀔 때 이전 요청 응답이 늦게 도착해 최신 상태를 덮어쓰는 문제를 막아준다.
+
+## 6. 한눈에 비교
+
+```js
+// Callback
+getUser(1, (err, user) => {
+  if (err) return console.error(err);
+  getOrders(user.id, (err, orders) => {
+    if (err) return console.error(err);
+    console.log(orders);
+  });
+});
+
+// Promise
+getUser(1)
+  .then((user) => getOrders(user.id))
+  .then((orders) => console.log(orders))
+  .catch(console.error);
+
+// async/await
+try {
+  const user = await getUser(1);
+  const orders = await getOrders(user.id);
+  console.log(orders);
+} catch (err) {
+  console.error(err);
+}
+```
+
+| 항목 | Callback | Promise | async/await |
+| --- | --- | --- | --- |
+| 가독성 | 중첩 깊어짐 | 체인으로 평탄화 | 동기 코드처럼 읽힘 |
+| 에러 처리 | 매 단계 `if (err)` | `.catch()` 한 번 | `try/catch` |
+| 제어권 | 라이브러리에 넘어감 | 내가 가짐 | 내가 가짐 |
+| 병렬 처리 | 직접 카운터 관리 | `Promise.all` | `await Promise.all` |
+| 취소 | 라이브러리마다 다름 | `AbortController` | `AbortController` |
+
+## 셀프 체크
+
+**Q1. 콜백 방식의 "제어의 역전" 문제란 무엇이고, Promise는 이를 어떻게 해결하나?**
+
+**A.** 콜백을 넘기면 그 콜백을 언제, 몇 번 호출할지 결정권이 상대 라이브러리에 넘어간다(두 번 호출, 호출 안 함 등). Promise는 결과를 객체로 돌려받아 내가 `then`을 붙이는 구조이고, 상태가 한 번만 settled 되므로 중복 호출 같은 문제가 원천 차단된다.
+
+**Q2. `Promise.all`과 `Promise.allSettled`의 차이는?**
+
+**A.** `all`은 하나라도 rejected 되면 즉시 전체가 reject 된다. `allSettled`는 절대 reject 되지 않고, 모든 Promise가 끝난 뒤 각각의 `status`와 `value` 또는 `reason`을 담은 배열을 돌려준다.
+
+**Q3. 다음 코드에서 "끝!"은 저장이 모두 끝난 뒤에 출력될까? `ids.forEach(async (id) => await save(id)); console.log("끝!");`**
+
+**A.** 아니다. `forEach`는 async 콜백이 반환한 Promise를 기다리지 않으므로 "끝!"이 먼저 출력된다. `for...of` + `await` 또는 `await Promise.all(ids.map(save))`로 바꿔야 한다.
+
+**Q4. 서로 의존성 없는 API 3개를 각각 100ms씩 걸려 호출할 때, 순차 `await`와 `Promise.all`의 소요 시간은?**
+
+**A.** 순차 `await`는 약 300ms, `Promise.all`은 약 100ms다. `Promise.all`은 세 요청을 동시에 출발시키고 가장 느린 것 하나만큼 기다리기 때문이다.
+
+**Q5. `fetch` 요청을 3초 후 자동으로 취소하려면?**
+
+**A.** `fetch(url, { signal: AbortSignal.timeout(3000) })`처럼 타임아웃 signal을 넘긴다. 직접 제어하려면 `AbortController`를 만들어 `signal`을 넘기고 `setTimeout`으로 `controller.abort()`를 호출한다.
+
+## 핵심 정리
+
+- 콜백의 본질적 문제는 중첩이 아니라 **제어의 역전**과 **에러 처리의 어려움**이다.
+- Promise는 `pending` → `fulfilled` / `rejected`로 **딱 한 번만** 전이되며, 그 결과를 객체로 돌려받아 제어권을 되찾는다.
+- `then`은 항상 새 Promise를 반환한다. 체인 안에서 Promise를 반환할 땐 `return`을 빠뜨리지 말자.
+- `all`(전부 성공), `allSettled`(전부 끝), `race`(먼저 끝), `any`(먼저 성공)의 차이를 상황에 맞게 고른다.
+- 콜백 API는 `util.promisify` 또는 직접 구현으로 Promise화 한다.
+- async 함수는 항상 Promise를 반환하고, `await`는 함수만 멈출 뿐 스레드를 막지 않는다.
+- 독립적인 작업은 `for...of await`가 아니라 `Promise.all`로 병렬 실행한다.
+- `forEach`, `filter`는 async 콜백을 기다리지 않는다 → `for...of` 또는 `Promise.all` + `map`.
+- 대량 작업은 worker 패턴이나 `p-limit`으로 동시성을 제한한다.
+- 취소는 `AbortController` / `AbortSignal.timeout` / `AbortSignal.any`로 처리하고, 직접 만든 함수도 signal을 받아 정리 로직을 넣는다.

@@ -1,0 +1,614 @@
+---
+title: "이터레이터·제너레이터"
+description: "iterable/iterator 프로토콜, Symbol.iterator 구현, 제너레이터와 지연 평가 파이프라인, async iterator와 for await...of, 코루틴으로서의 제너레이터, RxJS Observable과의 push/pull 비교를 정리한다."
+order: 5
+---
+
+## 한눈에 보기
+
+- **iterable** = `[Symbol.iterator]()` 메서드를 가진 객체, **iterator** = `next()`가 `{ value, done }`을 반환하는 객체. 이 두 약속만 지키면 `for...of`, spread, 구조 분해가 전부 동작한다.
+- `function*` 제너레이터는 iterator를 손쉽게 만드는 문법이고, `yield`에서 **실행을 멈췄다가 재개**할 수 있다.
+- 제너레이터는 값을 **요청할 때만** 계산한다(지연 평가). 무한 시퀀스나 큰 데이터 파이프라인에 유리하다.
+- `for await...of`는 async iterator를 순회한다. 페이지네이션 API, Node.js stream 처리에 딱 맞다.
+- iterator/제너레이터는 소비자가 당겨오는 **pull**, Observable은 생산자가 밀어주는 **push** 모델이다.
+
+## 1. Iterable / Iterator 프로토콜
+
+> **비유**: iterable은 **번호표 발급기가 달린 은행**이고, iterator는 **발급된 번호표 기계**다. 손님(`for...of`)이 버튼(`next()`)을 누를 때마다 다음 번호(`value`)가 나오고, 마감되면 "업무 종료(`done: true`)"가 뜬다. 은행(iterable)은 새 손님이 올 때마다 새 기계(iterator)를 내줄 수 있다.
+
+### 두 개의 프로토콜
+
+| 프로토콜 | 조건 | 예시 |
+| --- | --- | --- |
+| Iterable | `[Symbol.iterator]()` 메서드가 iterator를 반환 | `Array`, `String`, `Map`, `Set`, `arguments`, `NodeList` |
+| Iterator | `next()` 메서드가 `{ value, done }` 객체를 반환 | 배열의 `values()` 결과, 제너레이터 객체 |
+
+```js
+const arr = ["a", "b"];
+const it = arr[Symbol.iterator](); // iterable에서 iterator를 꺼냄
+
+console.log(it.next()); // { value: 'a', done: false }
+console.log(it.next()); // { value: 'b', done: false }
+console.log(it.next()); // { value: undefined, done: true }
+console.log(it.next()); // { value: undefined, done: true }  (끝난 뒤에도 계속 done)
+
+// 일반 객체는 iterable이 아니다
+const plain = { a: 1 };
+// for (const x of plain) {} // TypeError: plain is not iterable
+for (const [k, v] of Object.entries(plain)) console.log(k, v); // a 1
+```
+
+> **포인트**: `for...in`은 객체의 **열거 가능한 key**를 순회하고, `for...of`는 **iterable의 값**을 순회한다. 이름이 비슷하지만 완전히 다른 메커니즘이다.
+
+### Symbol.iterator 직접 구현
+
+```js
+class Range {
+  constructor(start, end, step = 1) {
+    this.start = start;
+    this.end = end;
+    this.step = step;
+  }
+
+  [Symbol.iterator]() {
+    let current = this.start;
+    const { end, step } = this;
+    return {
+      next() {
+        if (current < end) {
+          const value = current;
+          current += step;
+          return { value, done: false };
+        }
+        return { value: undefined, done: true };
+      },
+      // 순회가 중간에 끊길 때(break, throw) 호출되는 정리 훅 (선택)
+      return() {
+        console.log("cleanup!");
+        return { value: undefined, done: true };
+      },
+    };
+  }
+}
+
+const r = new Range(0, 10, 3);
+console.log([...r]); // [ 0, 3, 6, 9 ]
+
+for (const n of r) {
+  if (n > 3) break; // return() 호출됨
+  console.log(n);
+}
+// 0
+// 3
+// cleanup!
+```
+
+> **주의**: `[Symbol.iterator]()`가 매번 **새 iterator**를 반환해야 여러 번 순회할 수 있다. `return this`처럼 자기 자신을 반환하는 iterator(제너레이터 객체 등)는 한 번 소진되면 다시 순회할 수 없다.
+
+### for...of / spread가 내부에서 하는 일
+
+`for (const x of iterable)`는 대략 다음과 같이 동작한다.
+
+1. `iterable[Symbol.iterator]()`를 호출해 iterator를 얻는다.
+2. `iterator.next()`를 호출한다.
+3. 결과의 `done`이 true면 종료한다.
+4. 아니면 `value`를 `x`에 넣고 본문을 실행한 뒤 2로 돌아간다.
+5. 본문에서 `break`/`return`/예외가 발생하면 `iterator.return()`이 있을 때 호출한다.
+
+```js
+function forOf(iterable, body) {
+  const iterator = iterable[Symbol.iterator]();
+  let result = iterator.next();
+  try {
+    while (!result.done) {
+      const signal = body(result.value);
+      if (signal === "break") {
+        iterator.return?.();
+        return;
+      }
+      result = iterator.next();
+    }
+  } catch (err) {
+    iterator.return?.();
+    throw err;
+  }
+}
+
+forOf(new Set(["x", "y", "z"]), (v) => {
+  console.log(v);
+  if (v === "y") return "break";
+});
+// x
+// y
+```
+
+iterable 프로토콜을 쓰는 문법/API 목록:
+
+| 구문 | 예시 |
+| --- | --- |
+| `for...of` | `for (const v of set)` |
+| spread | `[...map.keys()]`, `Math.max(...iterable)` |
+| 배열 구조 분해 | `const [first, second] = iterable` |
+| `Array.from` | `Array.from(iterable, mapFn)` |
+| 생성자 | `new Map(entries)`, `new Set(iterable)` |
+| Promise 조합기 | `Promise.all(iterable)` |
+| `yield*` | 다른 iterable에 위임 |
+
+```js
+// 구조 분해도 필요한 만큼만 next()를 호출한다
+const [first, second] = new Range(100, Infinity);
+console.log(first, second); // 100 101
+// (cleanup! 이 먼저 출력됨: 구조 분해가 끝나면 return()으로 iterator를 닫는다)
+```
+
+## 2. 제너레이터
+
+> **비유**: 일반 함수는 **한 번 틀면 끝까지 재생되는 라디오**다. 제너레이터는 **일시정지 버튼이 있는 팟캐스트**다. `yield`에서 멈추고, 청취자가 `next()`를 누르면 멈춘 지점부터 다시 재생한다. 심지어 재개할 때 청취자가 메모(`next(value)`)를 건넬 수도 있다.
+
+### 기본 동작
+
+```js
+function* greet() {
+  console.log("start");
+  yield "hello";
+  console.log("middle");
+  yield "world";
+  console.log("end");
+  return "done";
+}
+
+const g = greet(); // 아직 아무것도 실행되지 않음! 제너레이터 객체만 생성
+console.log(g.next());
+// start
+// { value: 'hello', done: false }
+console.log(g.next());
+// middle
+// { value: 'world', done: false }
+console.log(g.next());
+// end
+// { value: 'done', done: true }
+console.log(g.next());
+// { value: undefined, done: true }
+
+console.log([...greet()]); // [ 'hello', 'world' ]  ← return 값은 포함되지 않음
+```
+
+> **주의**: `return`으로 반환한 값은 `done: true`와 함께 나오므로 `for...of`와 spread에서는 **버려진다**. 순회 대상 값은 반드시 `yield`로 내보내자.
+
+제너레이터 객체는 iterator이면서 iterable이다(`[Symbol.iterator]()`가 자기 자신을 반환).
+
+```js
+const gen = greet();
+console.log(gen[Symbol.iterator]() === gen); // true
+```
+
+### 제너레이터로 Range 다시 쓰기
+
+```js
+class Range2 {
+  constructor(start, end, step = 1) {
+    Object.assign(this, { start, end, step });
+  }
+  *[Symbol.iterator]() {
+    for (let i = this.start; i < this.end; i += this.step) yield i;
+  }
+}
+console.log([...new Range2(0, 10, 3)]); // [ 0, 3, 6, 9 ]
+```
+
+수동 구현과 비교하면 상태(`current`) 관리와 `{ value, done }` 객체 생성을 엔진이 대신 해준다.
+
+### next(value): 양방향 통신
+
+> **비유**: `yield`는 **탁구 랠리**다. 제너레이터가 공(`yield` 값)을 넘기면, 호출자는 `next(값)`으로 공을 되받아친다. 되받은 공은 `yield` 표현식의 결과값이 된다.
+
+```js
+function* conversation() {
+  const name = yield "이름이 뭐예요?";
+  const age = yield `${name}님, 나이는요?`;
+  return `${name}(${age})님 환영합니다`;
+}
+
+const chat = conversation();
+console.log(chat.next().value);       // "이름이 뭐예요?"   (첫 next의 인자는 무시됨)
+console.log(chat.next("Kim").value);  // "Kim님, 나이는요?"
+console.log(chat.next(30).value);     // "Kim(30)님 환영합니다"
+```
+
+실행 흐름:
+
+1. 첫 `next()` → 첫 번째 `yield`까지 실행하고 멈춘다. 이때 넘긴 인자를 받을 `yield`가 없으므로 첫 인자는 버려진다.
+2. `next("Kim")` → 멈춰 있던 `yield` 표현식이 `"Kim"`으로 평가되어 `name`에 들어가고, 다음 `yield`까지 실행한다.
+3. `next(30)` → `age`에 30이 들어가고 `return`까지 실행해 `done: true`.
+
+### return() / throw()
+
+```js
+function* worker() {
+  try {
+    while (true) {
+      const job = yield;
+      console.log("process", job);
+    }
+  } catch (e) {
+    console.log("caught:", e.message);
+    yield "recovered";
+  } finally {
+    console.log("cleanup");
+  }
+}
+
+const w = worker();
+w.next();           // 첫 yield까지 진행
+w.next("job-1");    // process job-1
+console.log(w.throw(new Error("boom")));
+// caught: boom
+// { value: 'recovered', done: false }
+console.log(w.return("bye"));
+// cleanup
+// { value: 'bye', done: true }
+```
+
+| 메서드 | 효과 | 결과 |
+| --- | --- | --- |
+| `next(v)` | 멈춘 `yield`가 `v`로 평가되며 재개 | 다음 `yield` 또는 `return` 값 |
+| `return(v)` | 멈춘 지점에서 `return v`를 실행한 것처럼 종료 (`finally`는 실행됨) | `{ value: v, done: true }` |
+| `throw(err)` | 멈춘 지점에서 `throw err`가 발생 | 내부에서 잡으면 계속, 아니면 밖으로 전파 |
+
+### yield*: 위임
+
+```js
+function* inner() {
+  yield 1;
+  yield 2;
+  return "inner-done";
+}
+function* outer() {
+  yield 0;
+  const r = yield* inner(); // inner의 yield를 그대로 전달, return 값을 받음
+  console.log("inner returned:", r);
+  yield* [3, 4];            // 아무 iterable에나 위임 가능
+}
+console.log([...outer()]);
+// inner returned: inner-done
+// [ 0, 1, 2, 3, 4 ]
+```
+
+## 3. 무한 시퀀스와 지연 평가
+
+> **비유**: 배열은 **뷔페**다. 먹든 안 먹든 모든 음식을 미리 만들어 깔아 둔다. 제너레이터는 **주문 즉시 조리하는 식당**이다. 손님이 주문한 만큼만 만들기 때문에 메뉴가 무한해도 주방이 터지지 않는다.
+
+```js
+function* naturals(start = 1) {
+  let n = start;
+  while (true) yield n++; // 무한 루프지만 next() 요청 시에만 한 칸씩 진행
+}
+
+function* fibonacci() {
+  let [a, b] = [0, 1];
+  while (true) {
+    yield a;
+    [a, b] = [b, a + b];
+  }
+}
+
+const fibIt = fibonacci();
+console.log(Array.from({ length: 10 }, () => fibIt.next().value));
+// [ 0, 1, 1, 2, 3, 5, 8, 13, 21, 34 ]
+
+// console.log([...naturals()]); // 무한 루프! 메모리 고갈
+```
+
+> **주의**: 무한 제너레이터에 spread나 `Array.from`을 그대로 쓰면 끝나지 않는다. 반드시 `take` 같은 종료 조건과 함께 써야 한다.
+
+## 4. 제너레이터 파이프라인: range / take / map
+
+> **비유**: 지연 파이프라인은 **공장의 컨베이어 벨트**다. 배열 메서드 체인은 공정마다 **전체 물량을 창고에 쌓은 뒤** 다음 공정으로 넘기지만, 제너레이터 파이프라인은 **부품 하나가 모든 공정을 통과한 뒤** 다음 부품이 출발한다.
+
+```js
+function* range(start, end = Infinity, step = 1) {
+  for (let i = start; i < end; i += step) yield i;
+}
+
+function* map(iterable, fn) {
+  for (const x of iterable) yield fn(x);
+}
+
+function* filter(iterable, pred) {
+  for (const x of iterable) if (pred(x)) yield x;
+}
+
+function* take(iterable, n) {
+  if (n <= 0) return;
+  for (const x of iterable) {
+    yield x;
+    if (--n <= 0) return; // 소비를 멈추면 상위 제너레이터들도 return()으로 정리됨
+  }
+}
+
+const pipeline = take(
+  map(
+    filter(range(1), (n) => {
+      console.log("filter", n);
+      return n % 2 === 0;
+    }),
+    (n) => {
+      console.log("map", n);
+      return n * n;
+    },
+  ),
+  2,
+);
+
+console.log([...pipeline]);
+// filter 1
+// filter 2
+// map 2
+// filter 3
+// filter 4
+// map 4
+// [ 4, 16 ]
+```
+
+`range(1)`은 무한인데도, `take(2)`가 두 개를 받고 멈추는 순간 전체 파이프라인이 멈춘다.
+
+```js
+// 같은 일을 배열로 하면? 무한 range는 불가능하고, 유한해도 중간 배열을 매번 만든다
+const eager = Array.from({ length: 1_000_000 }, (_, i) => i + 1)
+  .filter((n) => n % 2 === 0) // 50만 개짜리 배열 생성
+  .map((n) => n * n)          // 또 50만 개짜리 배열 생성
+  .slice(0, 2);
+console.log(eager); // [ 4, 16 ]
+```
+
+| 비교 | 배열 메서드 체인 (eager) | 제너레이터 파이프라인 (lazy) |
+| --- | --- | --- |
+| 평가 순서 | 단계별로 전체 처리 | 원소별로 전체 단계 통과 |
+| 중간 배열 | 단계마다 생성 | 없음 |
+| 무한 시퀀스 | 불가 | 가능 |
+| 조기 종료 | 마지막에야 자름 | 필요한 만큼만 계산 |
+| 작은 데이터 성능 | 보통 더 빠름 | 함수 호출 오버헤드 |
+
+> **포인트**: ES2025부터 표준 **Iterator Helpers**(`Iterator.prototype.map`, `filter`, `take`, `drop`, `toArray` 등)가 생겨 `naturals().filter(isEven).map(square).take(2).toArray()`처럼 체이닝할 수 있다. 위 구현은 그 원리를 보여주는 것이다.
+
+## 5. Async Iterator와 for await...of
+
+> **비유**: 동기 iterator가 **자판기**(버튼 누르면 즉시 음료가 나옴)라면, async iterator는 **주문 후 진동벨을 주는 카페**다. `next()`를 부르면 음료가 아니라 **진동벨(Promise)** 이 나오고, 벨이 울리면(resolve) 음료(`{ value, done }`)를 받는다.
+
+| 구분 | 동기 | 비동기 |
+| --- | --- | --- |
+| 프로토콜 메서드 | `[Symbol.iterator]()` | `[Symbol.asyncIterator]()` |
+| `next()` 반환 | `{ value, done }` | `Promise` of `{ value, done }` |
+| 제너레이터 | `function*` | `async function*` |
+| 순회 문법 | `for...of` | `for await...of` |
+
+```js
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function* ticker(count, ms) {
+  for (let i = 1; i <= count; i++) {
+    await sleep(ms);
+    yield i;
+  }
+}
+
+for await (const t of ticker(3, 100)) {
+  console.log("tick", t);
+}
+// (100ms) tick 1
+// (200ms) tick 2
+// (300ms) tick 3
+```
+
+### 페이지네이션 API
+
+```js
+// 가짜 API: cursor 기반 페이지네이션
+const DB = Array.from({ length: 7 }, (_, i) => ({ id: i + 1 }));
+async function fetchPage(cursor = 0, size = 3) {
+  await sleep(50);
+  const items = DB.slice(cursor, cursor + size);
+  const next = cursor + size < DB.length ? cursor + size : null;
+  return { items, next };
+}
+
+async function* paginate() {
+  let cursor = 0;
+  while (cursor !== null) {
+    const { items, next } = await fetchPage(cursor);
+    console.log(`(page fetched: cursor=${cursor})`);
+    yield* items; // 페이지 단위가 아니라 아이템 단위로 흘려보냄
+    cursor = next;
+  }
+}
+
+for await (const item of paginate()) {
+  console.log(item.id);
+  if (item.id === 4) break; // 필요한 만큼만 → 남은 페이지는 요청하지 않음
+}
+// (page fetched: cursor=0)
+// 1
+// 2
+// 3
+// (page fetched: cursor=3)
+// 4
+```
+
+> **포인트**: 호출하는 쪽은 "페이지"라는 개념을 몰라도 된다. 커서 관리, 재시도, rate limit 대기를 전부 async 제너레이터 안에 숨길 수 있다. 실제로 GitHub Octokit, AWS SDK v3의 paginator가 이 패턴을 쓴다.
+
+### Node.js stream
+
+Node.js의 Readable stream은 async iterable이다.
+
+```js
+// Node.js (ESM)
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
+
+async function countErrors(path) {
+  const rl = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
+  let errors = 0;
+  for await (const line of rl) {
+    // 파일 전체를 메모리에 올리지 않고 한 줄씩 처리
+    if (line.includes("ERROR")) errors++;
+  }
+  return errors;
+}
+
+// const n = await countErrors("./app.log");
+// console.log(n);
+```
+
+> **주의**: `for await...of`로 stream을 읽으면 **backpressure**가 자연스럽게 걸린다(본문이 끝나야 다음 chunk를 요청). 대신 본문이 순차 실행되므로, 병렬 처리가 필요하면 배치로 묶어 `Promise.all`을 쓰자.
+
+> **주의**: `for await...of`는 `async` 함수 안 또는 ES Module의 top-level에서만 쓸 수 있다. 또 일반 배열의 Promise들을 순회할 때는 각 Promise를 순서대로 await할 뿐, 병렬로 기다리는 `Promise.all`과는 다르다.
+
+## 6. 제너레이터와 async/await: 코루틴
+
+> **비유**: 코루틴은 **릴레이 대신 번갈아 운전하는 두 운전자**다. 한 사람(제너레이터)이 운전하다 휴게소(`yield`)에 멈추면, 다른 사람(실행기)이 일을 처리하고 다시 운전대를 돌려준다. async/await는 이 교대 규칙을 언어가 표준화한 것이다.
+
+제너레이터는 **멈추고 재개할 수 있는 함수**, 즉 코루틴이다. "Promise를 `yield`하고, resolve되면 그 값으로 `next()` 해주는 실행기"만 있으면 async/await를 흉내낼 수 있다.
+
+```js
+function run(genFn) {
+  return new Promise((resolve, reject) => {
+    const gen = genFn();
+
+    function step(method, arg) {
+      let result;
+      try {
+        result = gen[method](arg); // next(value) 또는 throw(err)
+      } catch (err) {
+        return reject(err);
+      }
+      if (result.done) return resolve(result.value);
+      Promise.resolve(result.value).then(
+        (v) => step("next", v),
+        (e) => step("throw", e),
+      );
+    }
+
+    step("next");
+  });
+}
+
+const fakeFetch = (v, ms) => new Promise((r) => setTimeout(() => r(v), ms));
+
+// 제너레이터 + 실행기 버전
+run(function* () {
+  const user = yield fakeFetch({ id: 1, name: "Kim" }, 50);
+  const posts = yield fakeFetch([`post by ${user.name}`], 50);
+  return posts;
+}).then((r) => console.log("gen:", r)); // gen: [ 'post by Kim' ]
+
+// async/await 버전 (같은 동작)
+(async function () {
+  const user = await fakeFetch({ id: 1, name: "Kim" }, 50);
+  const posts = await fakeFetch([`post by ${user.name}`], 50);
+  console.log("async:", posts); // async: [ 'post by Kim' ]
+})();
+```
+
+| 제너레이터 + 실행기 | async/await |
+| --- | --- |
+| `function*` | `async function` |
+| `yield promise` | `await promise` |
+| `run()` 같은 실행기 필요 (co 라이브러리) | 엔진 내장 |
+| 반환값을 직접 Promise로 감싸야 함 | 자동으로 Promise 반환 |
+
+> **포인트**: async/await 이전에는 TJ의 `co` 라이브러리와 Koa v1이 정확히 이 방식으로 비동기 코드를 동기처럼 썼다. Babel/TypeScript가 ES5 타깃으로 async 함수를 변환할 때도 제너레이터(또는 상태 머신)로 바꾼다. redux-saga도 제너레이터의 "멈춤"을 이용해 사이드 이펙트를 선언적으로 다룬다.
+
+## 7. RxJS Observable과의 비교: Pull vs Push
+
+> **비유**: iterator는 **책장에서 책을 한 권씩 꺼내 읽는 것**(내가 원할 때 꺼냄, pull)이고, Observable은 **신문 구독**(발행사가 정해진 때 집 앞에 던져줌, push)이다. 읽는 속도는 내가 정하느냐, 보내는 쪽이 정하느냐의 차이다.
+
+|  | 단일 값 | 여러 값 |
+| --- | --- | --- |
+| **Pull** (소비자가 요청) | 함수 호출 | Iterator / Generator |
+| **Push** (생산자가 전달) | Promise | Observable |
+
+```js
+// Pull: 소비자가 주도
+function* pullSource() {
+  yield 1;
+  yield 2;
+  yield 3;
+}
+const src = pullSource();
+console.log(src.next().value); // 1  ← 내가 원할 때 가져옴
+// ...한참 뒤
+console.log(src.next().value); // 2
+
+// Push: 생산자가 주도 (간단한 Observable 구현)
+function createObservable(subscribe) {
+  return { subscribe };
+}
+const pushSource = createObservable((observer) => {
+  let i = 0;
+  const id = setInterval(() => {
+    i++;
+    observer.next(i);
+    if (i === 3) {
+      clearInterval(id);
+      observer.complete();
+    }
+  }, 100);
+  return () => clearInterval(id); // unsubscribe
+});
+
+const unsubscribe = pushSource.subscribe({
+  next: (v) => console.log("push", v),
+  complete: () => console.log("complete"),
+});
+// push 1
+// push 2
+// push 3
+// complete
+```
+
+| 관점 | Iterator / Generator | Async Iterator | Observable (RxJS) |
+| --- | --- | --- | --- |
+| 모델 | pull (동기) | pull (비동기) | push |
+| 속도 제어 | 소비자 | 소비자 (backpressure 자연 발생) | 생산자 (backpressure는 연산자로 처리) |
+| 시작 시점 | 첫 `next()` | 첫 `next()` | `subscribe()` |
+| 취소 | `return()` 또는 `break` | `return()` 또는 `break` | `unsubscribe()` |
+| 시간 연산 | 없음 | 직접 구현 | `debounceTime`, `throttleTime` 등 풍부 |
+| 다중 구독자 | 각자 새 iterator | 각자 새 iterator | cold/hot, `share()`로 멀티캐스트 |
+| 적합한 곳 | 컬렉션 순회, 지연 계산 | 페이지네이션, 파일/네트워크 stream | UI 이벤트, WebSocket, 복잡한 이벤트 조합 |
+
+> **포인트**: 데이터를 **내 페이스로 소비**해야 하면 (async) iterator, **언제 올지 모르는 이벤트에 반응**해야 하면 Observable이 자연스럽다. RxJS의 `from(asyncIterable)`로 둘을 연결할 수도 있다.
+
+> **주의**: push 모델에서 생산자가 소비자보다 빠르면 버퍼가 무한히 쌓일 수 있다. Observable에서는 `bufferTime`, `sampleTime`, `throttleTime` 같은 연산자로 직접 속도를 조절해야 한다.
+
+## 셀프 체크
+
+**Q1. 어떤 객체를 `for...of`로 순회 가능하게 만들려면 무엇을 구현해야 하는가?**
+
+**A.** `[Symbol.iterator]()` 메서드를 구현해, `next()`가 `{ value, done }`을 반환하는 iterator 객체를 돌려주면 된다. 가장 쉬운 방법은 `*[Symbol.iterator]()`를 제너레이터 메서드로 정의하는 것이다.
+
+**Q2. `[...gen()]`의 결과에 제너레이터의 `return` 값이 포함되는가?**
+
+**A.** 포함되지 않는다. `return` 값은 `done: true`인 결과에 실려 오는데, `for...of`와 spread는 `done`이 true가 되는 순간 그 `value`를 버리고 종료한다.
+
+**Q3. `const g = gen(); g.next("a"); g.next("b");`에서 첫 번째 `yield` 표현식의 결과값은?**
+
+**A.** `"b"`다. 첫 `next()`는 함수 시작부터 첫 `yield`까지 실행할 뿐이고, 그 인자 `"a"`를 받을 `yield`가 없어 버려진다. 두 번째 `next("b")`가 멈춰 있던 첫 `yield`를 `"b"`로 재개한다.
+
+**Q4. 무한 `range()`에 `filter`, `map`, `take(2)`를 제너레이터로 연결해도 무한 루프가 안 생기는 이유는?**
+
+**A.** 제너레이터는 지연 평가라서 `take`가 값을 요청할 때만 상위 단계가 한 칸씩 진행한다. `take`가 2개를 받고 `return`하면 더 이상 `next()`가 호출되지 않고, 상위 제너레이터들도 `return()`으로 정리된다.
+
+**Q5. async iterator와 RxJS Observable의 가장 큰 차이는?**
+
+**A.** async iterator는 소비자가 `next()`로 다음 값을 **당겨오는 pull** 모델이라 소비 속도에 맞춰 생산이 조절된다. Observable은 생산자가 값을 **밀어주는 push** 모델이라 소비자가 느리면 별도 연산자로 속도를 제어해야 한다.
+
+## 핵심 정리
+
+- iterable은 `[Symbol.iterator]()`를, iterator는 `next()`를 가진다. 이 프로토콜 위에 `for...of`, spread, 구조 분해, `Array.from`, `Promise.all`이 올라가 있다.
+- `for...of`가 `break`/예외로 끝나면 iterator의 `return()`이 호출되어 정리 기회를 준다.
+- `function*`은 iterator를 만드는 가장 쉬운 방법이고, 제너레이터 객체는 iterator이자 iterable이다(한 번만 순회 가능).
+- `next(v)`로 값을 주입하고, `return()`/`throw()`로 외부에서 종료나 예외를 일으킬 수 있다. `yield*`는 다른 iterable에 위임한다.
+- 제너레이터는 지연 평가라 무한 시퀀스와 중간 배열 없는 파이프라인을 만들 수 있다. ES2025 Iterator Helpers가 이를 표준화했다.
+- `async function*` + `for await...of`로 페이지네이션, 파일/네트워크 stream을 아이템 단위로 자연스럽게 다룬다.
+- async/await는 "Promise를 yield하는 제너레이터 + 자동 실행기"라는 코루틴 패턴을 언어에 내장한 것이다.
+- iterator는 pull, Observable은 push. 소비 속도를 내가 정하면 iterator, 이벤트에 반응하면 Observable.

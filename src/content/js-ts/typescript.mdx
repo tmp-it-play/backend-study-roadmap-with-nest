@@ -1,0 +1,631 @@
+---
+title: "TypeScript 심화"
+description: "제네릭, 유틸리티 타입 직접 구현, Mapped/Conditional Types, infer, Template Literal Types, satisfies, 타입 가드, Discriminated Union, 오버로드, 데코레이터까지 TS 타입 시스템 심화 정리."
+order: 10
+---
+
+## 한눈에 보기
+
+- **제네릭**은 "타입을 인자로 받는 함수"다. `extends`로 범위를 제한하고 `keyof`로 키를 안전하게 다룬다.
+- `Partial`, `Pick`, `Omit` 같은 유틸리티 타입은 전부 **Mapped Types + 조건부 타입 + infer**로 직접 만들 수 있다.
+- 조건부 타입은 유니언에 대해 **분배**된다. 막고 싶으면 `[T] extends [U]`로 감싼다.
+- `satisfies`는 "타입 검사는 하되 추론된 구체적인 타입은 유지"한다. `as`는 검사를 끄는 것이라 최후의 수단이다.
+- 유니언은 **타입 가드**로 좁히고, Discriminated Union + `never`로 빠진 case를 컴파일 타임에 잡는다.
+
+## 1. 제네릭 (Generics)
+
+> **비유**: 제네릭은 **붕어빵 틀**이다. 틀(함수/타입)은 하나지만, 어떤 반죽(타입)을 넣느냐에 따라 팥 붕어빵, 슈크림 붕어빵이 나온다. 틀을 만들 때는 "어떤 반죽인지"를 `T`라는 빈칸으로 남겨둔다.
+
+### 왜 필요한가
+
+```ts
+// any를 쓰면 타입 정보가 사라진다
+function firstAny(arr: any[]): any {
+  return arr[0];
+}
+const a = firstAny([1, 2, 3]); // any → 오타를 내도 에러가 안 남
+
+// 제네릭: 입력 타입과 출력 타입을 연결
+function first<T>(arr: T[]): T | undefined {
+  return arr[0];
+}
+const n = first([1, 2, 3]);      // number | undefined
+const s = first(["a", "b"]);     // string | undefined
+const x = first<boolean>([true]); // 명시적으로 지정도 가능
+```
+
+### 인터페이스 / 타입 / 클래스 제네릭
+
+```ts
+interface ApiResponse<T> {
+  data: T;
+  status: number;
+  error?: string;
+}
+
+type User = { id: number; name: string };
+const res: ApiResponse<User[]> = { data: [], status: 200 };
+
+class Stack<T> {
+  private items: T[] = [];
+  push(item: T) { this.items.push(item); }
+  pop(): T | undefined { return this.items.pop(); }
+}
+
+const stack = new Stack<number>();
+stack.push(1);
+stack.push("a"); // X Argument of type 'string' is not assignable to 'number'
+```
+
+### 제약 조건 `extends`
+
+`T extends X`는 "T는 최소한 X의 모양을 가져야 한다"는 뜻이다.
+
+```ts
+function getLength<T extends { length: number }>(v: T): number {
+  return v.length;
+}
+getLength("hello");   // 5
+getLength([1, 2]);    // 2
+getLength(123);       // X number에는 length가 없음
+```
+
+### `keyof`와 함께 쓰기
+
+```ts
+function getProp<T, K extends keyof T>(obj: T, key: K): T[K] {
+  return obj[key];
+}
+
+const user = { id: 1, name: "Kim" };
+getProp(user, "name");  // string
+getProp(user, "id");    // number
+getProp(user, "age");   // X '"age"' is not assignable to '"id" | "name"'
+```
+
+`keyof T`는 T의 키들을 유니언으로 만들고, `T[K]`(indexed access)는 그 키의 값 타입을 꺼낸다.
+
+### 기본 타입 파라미터
+
+```ts
+interface Paginated<T, Meta = { total: number }> {
+  items: T[];
+  meta: Meta;
+}
+
+const p1: Paginated<User> = { items: [], meta: { total: 0 } };
+const p2: Paginated<User, { cursor: string }> = { items: [], meta: { cursor: "abc" } };
+```
+
+> **포인트**: 제네릭은 "입력과 출력의 타입 관계"를 표현할 때 쓴다. 타입 파라미터가 한 번만 등장한다면 제네릭이 필요 없을 가능성이 높다.
+
+## 2. 유틸리티 타입
+
+> **비유**: 이미 있는 설계도(타입)를 **복사기 옵션**으로 변형하는 것. "모든 칸 선택사항으로"(Partial), "이 칸들만 복사"(Pick), "이 칸 빼고 복사"(Omit), "읽기 전용 도장 찍기"(Readonly).
+
+| 유틸리티 타입 | 설명 | 예시 결과 |
+| --- | --- | --- |
+| `Partial<T>` | 모든 속성을 optional로 | `{ a?: string }` |
+| `Required<T>` | 모든 속성을 필수로 | `{ a: string }` |
+| `Readonly<T>` | 모든 속성을 readonly로 | `{ readonly a: string }` |
+| `Pick<T, K>` | K 속성만 선택 | `Pick<User, "id">` → `{ id: number }` |
+| `Omit<T, K>` | K 속성만 제외 | `Omit<User, "id">` → `{ name: string }` |
+| `Record<K, V>` | 키 K, 값 V인 객체 | `Record<"a" \| "b", number>` |
+| `Exclude<T, U>` | 유니언 T에서 U 제거 | `Exclude<"a" \| "b", "a">` → `"b"` |
+| `Extract<T, U>` | 유니언 T에서 U만 추출 | `Extract<"a" \| 1, string>` → `"a"` |
+| `NonNullable<T>` | null, undefined 제거 | `NonNullable<string \| null>` → `string` |
+| `ReturnType<F>` | 함수 반환 타입 | `ReturnType<() => number>` → `number` |
+| `Parameters<F>` | 함수 매개변수 튜플 | `Parameters<(a: string) => void>` → `[a: string]` |
+| `Awaited<T>` | Promise를 재귀적으로 벗김 | `Awaited<Promise<Promise<number>>>` → `number` |
+| `InstanceType<C>` | 생성자의 인스턴스 타입 | `InstanceType<typeof Stack>` |
+
+### 실무 예시
+
+```ts
+interface User {
+  id: number;
+  name: string;
+  email: string;
+  password: string;
+}
+
+type CreateUserDto = Omit<User, "id">;              // id는 서버가 생성
+type UpdateUserDto = Partial<Omit<User, "id">>;     // 일부만 수정 가능
+type PublicUser = Omit<User, "password">;            // 응답에서 비밀번호 제거
+type UserMap = Record<number, PublicUser>;           // id → user
+
+async function fetchUser() {
+  return { id: 1, name: "Kim" };
+}
+type Fetched = Awaited<ReturnType<typeof fetchUser>>; // { id: number; name: string }
+```
+
+### 직접 구현해보기
+
+아래 구현이 이해되면 TS 타입 시스템의 80%를 이해한 것이다. 각 문법은 다음 섹션에서 자세히 본다.
+
+```ts
+type MyPartial<T> = { [K in keyof T]?: T[K] };
+type MyRequired<T> = { [K in keyof T]-?: T[K] };
+type MyReadonly<T> = { readonly [K in keyof T]: T[K] };
+type MyPick<T, K extends keyof T> = { [P in K]: T[P] };
+type MyRecord<K extends keyof any, V> = { [P in K]: V };
+
+type MyExclude<T, U> = T extends U ? never : T;
+type MyExtract<T, U> = T extends U ? T : never;
+type MyNonNullable<T> = T extends null | undefined ? never : T;
+type MyOmit<T, K extends keyof any> = MyPick<T, MyExclude<keyof T, K>>;
+
+type MyReturnType<F> = F extends (...args: any[]) => infer R ? R : never;
+type MyParameters<F> = F extends (...args: infer P) => any ? P : never;
+type MyAwaited<T> = T extends PromiseLike<infer V> ? MyAwaited<V> : T;
+type MyInstanceType<C> = C extends abstract new (...args: any) => infer I ? I : never;
+```
+
+> **주의**: `Omit`의 `K`는 `keyof T`로 제한되어 있지 않다. 그래서 `Omit<User, "pasword">`처럼 오타를 내도 에러가 나지 않는다. 엄격하게 하고 싶으면 `K extends keyof T`인 자체 `StrictOmit`을 만들어 쓰자.
+
+## 3. Mapped Types
+
+> **비유**: 엑셀에서 **모든 행에 같은 수식을 일괄 적용**하는 것. `[K in keyof T]`가 "각 행(키)마다", 오른쪽이 "적용할 수식"이다.
+
+```ts
+type Flags<T> = { [K in keyof T]: boolean };
+
+type Features = { darkMode: () => void; beta: () => void };
+type FeatureFlags = Flags<Features>;
+// { darkMode: boolean; beta: boolean }
+```
+
+### `+` / `-` modifier
+
+`readonly`와 `?`를 붙이거나(`+`, 생략 가능) 뗄 수(`-`) 있다.
+
+```ts
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+type Concrete<T> = { [K in keyof T]-?: T[K] };
+
+type Locked = { readonly id: number; name?: string };
+type Unlocked = Mutable<Concrete<Locked>>;
+// { id: number; name: string }
+```
+
+### `as`로 키 리매핑 (TS 4.1+)
+
+```ts
+type Getters<T> = {
+  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+
+type Person = { name: string; age: number };
+type PersonGetters = Getters<Person>;
+// { getName: () => string; getAge: () => number }
+
+// as + never로 키 필터링
+type OnlyStrings<T> = {
+  [K in keyof T as T[K] extends string ? K : never]: T[K];
+};
+type S = OnlyStrings<Person>; // { name: string }
+```
+
+## 4. 조건부 타입 (Conditional Types)
+
+> **비유**: 타입 세계의 **삼항 연산자**. "이 타입이 저 모양에 들어맞으면 A, 아니면 B".
+
+```ts
+type IsString<T> = T extends string ? true : false;
+
+type A = IsString<"hi">;  // true
+type B = IsString<42>;    // false
+```
+
+### 분배 조건부 타입 (Distributive)
+
+> **비유**: 택배 상자 여러 개(유니언)를 검사대에 올리면, 상자를 **하나씩 따로** 검사해서 결과를 다시 모은다.
+
+`T`가 **naked 타입 파라미터**이고 유니언이 들어오면 각 멤버에 개별 적용된 뒤 유니언으로 합쳐진다.
+
+```ts
+type ToArray<T> = T extends any ? T[] : never;
+
+type R1 = ToArray<string | number>;
+// 단계별:
+// 1. ToArray<string> | ToArray<number>
+// 2. string[] | number[]
+```
+
+`Exclude`가 동작하는 원리도 이것이다.
+
+```ts
+type R2 = Exclude<"a" | "b" | "c", "a">;
+// ("a" extends "a" ? never : "a") | ("b" extends "a" ? never : "b") | ...
+// never | "b" | "c"  →  "b" | "c"
+```
+
+### `[T] extends [U]`로 분배 막기
+
+```ts
+type ToArrayNoDist<T> = [T] extends [any] ? T[] : never;
+type R3 = ToArrayNoDist<string | number>; // (string | number)[]
+
+// never 판별: never는 "빈 유니언"이라 분배되면 결과도 never가 된다
+type IsNeverWrong<T> = T extends never ? true : false;
+type IsNever<T> = [T] extends [never] ? true : false;
+
+type W = IsNeverWrong<never>; // never  
+type Y = IsNever<never>;      // true
+```
+
+> **주의**: 분배는 `T`가 감싸지지 않은 채로 `extends` 왼쪽에 있을 때만 일어난다. 결과가 예상과 다르면 분배 여부부터 의심하자.
+
+## 5. infer
+
+> **비유**: 패턴 매칭으로 **빈칸 채우기 문제**를 푸는 것. "`Promise<___>` 모양이면 빈칸에 뭐가 들어있는지 `V`라고 이름 붙여서 꺼내줘."
+
+`infer`는 조건부 타입의 `extends` 절 안에서만 쓸 수 있다.
+
+### ReturnType 구현
+
+```ts
+type MyReturnType<F> = F extends (...args: any[]) => infer R ? R : never;
+
+type T1 = MyReturnType<() => string>;            // string
+type T2 = MyReturnType<(x: number) => boolean[]>; // boolean[]
+```
+
+### Promise 언래핑
+
+```ts
+type UnwrapPromise<T> = T extends Promise<infer V> ? UnwrapPromise<V> : T;
+
+type U1 = UnwrapPromise<Promise<Promise<number>>>; // number
+type U2 = UnwrapPromise<string>;                   // string
+```
+
+### 튜플 첫 요소 / 마지막 요소
+
+```ts
+type First<T extends unknown[]> = T extends [infer F, ...unknown[]] ? F : never;
+type Last<T extends unknown[]> = T extends [...unknown[], infer L] ? L : never;
+
+type F1 = First<[1, 2, 3]>; // 1
+type L1 = Last<[1, 2, 3]>;  // 3
+type F2 = First<[]>;        // never
+```
+
+### 문자열 템플릿 파싱
+
+```ts
+type ExtractParams<S extends string> =
+  S extends `${string}:${infer P}/${infer Rest}`
+    ? P | ExtractParams<`/${Rest}`>
+    : S extends `${string}:${infer P}`
+      ? P
+      : never;
+
+type Params = ExtractParams<"/users/:id/posts/:postId">;
+// "id" | "postId"
+
+function route<P extends string>(
+  path: P,
+  params: Record<ExtractParams<P>, string>
+) { /* ... */ }
+
+route("/users/:id", { id: "1" });     // O
+route("/users/:id", { userId: "1" }); // X 'id' 속성이 없음
+```
+
+단계별 동작:
+
+1. `"/users/:id/posts/:postId"`가 `${string}:${infer P}/${infer Rest}`에 매칭 → `P = "id"`, `Rest = "posts/:postId"`
+2. 재귀: `"/posts/:postId"`는 `:` 뒤에 `/`가 없어 첫 패턴 실패 → 두 번째 패턴으로 `P = "postId"`
+3. 결과: `"id" | "postId"`
+
+## 6. Template Literal Types
+
+> **비유**: 문자열 타입용 **조립 블록**. 블록 조각(유니언)들을 끼우면 가능한 모든 조합이 자동으로 만들어진다.
+
+```ts
+type Color = "red" | "blue";
+type Size = "sm" | "lg";
+
+type ClassName = `${Color}-${Size}`;
+// "red-sm" | "red-lg" | "blue-sm" | "blue-lg"
+
+type EventName<T extends string> = `on${Capitalize<T>}`;
+type ClickHandler = EventName<"click">; // "onClick"
+
+// 내장 문자열 유틸: Uppercase, Lowercase, Capitalize, Uncapitalize
+type Shout = Uppercase<"hello">; // "HELLO"
+
+// 패턴 강제
+type Px = `${number}px`;
+const w: Px = "100px"; // O
+const h: Px = "100";   // X
+```
+
+## 7. satisfies, as, as const
+
+> **비유**: 타입 어노테이션은 "이 상자는 **과일 상자**야"라고 라벨을 붙여서 안에 사과가 있다는 정보가 사라지는 것, `satisfies`는 "**과일 상자 규격에 맞는지 검사만** 받고 라벨은 '사과 상자' 그대로 유지", `as`는 "검사 없이 **라벨만 바꿔 붙이는** 것(거짓말 가능)"이다.
+
+```ts
+type Theme = Record<"primary" | "secondary", string | [number, number, number]>;
+
+// 1) 타입 어노테이션: 검사 O, 구체적 타입 정보 손실
+const t1: Theme = { primary: "#fff", secondary: [0, 0, 0] };
+t1.primary.toUpperCase(); // X string | [number, number, number]일 수 있음
+
+// 2) satisfies: 검사 O, 추론된 구체적 타입 유지
+const t2 = { primary: "#fff", secondary: [0, 0, 0] } satisfies Theme;
+t2.primary.toUpperCase(); // O string으로 알고 있음
+t2.secondary[0];          // O number
+
+const t3 = { primary: "#fff" } satisfies Theme; // X secondary 누락을 잡아줌
+
+// 3) as: 검사 X (단언)
+const t4 = { primary: "#fff" } as Theme; // 에러 없음 secondary 누락
+```
+
+| 방식 | 타입 검사 | 결과 타입 | 용도 |
+| --- | --- | --- | --- |
+| `const x: T = v` | O | `T` (넓어짐) | 변수 타입을 고정할 때 |
+| `v satisfies T` | O | `v`의 추론 타입 | 설정 객체, 상수 맵 |
+| `v as T` | 거의 X | `T` | 내가 컴파일러보다 확실히 알 때만 |
+
+### as const
+
+리터럴 타입을 유지하고 전부 `readonly`로 만든다.
+
+```ts
+const roles = ["admin", "user", "guest"] as const;
+// readonly ["admin", "user", "guest"]
+
+type Role = (typeof roles)[number]; // "admin" | "user" | "guest"
+
+// satisfies와 조합: 리터럴 유지 + 형태 검사
+const routes = {
+  home: "/",
+  user: "/users/:id",
+} as const satisfies Record<string, `/${string}`>;
+```
+
+> **주의**: `as unknown as T` 같은 이중 단언은 사실상 타입 검사를 꺼버린다. 외부 데이터는 단언 대신 zod 같은 런타임 검증 + 타입 가드로 다루자.
+
+## 8. 타입 가드 (Narrowing)
+
+> **비유**: 공항 보안 검색대. 통과하기 전엔 "승객(유니언)"이지만, 검색대(if 문)를 통과하고 나면 "여권 확인된 내국인"처럼 **신분이 좁혀진다**.
+
+```ts
+// typeof: 원시 타입
+function pad(v: string | number) {
+  if (typeof v === "string") return v.padStart(4); // string
+  return v.toFixed(2);                              // number
+}
+
+// instanceof: 클래스
+function handle(e: Error | Response) {
+  if (e instanceof Error) return e.message;
+  return e.status;
+}
+
+// in: 속성 존재 여부
+type Fish = { swim: () => void };
+type Bird = { fly: () => void };
+function move(a: Fish | Bird) {
+  if ("swim" in a) a.swim(); // Fish
+  else a.fly();              // Bird
+}
+```
+
+### 사용자 정의 타입 가드 `is`
+
+```ts
+function isString(v: unknown): v is string {
+  return typeof v === "string";
+}
+
+const values: unknown[] = ["a", 1, "b"];
+const strs = values.filter(isString); // string[]
+```
+
+> **주의**: `is`는 컴파일러가 **내 말을 믿는** 것이다. 함수 본문이 틀려도(예: 항상 true 반환) 에러가 나지 않는다. 판별 로직을 꼼꼼히 쓰자. (TS 5.5부터는 단순한 filter 콜백은 자동으로 타입 가드로 추론된다.)
+
+### asserts
+
+조건을 만족하지 않으면 throw 하고, 이후 코드에서 타입을 좁힌다.
+
+```ts
+function assertIsDefined<T>(v: T): asserts v is NonNullable<T> {
+  if (v == null) throw new Error("값이 없습니다");
+}
+
+function process(user: User | undefined) {
+  assertIsDefined(user);
+  user.name; // O 이후로는 User
+}
+```
+
+## 9. Discriminated Union + exhaustive check
+
+> **비유**: 택배 상자마다 붙은 **분류 스티커**(`kind`). 분류 직원은 스티커만 보고 어느 컨베이어로 보낼지 정한다. 새 종류의 상자가 추가됐는데 분류 규칙이 없으면 `never` 경보가 울린다.
+
+```ts
+type Shape =
+  | { kind: "circle"; radius: number }
+  | { kind: "rect"; width: number; height: number }
+  | { kind: "triangle"; base: number; height: number };
+
+function area(s: Shape): number {
+  switch (s.kind) {
+    case "circle":
+      return Math.PI * s.radius ** 2; // s: circle로 좁혀짐
+    case "rect":
+      return s.width * s.height;
+    case "triangle":
+      return (s.base * s.height) / 2;
+    default: {
+      const _exhaustive: never = s; // 모든 case를 처리했다면 s는 never
+      throw new Error(`Unknown shape: ${JSON.stringify(_exhaustive)}`);
+    }
+  }
+}
+```
+
+나중에 `{ kind: "square"; size: number }`를 추가하고 case를 빠뜨리면, `default`에서 `s`가 `never`가 아니게 되어 **컴파일 에러**가 난다. 런타임 전에 누락을 잡는 것이다.
+
+실무에서 자주 쓰는 형태는 비동기 상태 표현이다.
+
+```ts
+type AsyncState<T> =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; data: T }
+  | { status: "error"; error: Error };
+// data와 error가 동시에 존재하는 "불가능한 상태"를 타입으로 차단
+```
+
+## 10. 함수 오버로드
+
+> **비유**: 식당 메뉴판에 "세트 A: 버거만 주문 → 버거", "세트 B: 버거 + 음료 → 세트 영수증"처럼 **주문 방식별 결과를 따로 명시**하는 것.
+
+```ts
+// 오버로드 시그니처 (외부에 보이는 것)
+function parse(input: string): number;
+function parse(input: string[]): number[];
+// 구현 시그니처 (외부에서 직접 호출 불가)
+function parse(input: string | string[]): number | number[] {
+  return Array.isArray(input) ? input.map(Number) : Number(input);
+}
+
+const a = parse("1");          // number
+const b = parse(["1", "2"]);   // number[]
+```
+
+> **포인트**: 반환 타입이 입력에 따라 달라지지 않는다면 오버로드 대신 유니언 매개변수 하나로 충분하다. 오버로드는 **위에서부터** 매칭되므로 구체적인 시그니처를 먼저 쓴다.
+
+## 11. 데코레이터
+
+> **비유**: 선물 상자에 **포장지와 리본**을 두르는 것. 내용물(클래스, 메서드)은 그대로 두고 겉에 기능(로깅, 라우팅, 의존성 주입 메타데이터)을 덧입힌다.
+
+### 두 가지 데코레이터
+
+| 항목 | Legacy (`experimentalDecorators`) | TC39 표준 (TS 5.0+) |
+| --- | --- | --- |
+| 설정 | tsconfig에 `experimentalDecorators: true` | 별도 설정 불필요 |
+| 시그니처 | `(target, key, descriptor)` | `(value, context)` |
+| 매개변수 데코레이터 | 지원 | 미지원 |
+| `emitDecoratorMetadata` | 지원 (reflect-metadata) | 미지원 |
+| 사용처 | NestJS, TypeORM, Angular | 신규 라이브러리 |
+
+### TC39 표준 데코레이터
+
+```ts
+function logged<This, Args extends any[], R>(
+  target: (this: This, ...args: Args) => R,
+  context: ClassMethodDecoratorContext
+) {
+  const name = String(context.name);
+  return function (this: This, ...args: Args): R {
+    console.log(`→ ${name}(${args.join(", ")})`);
+    const result = target.call(this, ...args);
+    console.log(`← ${name} = ${result}`);
+    return result;
+  };
+}
+
+class Calc {
+  @logged
+  add(a: number, b: number) {
+    return a + b;
+  }
+}
+
+new Calc().add(1, 2);
+// → add(1, 2)
+// ← add = 3
+```
+
+### NestJS와의 연결고리
+
+NestJS는 legacy 데코레이터 + `reflect-metadata`로 동작한다.
+
+```ts
+@Controller("users")
+export class UsersController {
+  constructor(private readonly usersService: UsersService) {}
+
+  @Get(":id")
+  findOne(@Param("id") id: string) {
+    return this.usersService.findOne(+id);
+  }
+}
+```
+
+1. `@Controller`, `@Get`은 클래스/메서드에 "라우팅 정보"를 **메타데이터로 기록**만 한다.
+2. `emitDecoratorMetadata`가 생성자 매개변수 타입(`UsersService`)을 메타데이터로 남긴다.
+3. NestJS가 부팅 시 메타데이터를 읽어 라우터를 등록하고, 생성자 타입을 보고 의존성을 주입(DI)한다.
+
+> **주의**: `@Param()` 같은 **매개변수 데코레이터**는 TC39 표준에 없다. 그래서 NestJS 프로젝트는 `experimentalDecorators`와 `emitDecoratorMetadata`를 켜야 한다.
+
+## 12. unknown vs any vs never
+
+> **비유**: `any`는 **검사 없이 통과하는 프리패스**(위험), `unknown`은 **내용물 모르는 밀봉 상자**(열어보기 전엔 못 씀), `never`는 **절대 존재할 수 없는 빈 상자**(공집합).
+
+| 타입 | 무엇이든 할당 가능? | 다른 타입에 할당 가능? | 메서드 호출 | 의미 |
+| --- | --- | --- | --- | --- |
+| `any` | O | O (아무 데나) | 검사 없이 허용 | 타입 검사 포기 |
+| `unknown` | O | `any`, `unknown`에만 | 좁히기 전엔 불가 | 안전한 top type |
+| `never` | X (never만) | O (모든 타입에) | 해당 없음 | bottom type, 공집합 |
+
+```ts
+let a: any = "hi";
+a.foo.bar();         // 컴파일 OK, 런타임 
+
+let u: unknown = "hi";
+u.toUpperCase();     // X 'u' is of type 'unknown'
+if (typeof u === "string") u.toUpperCase(); // O
+
+function fail(msg: string): never {
+  throw new Error(msg); // 절대 정상 반환하지 않음
+}
+
+type T = string & number; // never (둘 다인 값은 없음)
+```
+
+> **포인트**: 외부 입력(`JSON.parse`, API 응답, `catch (e)`)은 `any` 대신 `unknown`으로 받고 타입 가드로 좁히자. `useUnknownInCatchVariables`(strict에 포함)가 켜져 있으면 `catch`의 `e`는 기본적으로 `unknown`이다.
+
+## 셀프 체크
+
+**Q1. `type R = Exclude<"a" | "b" | "c", "a" | "b">`의 결과와, 그렇게 되는 원리는?**
+
+**A.** `"c"`다. `Exclude`는 `T extends U ? never : T`로 구현된 분배 조건부 타입이라, 유니언의 각 멤버에 개별 적용된다. `"a"`와 `"b"`는 `never`가 되고 `"c"`만 남는다.
+
+**Q2. `ToArray<string | number>`가 `string[] | number[]`가 아니라 `(string | number)[]`가 되게 하려면?**
+
+**A.** 분배를 막기 위해 `[T] extends [any] ? T[] : never`처럼 타입 파라미터를 튜플로 감싼다. naked 타입 파라미터일 때만 분배가 일어나기 때문이다.
+
+**Q3. 설정 객체에 `const config: Config = ...` 대신 `satisfies Config`를 쓰면 무엇이 좋은가?**
+
+**A.** 둘 다 `Config` 형태를 검사하지만, `satisfies`는 추론된 구체적인 타입(리터럴, 정확한 값 타입)을 그대로 유지한다. 그래서 이후 코드에서 `string | number` 같은 넓은 타입 대신 실제 값의 타입으로 자동완성과 검사를 받을 수 있다.
+
+**Q4. Discriminated Union의 `switch`에서 `default` 절에 `const _: never = s`를 두는 이유는?**
+
+**A.** 모든 case를 처리했다면 `default`에 도달한 `s`는 `never`로 좁혀진다. 나중에 유니언에 새 멤버가 추가됐는데 case를 빠뜨리면 `s`가 `never`가 아니게 되어 컴파일 에러가 발생하므로, 누락을 빌드 시점에 잡을 수 있다.
+
+**Q5. API 응답을 `any` 대신 `unknown`으로 받아야 하는 이유는?**
+
+**A.** `any`는 타입 검사를 완전히 꺼서 잘못된 속성 접근도 컴파일을 통과하고 런타임에 터진다. `unknown`은 타입 가드나 런타임 검증으로 좁히기 전에는 아무 연산도 허용하지 않아, 검증을 강제한다.
+
+## 핵심 정리
+
+- 제네릭은 입력과 출력의 타입 관계를 표현한다. `extends`로 제약, `keyof` + `T[K]`로 안전한 키 접근, 기본 타입 파라미터로 편의성 확보.
+- 유틸리티 타입은 Mapped Types(`[K in keyof T]`), 조건부 타입, `infer`의 조합이다. 직접 구현해보면 원리가 보인다.
+- Mapped Types는 `+` / `-`로 `readonly`, `?`를 조작하고, `as`로 키 이름을 바꾸거나 `never`로 걸러낸다.
+- 조건부 타입은 naked 타입 파라미터에 대해 유니언을 분배한다. `[T] extends [U]`로 막을 수 있고, never 판별에 필수다.
+- `infer`로 함수 반환값, Promise 내부, 튜플 요소, 문자열 패턴의 일부를 꺼낼 수 있다.
+- Template Literal Types는 문자열 유니언을 조합하고 `Capitalize` 등과 함께 키 리매핑에 쓰인다.
+- `satisfies`는 검사 + 구체적 타입 유지, 어노테이션은 검사 + 타입 넓힘, `as`는 검사 생략. `as const`로 리터럴과 readonly를 유지한다.
+- 타입 좁히기는 `typeof`, `instanceof`, `in`, 사용자 정의 `is`, `asserts`로 한다.
+- Discriminated Union + `never` exhaustive check로 빠진 분기를 컴파일 타임에 잡는다.
+- 오버로드는 입력에 따라 반환 타입이 달라질 때만, 구체적인 시그니처부터 작성한다.
+- NestJS는 legacy 데코레이터(`experimentalDecorators` + `emitDecoratorMetadata`)에 의존하고, TS 5.0+ 표준 데코레이터는 `(value, context)` 시그니처를 쓴다.
+- `any`는 검사 포기, `unknown`은 안전한 top type, `never`는 공집합 bottom type이다.

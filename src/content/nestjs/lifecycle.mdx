@@ -1,0 +1,604 @@
+---
+title: "Request Lifecycle"
+description: "요청이 Middleware → Guard → Interceptor → Pipe → Handler → Filter를 거치는 순서와 각 단계 구현, 앱 lifecycle hook까지"
+order: 4
+---
+
+## 한눈에 보기
+
+- 요청 흐름: **Middleware → Guard → Interceptor(before) → Pipe → Handler → Interceptor(after) → (예외 시) Exception Filter → Response**.
+- 바인딩 레벨은 대부분 **global → controller → route** 순으로 실행되고, Interceptor의 after 단계는 **역순**, Filter는 **가장 가까운 것 하나만** 적용된다.
+- `app.useGlobalX()`는 DI 불가, `APP_GUARD` 같은 provider 등록은 DI 가능.
+- `ExecutionContext`/`ArgumentsHost`로 HTTP·RPC·WebSocket을 같은 코드로 다룬다.
+- 앱 시작/종료 시점에는 `onModuleInit`, `onApplicationBootstrap`, `onModuleDestroy` 등의 hook이 호출된다.
+
+## 전체 흐름
+
+> **비유**: 공항 출국 과정을 떠올려 보자.
+> 1. **Middleware** = 공항 입구 안내원 (누구든 지나가며 기록·안내)
+> 2. **Guard** = 보안 검색대 / 여권 심사 (통과 or 거절, 딱 두 가지)
+> 3. **Interceptor** = 탑승 전후를 모두 관리하는 승무원 (탑승 전 준비, 도착 후 정리)
+> 4. **Pipe** = 수하물 검사·규격 변환 (짐이 규격에 맞는지 확인하고 포장)
+> 5. **Handler / Service** = 실제 비행
+> 6. **Exception Filter** = 문제 발생 시 대응하는 고객센터
+
+```text
+                Incoming Request
+                       │
+                       ▼
+  ┌──────────────────────────────────────────┐
+  │ 1. Middleware                            │  global(app.use) → module-bound
+  └──────────────────────────────────────────┘
+                       │
+                       ▼
+  ┌──────────────────────────────────────────┐
+  │ 2. Guards                                │  global → controller → route
+  └──────────────────────────────────────────┘
+                       │  (false면 403, 이후 단계 skip)
+                       ▼
+  ┌──────────────────────────────────────────┐
+  │ 3. Interceptors (before)                 │  global → controller → route
+  └──────────────────────────────────────────┘
+                       │
+                       ▼
+  ┌──────────────────────────────────────────┐
+  │ 4. Pipes                                 │  global → controller → route → param
+  └──────────────────────────────────────────┘
+                       │
+                       ▼
+  ┌──────────────────────────────────────────┐
+  │ 5. Controller handler → Service          │
+  └──────────────────────────────────────────┘
+                       │
+                       ▼
+  ┌──────────────────────────────────────────┐
+  │ 6. Interceptors (after)                  │  route → controller → global (역순)
+  └──────────────────────────────────────────┘
+                       │
+         (어느 단계에서든 예외 발생 시)
+                       ▼
+  ┌──────────────────────────────────────────┐
+  │ 7. Exception Filters                     │  route → controller → global
+  │    (가장 가까운 매칭 filter 하나만 실행)  │
+  └──────────────────────────────────────────┘
+                       │
+                       ▼
+                    Response
+```
+
+### 레벨별 실행 순서 요약
+
+| 단계 | 실행 순서 | 비고 |
+| --- | --- | --- |
+| Middleware | global → module-bound | module-bound는 모듈 import 순서대로 |
+| Guards | global → controller → route | 하나라도 false면 중단 |
+| Interceptors (before) | global → controller → route | `next.handle()` 호출 전 코드 |
+| Pipes | global → controller → route → param | param 레벨은 마지막 파라미터부터 첫 파라미터 순 |
+| Interceptors (after) | route → controller → global | Observable 체인이 안쪽부터 풀리므로 역순 |
+| Exception Filters | route → controller → global | 먼저 매칭된 하나만 처리, chaining 없음 |
+
+> **포인트**: Interceptor가 "양파 껍질"처럼 동작한다고 기억하자. 바깥(global)에서 안으로 들어갔다가, 응답은 안쪽(route)부터 바깥으로 나온다.
+
+요청 하나가 이 흐름을 어떻게 지나가는지, 실패하면 어디서 멈추는지 시나리오별로 따라가 봅시다.
+
+```sim
+request-pipeline
+```
+
+## ExecutionContext와 ArgumentsHost
+
+Guard, Interceptor, Filter를 이해하려면 먼저 이 두 객체를 알아야 한다.
+
+> **비유**: `ArgumentsHost`는 **만능 어댑터 플러그**다. HTTP든 마이크로서비스(RPC)든 WebSocket이든 꽂으면 그 환경에 맞는 인자(요청, 응답 등)를 꺼낼 수 있다. `ExecutionContext`는 여기에 "지금 **어느 컨트롤러의 어느 메서드**가 실행되는지" 정보를 추가한 확장판이다.
+
+| 객체 | 사용처 | 주요 메서드 |
+| --- | --- | --- |
+| `ArgumentsHost` | Exception Filter | `getType()`, `getArgs()`, `getArgByIndex()`, `switchToHttp()`, `switchToRpc()`, `switchToWs()` |
+| `ExecutionContext` | Guard, Interceptor | `ArgumentsHost`의 모든 메서드 + `getClass()`, `getHandler()` |
+
+```ts
+const ctx = context.switchToHttp();
+const request = ctx.getRequest<Request>();
+const response = ctx.getResponse<Response>();
+
+context.getType();     // 'http' | 'rpc' | 'ws' (GraphQL은 'graphql')
+context.getClass();    // 실행될 Controller 클래스 (예: UsersController)
+context.getHandler();  // 실행될 핸들러 함수 (예: findAll)
+```
+
+`getClass()`와 `getHandler()`는 `Reflector`와 함께 **커스텀 메타데이터**(역할, public 여부 등)를 읽을 때 핵심이다.
+
+## 1. Middleware
+
+> **비유**: 건물 입구의 **안내원**이다. 누가 어느 방(라우트 핸들러)으로 갈지는 정확히 모르지만, 출입 기록을 남기거나 출입증을 달아 줄 수 있다.
+
+### 역할
+
+- Express/Fastify 미들웨어와 동일한 개념. `req`, `res`, `next`에 접근한다.
+- 라우트 핸들러가 **무엇인지 모른다** (ExecutionContext 없음).
+- 로깅, CORS, body 파싱, 요청 ID 부여, 세션 같은 저수준 처리에 적합하다.
+
+### 구현
+
+```ts
+import { Injectable, NestMiddleware } from '@nestjs/common';
+import { Request, Response, NextFunction } from 'express';
+import { randomUUID } from 'crypto';
+
+@Injectable()
+export class RequestIdMiddleware implements NestMiddleware {
+  constructor(private readonly logger: AppLogger) {} // 클래스 미들웨어는 DI 가능
+
+  use(req: Request, res: Response, next: NextFunction) {
+    const requestId = (req.headers['x-request-id'] as string) ?? randomUUID();
+    req.headers['x-request-id'] = requestId;
+    res.setHeader('x-request-id', requestId);
+
+    const start = Date.now();
+    res.on('finish', () => {
+      this.logger.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
+    });
+
+    next(); // 호출하지 않으면 요청이 멈춘다
+  }
+}
+```
+
+### 등록
+
+미들웨어는 `@Module()` 데코레이터가 아니라 모듈 클래스의 `configure()`에서 등록한다.
+
+```ts
+@Module({ controllers: [UsersController], providers: [UsersService] })
+export class UsersModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply(RequestIdMiddleware, AuthContextMiddleware) // 나열 순서대로 실행
+      .exclude({ path: 'users/health', method: RequestMethod.GET })
+      .forRoutes(UsersController);                      // 또는 'users', { path, method }
+  }
+}
+```
+
+```ts
+// main.ts: 전역 함수형 미들웨어 (DI 불가)
+app.use(helmet());
+app.use((req, res, next) => {
+  console.log('global middleware');
+  next();
+});
+```
+
+> **주의**: `next()`를 호출하지 않고 응답도 보내지 않으면 요청이 영원히 대기한다. 또한 `app.use()`로 등록한 전역 미들웨어에는 DI가 되지 않는다. DI가 필요하면 클래스 미들웨어를 만들고 root module의 `configure()`에서 `forRoutes('*')`로 등록하자.
+
+## 2. Guards
+
+> **비유**: **보안 검색대**다. 할 수 있는 말은 "통과" 또는 "불가" 두 가지뿐이다. 안내원(Middleware)과 달리 손님이 **어느 게이트(핸들러)로 가는지** 알고 판단한다.
+
+### 역할
+
+- 요청을 핸들러까지 보낼지 말지 결정하는 **인가(authorization)** 담당.
+- `ExecutionContext`가 있어 어떤 핸들러가 실행될지 알 수 있다 → 메타데이터 기반 권한 검사 가능.
+- `false`를 반환하면 Nest가 `ForbiddenException`(403)을 던진다. 다른 예외를 원하면 직접 throw.
+
+### 구현
+
+```ts
+import { SetMetadata } from '@nestjs/common';
+
+export const ROLES_KEY = 'roles';
+export const Roles = (...roles: Role[]) => SetMetadata(ROLES_KEY, roles);
+
+export const IS_PUBLIC_KEY = 'isPublic';
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+```
+
+```ts
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    // 1. 핸들러 → 클래스 순으로 메타데이터 조회 (핸들러 설정이 우선)
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (isPublic) return true;
+
+    const requiredRoles = this.reflector.getAllAndOverride<Role[]>(ROLES_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (!requiredRoles?.length) return true;
+
+    // 2. 요청에서 유저 정보 꺼내기 (앞선 인증 단계에서 req.user 세팅됐다고 가정)
+    const { user } = context.switchToHttp().getRequest();
+    if (!user) throw new UnauthorizedException();
+
+    // 3. 권한 판단
+    return requiredRoles.some((role) => user.roles?.includes(role));
+  }
+}
+```
+
+```ts
+@Controller('admin')
+@UseGuards(RolesGuard)          // controller 레벨
+@Roles(Role.Admin)
+export class AdminController {
+  @Get('stats')
+  getStats() { /* Admin만 */ }
+
+  @Get('ping')
+  @Public()                     // 메타데이터로 예외 처리
+  ping() { return 'pong'; }
+}
+```
+
+`canActivate`는 `boolean`, `Promise<boolean>`, `Observable<boolean>` 중 무엇이든 반환할 수 있다.
+
+## 3. Interceptors
+
+> **비유**: 비행 **전후를 모두 챙기는 승무원**이다. 탑승 전에 시간을 재기 시작하고, 도착 후 짐(응답)을 정리해 건네준다. 필요하면 비행 자체를 생략하고 "캐시된 결과"를 바로 줄 수도 있다.
+
+### 역할
+
+- 핸들러 실행 **전과 후** 모두에 로직을 넣을 수 있는 유일한 enhancer (AOP 스타일).
+- 응답 변환(공통 응답 포맷), 로깅·실행 시간 측정, 캐싱, 타임아웃, 예외 매핑 등에 사용.
+- `next.handle()`이 반환하는 `Observable`을 RxJS 연산자로 가공한다.
+
+### 구현: 응답 래핑 (map)
+
+```ts
+import { CallHandler, ExecutionContext, Injectable, NestInterceptor } from '@nestjs/common';
+import { Observable, map } from 'rxjs';
+
+export interface ApiResponse<T> {
+  success: true;
+  data: T;
+  timestamp: string;
+}
+
+@Injectable()
+export class TransformInterceptor<T> implements NestInterceptor<T, ApiResponse<T>> {
+  intercept(context: ExecutionContext, next: CallHandler<T>): Observable<ApiResponse<T>> {
+    return next.handle().pipe(
+      map((data) => ({ success: true, data, timestamp: new Date().toISOString() })),
+    );
+  }
+}
+```
+
+### 구현: 로깅 (tap)
+
+```ts
+import { tap } from 'rxjs';
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger('HTTP');
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const req = context.switchToHttp().getRequest();
+    const handler = `${context.getClass().name}.${context.getHandler().name}`;
+    const start = Date.now();                   // ← before 단계
+
+    return next.handle().pipe(
+      tap(() => this.logger.log(`${req.method} ${handler} +${Date.now() - start}ms`)), // ← after 단계
+    );
+  }
+}
+```
+
+### 구현: 예외 매핑 + 타임아웃 (catchError)
+
+```ts
+import { catchError, throwError, timeout, TimeoutError } from 'rxjs';
+import { RequestTimeoutException, BadGatewayException } from '@nestjs/common';
+
+@Injectable()
+export class TimeoutInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler) {
+    return next.handle().pipe(
+      timeout(5000),
+      catchError((err) => {
+        if (err instanceof TimeoutError) {
+          return throwError(() => new RequestTimeoutException());
+        }
+        if (err?.code === 'ECONNREFUSED') {
+          return throwError(() => new BadGatewayException('upstream unavailable'));
+        }
+        return throwError(() => err);
+      }),
+    );
+  }
+}
+```
+
+> **주의**: `next.handle()`을 호출하지 않으면 **핸들러가 아예 실행되지 않는다**. 캐시 인터셉터처럼 의도적으로 생략할 때는 `of(cachedValue)`를 반환하면 된다. 또한 `@Res()`로 응답 객체를 직접 다루는 핸들러에서는 `map`으로 응답을 변환할 수 없다.
+
+## 4. Pipes
+
+> **비유**: **수하물 검사대**다. 짐(입력값)이 규격에 맞는지 검사(validation)하고, 필요하면 규격 박스에 다시 포장(transformation)한다. 규격에 안 맞으면 그 자리에서 반려(400 에러).
+
+### 역할
+
+- 핸들러 **인자**에 대해 동작한다: **변환(transformation)** 과 **검증(validation)**.
+- 예외를 던지면 핸들러는 실행되지 않는다.
+- 내장 pipe: `ValidationPipe`, `ParseIntPipe`, `ParseUUIDPipe`, `ParseBoolPipe`, `ParseArrayPipe`, `ParseEnumPipe`, `DefaultValuePipe`, `ParseFilePipe` 등.
+
+### 구현: 커스텀 Pipe
+
+```ts
+import { ArgumentMetadata, BadRequestException, Injectable, PipeTransform } from '@nestjs/common';
+
+@Injectable()
+export class ParsePositiveIntPipe implements PipeTransform<string, number> {
+  transform(value: string, metadata: ArgumentMetadata): number {
+    // metadata.type: 'body' | 'query' | 'param' | 'custom'
+    // metadata.metatype: 파라미터의 타입 (예: Number)
+    // metadata.data: 데코레이터에 넘긴 키 (예: 'id')
+    const n = Number(value);
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new BadRequestException(`${metadata.data} must be a positive integer`);
+    }
+    return n;
+  }
+}
+
+@Get(':id')
+findOne(@Param('id', ParsePositiveIntPipe) id: number) {
+  return this.usersService.findOne(id);
+}
+```
+
+### ValidationPipe + class-validator
+
+```ts
+import { IsEmail, IsInt, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
+import { Type } from 'class-transformer';
+
+export class CreateUserDto {
+  @IsEmail()
+  email: string;
+
+  @IsString()
+  @MinLength(8)
+  password: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(14)
+  @Max(120)
+  age?: number;
+}
+```
+
+```ts
+// main.ts
+app.useGlobalPipes(
+  new ValidationPipe({
+    whitelist: true,            // DTO에 없는 속성 제거
+    forbidNonWhitelisted: true, // DTO에 없는 속성이 오면 400
+    transform: true,            // plain object → DTO 인스턴스, 원시 타입 변환
+  }),
+);
+```
+
+> **포인트**: `transform: true`가 없으면 핸들러가 받는 `dto`는 DTO 클래스의 인스턴스가 아니라 **plain object**다. `@Param('id') id: number`도 실제로는 문자열이 들어온다.
+
+## 5. Exception Filters
+
+> **비유**: **고객센터**다. 어느 단계에서 문제가 생기든 결국 여기로 연결되고, 고객(클라이언트)에게 일관된 형식으로 안내한다. 가장 가까운 담당 창구(route → controller → global) **한 곳만** 응대한다.
+
+### 역할
+
+- 처리되지 않은 예외를 잡아 **응답 형식을 결정**한다.
+- Middleware, Guard, Interceptor, Pipe, Handler 어디서 던진 예외든 처리 대상이다.
+- 기본으로 내장 global filter가 있어서 `HttpException`은 해당 status로, 그 외 예외는 500 `Internal server error`로 응답한다.
+
+### 구현
+
+```ts
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import { Request, Response } from 'express';
+
+@Catch(HttpException) // 잡을 예외 타입. 비워 두면 모든 예외
+export class HttpExceptionFilter implements ExceptionFilter {
+  catch(exception: HttpException, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+    const request = ctx.getRequest<Request>();
+    const status = exception.getStatus();
+    const body = exception.getResponse();
+
+    response.status(status).json({
+      success: false,
+      statusCode: status,
+      path: request.url,
+      timestamp: new Date().toISOString(),
+      error: typeof body === 'string' ? { message: body } : body,
+    });
+  }
+}
+
+@Catch() // 모든 예외 (최후의 보루)
+export class AllExceptionsFilter implements ExceptionFilter {
+  private readonly logger = new Logger(AllExceptionsFilter.name);
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const res = host.switchToHttp().getResponse<Response>();
+    const status =
+      exception instanceof HttpException ? exception.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR;
+
+    if (status >= 500) this.logger.error(exception);
+    res.status(status).json({ success: false, statusCode: status });
+  }
+}
+```
+
+```ts
+@Controller('orders')
+@UseFilters(HttpExceptionFilter) // controller 레벨
+export class OrdersController {}
+```
+
+> **주의**: filter는 **체이닝되지 않는다**. route 레벨 filter가 예외를 잡으면 controller/global filter는 실행되지 않는다. 또 global filter를 여러 개 등록할 때 `@Catch()`(전체)와 `@Catch(HttpException)`(구체)이 겹치면, `useGlobalFilters`에서는 **나중에 등록된 것이 먼저** 매칭을 시도하므로 catch-all filter를 앞쪽에 둬야 한다.
+
+## 등록 방법: useGlobalX vs APP_* provider
+
+> **비유**: `app.useGlobalGuards(new RolesGuard())`는 **외부 용역 직원**을 데려온 것이다. 회사 시스템(DI 컨테이너)에 등록되지 않아 사내 동료(provider)의 도움을 받을 수 없다. `APP_GUARD`는 **정식 채용된 직원**이라 사내 누구에게든 도움을 요청할 수 있다.
+
+```ts
+// 방법 1: main.ts에서 직접 (DI 불가 — 의존성을 손으로 넣어야 함)
+app.useGlobalGuards(new RolesGuard(new Reflector()));
+app.useGlobalInterceptors(new LoggingInterceptor());
+app.useGlobalPipes(new ValidationPipe({ whitelist: true }));
+app.useGlobalFilters(new AllExceptionsFilter(), new HttpExceptionFilter());
+```
+
+```ts
+// 방법 2: 모듈 provider로 등록 (DI 가능)
+import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
+
+@Module({
+  providers: [
+    { provide: APP_GUARD, useClass: JwtAuthGuard },     // 여러 개 등록 가능, 등록 순서대로 실행
+    { provide: APP_GUARD, useClass: RolesGuard },
+    { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
+    { provide: APP_PIPE, useValue: new ValidationPipe({ whitelist: true, transform: true }) },
+    { provide: APP_FILTER, useClass: AllExceptionsFilter },
+  ],
+})
+export class AppModule {}
+```
+
+| 구분 | `app.useGlobalX()` | `APP_GUARD` 등 provider |
+| --- | --- | --- |
+| 등록 위치 | `main.ts` | 아무 모듈의 `providers` (보통 AppModule) |
+| DI | 불가 (모듈 컨텍스트 밖) | 가능 (`ConfigService`, `Reflector` 등 주입) |
+| 적용 범위 | 전역 | 전역 (선언한 모듈과 무관하게) |
+| 테스트 | e2e 테스트에서 `main.ts`를 거치지 않으면 누락됨 | TestingModule에 자동 포함 |
+| 하이브리드 앱 | 기본적으로 gateway/microservice에 미적용 | 모든 컨텍스트에 적용 |
+
+> **포인트**: 실무에서는 DI와 테스트 일관성 때문에 **`APP_*` provider 방식**을 권장한다. `APP_GUARD`를 FeatureModule에 선언해도 전역으로 적용되므로, 어디에 선언했는지 찾기 쉽게 AppModule이나 CoreModule에 모아 두자.
+
+## Guard vs Middleware vs Interceptor 비교
+
+| 항목 | Middleware | Guard | Interceptor | Pipe |
+| --- | --- | --- | --- | --- |
+| 실행 시점 | 가장 먼저 | Middleware 다음 | Guard 다음 (전·후) | Interceptor before 다음 |
+| 핸들러 정보 | 모름 | `ExecutionContext`로 앎 | `ExecutionContext`로 앎 | `ArgumentMetadata`만 |
+| 응답 후 처리 | `res.on('finish')` 정도 | 불가 | 가능 (RxJS) | 불가 |
+| 반환값 | `next()` 호출 | `boolean` | `Observable` | 변환된 값 |
+| 주 용도 | 로깅, CORS, 요청 가공 | 인증·인가 | 응답 변환, 캐싱, 타이밍 | 검증, 타입 변환 |
+| 비 HTTP(RPC/WS) | 미지원 | 지원 | 지원 | 지원 |
+
+> **포인트**: "들어올 수 있나?"는 **Guard**, "들어온 데이터가 올바른가?"는 **Pipe**, "들어가고 나오는 걸 감싸서 가공할까?"는 **Interceptor**, "어느 핸들러인지 몰라도 되는 일"은 **Middleware**.
+
+## Application Lifecycle Hooks
+
+> **비유**: 가게의 **개점 준비와 폐점 정리**다. 개점 전에는 각 코너(모듈)가 진열을 마치고(`onModuleInit`), 전체 준비가 끝나면 문을 연다(`onApplicationBootstrap`). 폐점 시에는 코너별로 정리하고(`onModuleDestroy`), 마지막 손님을 내보내기 직전(`beforeApplicationShutdown`)과 셔터를 내린 후(`onApplicationShutdown`)에 할 일을 한다.
+
+### 호출 순서
+
+1. **`onModuleInit()`**: 해당 모듈의 의존성이 모두 resolve된 직후. 모듈 단위로 호출된다.
+2. **`onApplicationBootstrap()`**: 모든 모듈 초기화가 끝난 후, 연결 수신(listen) 시작 전.
+3. (앱 실행 중)
+4. **`onModuleDestroy()`**: 종료 신호(예: `SIGTERM`)를 받았거나 `app.close()` 호출 시.
+5. **`beforeApplicationShutdown(signal?)`**: 모든 `onModuleDestroy`가 완료된 뒤. 이 hook이 끝나면 기존 연결을 닫는다(`app.close()` 진행).
+6. **`onApplicationShutdown(signal?)`**: 연결이 모두 닫힌 뒤.
+
+| Hook | 시점 | 대표 용도 |
+| --- | --- | --- |
+| `onModuleInit` | 모듈 의존성 resolve 직후 | 캐시 워밍, 순환 의존 provider 조회 |
+| `onApplicationBootstrap` | 전체 초기화 완료 후 | 스케줄러 시작, 큐 consumer 시작 |
+| `onModuleDestroy` | 종료 시작 | 진행 중 작업 중단 |
+| `beforeApplicationShutdown` | destroy 완료 후, 연결 종료 전 | in-flight 요청 마무리 대기 |
+| `onApplicationShutdown` | 연결 종료 후 | DB/Redis 연결 해제 |
+
+```ts
+@Injectable()
+export class QueueWorker implements OnModuleInit, OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
+  private readonly logger = new Logger(QueueWorker.name);
+
+  constructor(@Inject(REDIS_CLIENT) private readonly redis: Redis) {}
+
+  async onModuleInit() {
+    await this.redis.ping();        // async hook은 resolve될 때까지 다음 단계 대기
+    this.logger.log('redis ready');
+  }
+
+  onApplicationBootstrap() {
+    this.startConsuming();
+  }
+
+  async beforeApplicationShutdown(signal?: string) {
+    this.logger.log(`stopping consumer (${signal})`);
+    await this.stopConsuming();     // 처리 중인 job 마무리
+  }
+
+  async onApplicationShutdown() {
+    await this.redis.quit();
+  }
+
+  private startConsuming() { /* ... */ }
+  private async stopConsuming() { /* ... */ }
+}
+```
+
+### enableShutdownHooks
+
+```ts
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.enableShutdownHooks(); // SIGTERM, SIGINT 등 시스템 신호를 받아 종료 hook 실행
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+> **주의**:
+> - `enableShutdownHooks()`를 호출하지 않으면 `SIGTERM`(Kubernetes Pod 종료 등)을 받아도 종료 hook이 실행되지 않는다. 기본 비활성인 이유는 프로세스 신호 리스너가 메모리를 사용하기 때문이다.
+> - lifecycle hook은 **REQUEST/TRANSIENT scope 클래스에서는 호출되지 않는다**.
+> - Windows에서는 `SIGTERM`이 제대로 동작하지 않는 등 신호 지원이 제한적이다.
+
+## 셀프 체크
+
+**Q1. 인증 실패 시 핸들러는 물론 Interceptor의 before 로직도 실행되지 않는 이유는?**
+
+**A.** Guard가 Interceptor보다 먼저 실행되기 때문이다. Guard가 false를 반환하거나 예외를 던지면 그 뒤 단계(Interceptor, Pipe, Handler)는 모두 건너뛰고 바로 Exception Filter로 간다.
+
+**Q2. global, controller, route 레벨에 Interceptor가 하나씩 있을 때 after 로직의 실행 순서는?**
+
+**A.** route → controller → global 순이다. before는 global → controller → route 순으로 들어가고, Observable 체인이 안쪽부터 풀리면서 after는 역순으로 실행된다.
+
+**Q3. route 레벨과 global 레벨 Exception Filter가 모두 같은 예외를 잡을 수 있다면 둘 다 실행되나?**
+
+**A.** 아니다. 가장 가까운 route 레벨 filter 하나만 실행된다. Exception Filter는 체이닝되지 않는다.
+
+**Q4. `app.useGlobalGuards(new RolesGuard())`로 등록한 Guard에서 `ConfigService`를 주입받을 수 없는 이유와 해결책은?**
+
+**A.** `main.ts`에서 직접 생성한 인스턴스는 어떤 모듈 컨텍스트에도 속하지 않아 DI 컨테이너가 관여하지 않는다. AppModule의 providers에 `APP_GUARD` 토큰으로 `useClass: RolesGuard`를 등록하면 DI가 가능하다.
+
+**Q5. Kubernetes에서 Pod가 종료될 때 DB 연결을 정리하는 `onApplicationShutdown`이 호출되지 않는다. 무엇을 확인해야 하나?**
+
+**A.** `main.ts`에서 `app.enableShutdownHooks()`를 호출했는지 확인한다. 이 설정이 없으면 `SIGTERM` 신호를 받아도 종료 hook이 실행되지 않는다. 또 해당 클래스가 REQUEST/TRANSIENT scope가 아닌지도 확인한다.
+
+## 핵심 정리
+
+- 요청 흐름: **Middleware → Guard → Interceptor(before) → Pipe → Handler → Service → Interceptor(after) → Exception Filter(예외 시) → Response**.
+- 레벨 순서는 대체로 global → controller → route. 예외: Interceptor after는 **역순**, Filter는 **가장 가까운 것 하나만**, Pipe는 param 레벨이 마지막.
+- **Middleware**: 핸들러를 모르는 저수준 처리, `configure(consumer)`로 등록. `next()` 필수.
+- **Guard**: `CanActivate`, `Reflector`로 메타데이터 읽어 인가. false면 403.
+- **Interceptor**: `next.handle()`의 Observable을 `map`/`tap`/`catchError`/`timeout`으로 가공. 전·후 모두 개입 가능한 유일한 enhancer.
+- **Pipe**: `PipeTransform`으로 변환·검증. `ValidationPipe`의 `whitelist`, `transform` 옵션을 기억하자.
+- **Exception Filter**: `@Catch()` + `ArgumentsHost`로 응답 형식 통일. 체이닝 없음.
+- **등록**: `app.useGlobalX()`는 DI 불가, `APP_GUARD`/`APP_INTERCEPTOR`/`APP_PIPE`/`APP_FILTER` provider는 DI 가능 → 후자 권장.
+- `ExecutionContext` = `ArgumentsHost` + `getClass()`/`getHandler()`. 프로토콜(http/rpc/ws) 독립적인 코드 작성에 사용.
+- Lifecycle hook: `onModuleInit` → `onApplicationBootstrap` → (종료) `onModuleDestroy` → `beforeApplicationShutdown` → `onApplicationShutdown`. 신호 처리는 `enableShutdownHooks()` 필수.

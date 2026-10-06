@@ -1,0 +1,746 @@
+---
+title: "TypeScript 타입 레벨 프로그래밍"
+description: "재귀 타입, 튜플 조작, 템플릿 리터럴 파싱, Branded 타입, 공변/반공변, 선언 병합과 module augmentation, 타입 안전 EventEmitter, 스키마에서 타입 추론하기, 타입 성능 팁까지 타입으로 프로그래밍하는 기법을 정리한다."
+order: 11
+---
+
+## 한눈에 보기
+
+- 타입 시스템은 그 자체로 작은 함수형 언어다. **conditional type = if**, **재귀 = 반복**, **`infer` = 패턴 매칭 변수**, **튜플 = 배열/숫자 카운터**다.
+- 템플릿 리터럴 타입 + `infer`로 `'/users/:id'` 같은 문자열을 타입 레벨에서 파싱할 수 있다.
+- 구조적 타이핑의 빈틈은 **Branded 타입**으로, 함수 매개변수 안전성은 **strictFunctionTypes(반공변)** 로 메운다. 단, 메서드 문법은 여전히 bivariant다.
+- 라이브러리 타입 확장은 **선언 병합 / module augmentation / declare global**로 한다(Express `req.user` 등).
+- 깊은 재귀는 컴파일러 한계(TS2589)에 부딪히므로 tail recursion, accumulator, 단순한 타입을 선호한다.
+
+> **포인트**: 이 노트는 "TypeScript 심화"(제네릭, 유틸리티 타입, mapped/conditional 타입, `infer` 기초, `satisfies`, type guard)를 안다고 가정하고 그 위에 쌓는다.
+
+## 1. 타입 레벨 프로그래밍이란
+
+> **비유**: 일반 코드는 "값"을 입력받아 "값"을 내놓는 공장이다. 타입 레벨 코드는 "타입"을 입력받아 "타입"을 내놓는 공장이며, 컴파일러가 이 공장을 돌린다. 공장이 다 돌고 나면(컴파일 후) 설비는 철거되고 제품(JS)만 남는다.
+
+값 레벨과 타입 레벨 문법을 대응시키면 다음과 같다.
+
+| 값 레벨 (JS) | 타입 레벨 (TS) |
+| --- | --- |
+| 함수 `f(x)` | 제네릭 타입 `F<X>` |
+| `if (cond) a else b` | `X extends Y ? A : B` |
+| 구조 분해 / 정규식 캡처 | `infer` |
+| 재귀 함수 | 재귀 타입 alias |
+| 배열 | 튜플 `[A, B, C]` |
+| 숫자 연산 | 튜플의 `length` |
+| 문자열 처리 | 템플릿 리터럴 타입 |
+| `for...in` 루프 | mapped type `[K in keyof T]` |
+
+## 2. 재귀 타입
+
+> **비유**: 러시아 인형 마트료시카다. 인형을 열면 같은 모양의 작은 인형이 또 나온다. 재귀 타입은 "인형을 열고, 안에 인형이 있으면 같은 규칙을 다시 적용"하는 규칙이다.
+
+### 2.1 DeepPartial
+
+내장 `Partial`은 1단계만 optional로 만든다. 중첩 객체 설정값 병합에는 부족하다.
+
+```ts
+type DeepPartial<T> =
+  T extends (...args: any[]) => any
+    ? T                                         // 함수는 그대로
+    : T extends object
+      ? { [K in keyof T]?: DeepPartial<T[K]> }  // 객체·배열이면 재귀
+      : T;                                      // 원시값은 그대로
+
+interface Config {
+  server: { host: string; port: number };
+  db: { url: string; pool: { min: number; max: number } };
+}
+
+const override: DeepPartial<Config> = {
+  db: { pool: { max: 20 } }, // O 깊은 곳만 일부 지정
+};
+
+const bad: Partial<Config> = {
+  db: { pool: { max: 20 } },
+  // X Property 'url' is missing in type '{ pool: ... }'
+};
+```
+
+> **주의**: 함수 분기를 빼면 메서드까지 mapped type으로 펼쳐져 이상한 타입이 된다. `Date`, `Map` 같은 내장 객체도 `object`로 잡히므로 필요하면 분기를 추가한다.
+
+### 2.2 DeepReadonly
+
+```ts
+type DeepReadonly<T> =
+  T extends (...args: any[]) => any
+    ? T
+    : T extends object
+      ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+      : T;
+
+type State = DeepReadonly<{ user: { tags: string[] } }>;
+declare const s: State;
+
+s.user = { tags: [] };   // X Cannot assign to 'user' because it is a read-only property.
+s.user.tags.push("x");   // X Property 'push' does not exist on type 'readonly string[]'.
+```
+
+제네릭 매개변수에 대한 homomorphic mapped type(`[K in keyof T]`)은 배열/튜플을 만나면 **배열 모양을 유지**한다. 그래서 `string[]`이 `readonly string[]`으로 자연스럽게 변환된다.
+
+### 2.3 JSON 타입
+
+```ts
+type JsonPrimitive = string | number | boolean | null;
+type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+const ok: JsonValue = { a: [1, "x", { b: null }] };     // O
+const bad: JsonValue = { d: new Date() };                // X Date는 JsonValue가 아님
+const bad2: JsonValue = { f: () => 1 };                  // X 함수 불가
+const bad3: JsonValue = { u: undefined };                // X undefined 불가
+
+function saveToStorage(key: string, value: JsonValue) {
+  localStorage.setItem(key, JSON.stringify(value));
+}
+```
+
+> **포인트**: 자기 자신을 참조하는 type alias는 TS 3.7부터 객체·배열·튜플 안에서 허용된다. `type X = X | string`처럼 즉시 자기 자신으로 풀리는 형태만 금지된다.
+
+## 3. 튜플 조작
+
+> **비유**: 튜플은 기차다. 맨 앞 칸(Head)을 떼거나, 나머지 칸(Tail)만 남기거나, 두 기차를 연결(Concat)하거나, 순서를 뒤집을(Reverse) 수 있다. 칸 수(Length)는 기차 길이로 바로 알 수 있다.
+
+```ts
+type Head<T extends readonly unknown[]> =
+  T extends readonly [infer H, ...unknown[]] ? H : never;
+
+type Tail<T extends readonly unknown[]> =
+  T extends readonly [unknown, ...infer R] ? R : [];
+
+type Length<T extends readonly unknown[]> = T["length"];
+
+type Concat<A extends readonly unknown[], B extends readonly unknown[]> = [...A, ...B];
+
+type Reverse<T extends readonly unknown[]> =
+  T extends readonly [infer H, ...infer R] ? [...Reverse<R>, H] : [];
+
+type T1 = Head<[1, 2, 3]>;           // 1
+type T2 = Tail<[1, 2, 3]>;           // [2, 3]
+type T3 = Length<[1, 2, 3]>;         // 3
+type T4 = Length<string[]>;          // number  (길이가 고정되지 않은 배열)
+type T5 = Concat<[1], ["a", "b"]>;   // [1, "a", "b"]
+type T6 = Reverse<[1, 2, 3]>;        // [3, 2, 1]
+type T7 = Head<[]>;                  // never
+```
+
+### 3.1 튜플로 숫자 세기
+
+타입 레벨에는 `+` 연산이 없다. 대신 **튜플 길이**를 카운터로 쓴다.
+
+```ts
+type BuildTuple<N extends number, Acc extends unknown[] = []> =
+  Acc["length"] extends N ? Acc : BuildTuple<N, [...Acc, unknown]>;
+
+type Add<A extends number, B extends number> =
+  [...BuildTuple<A>, ...BuildTuple<B>]["length"];
+
+type Sum = Add<3, 4>; // 7
+```
+
+### 3.2 실전 활용: 함수 인자 다루기
+
+```ts
+// 첫 번째 인자를 제거한 함수 타입 (예: context 주입)
+type OmitFirstArg<F> =
+  F extends (first: any, ...rest: infer R) => infer Ret
+    ? (...args: R) => Ret
+    : never;
+
+type Handler = (ctx: { db: unknown }, id: string, force: boolean) => Promise<void>;
+type Bound = OmitFirstArg<Handler>; // (id: string, force: boolean) => Promise<void>
+```
+
+> **포인트**: variadic tuple(`[...A, ...B]`, TS 4.0+)과 `infer`의 조합으로 `bind`, `curry`, `pipe` 같은 함수의 타입을 정확히 표현할 수 있다.
+
+## 4. 템플릿 리터럴 + infer로 문자열 파싱
+
+> **비유**: 우편번호 양식 `___-___`에 주소를 대보고 빈칸에 들어간 글자를 뽑아내는 것이다. 템플릿 리터럴 패턴이 양식이고, `infer`가 빈칸이다.
+
+### 4.1 기본 패턴 매칭
+
+```ts
+type GetPrefix<S> = S extends `${infer P}_${string}` ? P : never;
+type A = GetPrefix<"user_name">;    // "user"
+
+type Trim<S extends string> =
+  S extends ` ${infer R}` ? Trim<R> :
+  S extends `${infer L} ` ? Trim<L> :
+  S;
+type B = Trim<"  hello  ">;          // "hello"
+
+type Split<S extends string, D extends string> =
+  S extends `${infer Head}${D}${infer Rest}`
+    ? [Head, ...Split<Rest, D>]
+    : [S];
+type C = Split<"a,b,c", ",">;        // ["a", "b", "c"]
+```
+
+`infer`가 연속될 때 앞쪽 `infer`는 **가능한 가장 짧은** 문자열을 잡는다. 그래서 `Split`은 첫 번째 구분자에서 끊긴다.
+
+### 4.2 라우트 파라미터 추출
+
+목표는 `'/users/:id/posts/:postId'` → `{ id: string; postId: string }`이다.
+
+```ts
+type ParamNames<Path extends string> =
+  Path extends `${string}:${infer Param}/${infer Rest}`
+    ? Param | ParamNames<Rest>
+    : Path extends `${string}:${infer Param}`
+      ? Param
+      : never;
+
+type RouteParams<Path extends string> = {
+  [K in ParamNames<Path>]: string;
+};
+
+type P1 = ParamNames<"/users/:id/posts/:postId">;   // "id" | "postId"
+type P2 = RouteParams<"/users/:id/posts/:postId">;  // { id: string; postId: string }
+type P3 = RouteParams<"/health">;                    // {}
+```
+
+동작 순서는 다음과 같다.
+
+1. `"/users/:id/posts/:postId"`를 첫 패턴에 대입 → `${string}`이 `"/users/"`, `Param`이 `"id"`, `Rest`가 `"posts/:postId"`
+2. `"id" | ParamNames<"posts/:postId">`로 재귀
+3. `"posts/:postId"`는 `:` 뒤에 `/`가 없어 첫 패턴 실패 → 두 번째 패턴에서 `Param = "postId"`
+4. 결과 union `"id" | "postId"`를 mapped type으로 객체화
+
+실제 사용 예시는 다음과 같다.
+
+```ts
+function route<Path extends string>(
+  path: Path,
+  handler: (params: RouteParams<Path>) => void,
+) {
+  /* ... */
+}
+
+route("/users/:id/posts/:postId", (params) => {
+  params.id;      // O string
+  params.postId;  // O string
+  params.slug;    // X Property 'slug' does not exist on type '{ id: string; postId: string; }'.
+});
+```
+
+> **포인트**: `@types/express`(RouteParameters), Hono 같은 라이브러리가 이 기법으로 경로 문자열에서 `req.params` 타입을 자동 생성한다.
+
+## 5. 키 리매핑으로 getter 생성
+
+> **비유**: 명찰 공장이다. 직원 명단(`keyof T`)을 받아 각 이름 앞에 "get"을 붙이고 첫 글자를 대문자로 바꾼 새 명찰을 찍어낸다.
+
+```ts
+type Getters<T> = {
+  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+
+interface Person {
+  name: string;
+  age: number;
+}
+
+type PersonGetters = Getters<Person>;
+// { getName: () => string; getAge: () => number }
+```
+
+`as` 절(TS 4.1+)에서 `never`를 반환하면 그 키는 **제거**된다. 이를 이용해 필터링도 가능하다.
+
+```ts
+// 함수 프로퍼티만 남기기
+type MethodsOnly<T> = {
+  [K in keyof T as T[K] extends (...args: any[]) => any ? K : never]: T[K];
+};
+
+// 이벤트 핸들러 이름 만들기
+type Handlers<E extends string> = {
+  [K in E as `on${Capitalize<K>}`]: () => void;
+};
+type H = Handlers<"click" | "hover">; // { onClick: () => void; onHover: () => void }
+```
+
+> **주의**: `keyof T`에는 `symbol`, `number` 키도 포함될 수 있다. `Capitalize`는 `string`만 받으므로 `string & K`로 교차시켜 string 키만 남긴다.
+
+## 6. Branded / Nominal 타입
+
+> **비유**: 똑같이 생긴 열쇠(`string`) 두 개가 있는데 하나는 집 열쇠, 하나는 차 열쇠다. 모양이 같으니 TS는 구분하지 못한다. 그래서 각 열쇠에 색깔 스티커(brand)를 붙여 타입 레벨에서 구분한다. 스티커는 런타임에는 존재하지 않는다.
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, B extends string> = T & { readonly [brand]: B };
+
+type UserId = Brand<string, "UserId">;
+type OrderId = Brand<string, "OrderId">;
+
+function getUser(id: UserId) { /* ... */ }
+
+const raw = "u_123";
+getUser(raw);                    // X Type 'string' is not assignable to type 'UserId'.
+
+const orderId = "o_1" as OrderId;
+getUser(orderId);                // X Type '"UserId"' is not assignable to type '"OrderId"'.
+```
+
+brand는 **검증 함수를 통해서만** 부여하는 것이 정석이다.
+
+```ts
+function toUserId(value: string): UserId {
+  if (!/^u_\d+$/.test(value)) throw new Error(`Invalid UserId: ${value}`);
+  return value as UserId; // 단언은 이 한 곳에서만
+}
+
+const id = toUserId("u_123");
+getUser(id);                     // O
+id.toUpperCase();                // O 여전히 string 메서드 사용 가능
+```
+
+| 활용 예 | 효과 |
+| --- | --- |
+| `UserId`, `OrderId` | ID 혼동 방지 |
+| `Email`, `Url` | 검증을 통과한 문자열만 허용 |
+| `Cents`, `Won` | 단위가 다른 숫자 혼동 방지 |
+| `SanitizedHtml` | XSS 방지용 이스케이프 완료 표시 |
+
+> **포인트**: Zod의 `.brand()`도 같은 원리다. 런타임 비용은 0이고, 검증 함수가 "타입 레벨 관문" 역할을 한다.
+
+## 7. 공변/반공변 (Variance)
+
+> **비유**: "동물 병원"은 "개 병원"을 대신할 수 있다(개도 동물이니 다 치료 가능). 반대로 "개 병원"은 "동물 병원"을 대신할 수 없다(고양이가 오면 곤란). 즉 **받는 쪽(매개변수)** 은 더 넓은 걸 받는 쪽이 더 안전하다 → 방향이 뒤집힌다(반공변). **내주는 쪽(반환값)** 은 더 구체적인 걸 주는 게 안전하다 → 방향 유지(공변).
+
+```ts
+interface Animal { name: string }
+interface Dog extends Animal { bark(): void }
+
+// 공변 (covariance): 반환 타입, 읽기 전용 위치
+let getAnimal: () => Animal = () => ({ name: "a" });
+let getDog: () => Dog = () => ({ name: "d", bark() {} });
+getAnimal = getDog;   // O Dog를 주면 Animal을 기대하는 쪽도 만족
+
+// 반공변 (contravariance): 매개변수 위치
+let handleAnimal = (a: Animal) => console.log(a.name);
+let handleDog = (d: Dog) => d.bark();
+
+handleDog = handleAnimal;  // O Animal을 처리할 수 있으면 Dog도 처리 가능
+handleAnimal = handleDog;  // X (strictFunctionTypes) 고양이가 오면 bark() 
+// Type '(d: Dog) => void' is not assignable to type '(a: Animal) => void'.
+```
+
+| 위치 | 성질 | 규칙 (`Dog extends Animal`일 때) |
+| --- | --- | --- |
+| 반환 타입 | 공변 | `() => Dog`는 `() => Animal`에 할당 가능 |
+| 매개변수 | 반공변 | `(a: Animal) => void`는 `(d: Dog) => void`에 할당 가능 |
+| 읽기+쓰기 (가변 프로퍼티) | 이론상 불변(invariant) | TS는 실용성 때문에 공변으로 취급 |
+
+### 7.1 메서드 vs 함수 프로퍼티: bivariance
+
+`strictFunctionTypes`는 **함수 타입 프로퍼티**에만 적용되고, **메서드 문법**으로 선언된 것은 여전히 bivariant(양방향 허용)로 검사한다.
+
+```ts
+interface MethodStyle {
+  handle(a: Animal): void;           // 메서드 문법
+}
+interface PropertyStyle {
+  handle: (a: Animal) => void;       // 함수 프로퍼티 문법
+}
+
+const m: MethodStyle = { handle: (d: Dog) => d.bark() };   // O 통과 (bivariant) — 런타임 위험!
+const p: PropertyStyle = { handle: (d: Dog) => d.bark() }; // X 에러 (contravariant)
+```
+
+왜 메서드는 예외일까? `Array<T>`의 `push(item: T)` 같은 메서드 때문이다. 메서드까지 엄격하게 검사하면 `Dog[]`를 `Animal[]`에 할당할 수 없게 되어 기존 코드가 대량으로 깨진다.
+
+```ts
+const dogs: Dog[] = [];
+const animals: Animal[] = dogs;     // O 허용 (메서드 bivariance 덕분)
+animals.push({ name: "cat" });      // O 컴파일 통과
+dogs[0].bark();                      // 런타임 에러 — 알려진 구멍
+```
+
+> **주의**: 콜백·핸들러 타입을 정의할 때 안전성을 원하면 **함수 프로퍼티 문법**(`handle: (a: Animal) => void`)을 쓰자. 메서드 문법은 매개변수 검사가 느슨하다.
+
+> **포인트**: TS 4.7+에서는 제네릭에 `in`/`out` variance annotation을 달 수 있다. `interface Producer<out T>`, `interface Consumer<in T>`처럼 의도를 명시하면 검사가 명확해지고 큰 타입에서 비교 성능도 좋아진다.
+
+## 8. 함수 오버로드 vs 제네릭
+
+> **비유**: 오버로드는 메뉴판에 "A 세트, B 세트"를 따로 적는 것이고, 제네릭은 "고른 재료 그대로 만들어 드립니다"라고 한 줄로 쓰는 것이다. 입력과 출력 관계가 규칙적이면 제네릭, 불규칙하면 오버로드가 맞다.
+
+```ts
+// 오버로드: 입력 타입별로 출력이 불규칙하게 다름
+function parse(input: string): number;
+function parse(input: number): string;
+function parse(input: string | number): string | number {
+  return typeof input === "string" ? Number(input) : String(input);
+}
+
+const a = parse("42");  // number
+const b = parse(42);    // string
+
+declare const x: string | number;
+parse(x);
+// X No overload matches this call. (union은 어느 시그니처에도 안 맞음)
+```
+
+```ts
+// 제네릭: 입력과 출력이 같은 규칙으로 연결됨
+function first<T>(arr: readonly T[]): T | undefined {
+  return arr[0];
+}
+first([1, 2]);      // number | undefined
+first(["a"]);       // string | undefined
+```
+
+| 기준 | 오버로드 | 제네릭 (+ conditional type) |
+| --- | --- | --- |
+| 입력-출력 관계 | 불규칙, 경우가 적음 | 규칙적, 타입을 그대로 전달 |
+| union 인자 | 별도 시그니처 없으면 실패 | 자연스럽게 처리 |
+| 구현부 타입 안전성 | 구현 시그니처는 느슨해서 검사 약함 | 상대적으로 강함 |
+| IDE 표시 | 시그니처 목록이 보여 읽기 쉬움 | 복잡하면 읽기 어려움 |
+
+> **주의**: 오버로드는 **위에서부터 첫 매칭**이 이긴다. 구체적인 시그니처를 위에, 넓은 시그니처를 아래에 둔다. 마지막 구현 시그니처는 외부에서 보이지 않는다.
+
+## 9. 선언 병합 & Module Augmentation
+
+> **비유**: 도서관 책(라이브러리 타입)에 직접 낙서할 수는 없지만, 같은 제목의 부록(같은 이름의 interface)을 끼워 넣으면 도서관이 원본과 부록을 한 권으로 합쳐서 빌려준다.
+
+### 9.1 선언 병합 기본
+
+```ts
+interface Box { width: number }
+interface Box { height: number }
+
+const box: Box = { width: 1, height: 2 }; // 두 선언이 합쳐짐
+
+// namespace + function 병합 (값과 타입 동시 확장)
+function greet(name: string) { return `Hi ${name}`; }
+namespace greet {
+  export const version = "1.0";
+}
+greet.version; // "1.0"
+```
+
+| 병합 가능 조합 | 결과 |
+| --- | --- |
+| interface + interface | 멤버 합침 |
+| namespace + namespace | export 합침 |
+| function/class/enum + namespace | 정적 멤버 추가 |
+| type alias + 무엇이든 | 불가 (Duplicate identifier) |
+
+### 9.2 Express Request에 user 추가
+
+인증 미들웨어가 `req.user`를 넣어도 TS는 모른다.
+
+```ts
+app.get("/me", (req, res) => {
+  res.json(req.user);
+  // X Property 'user' does not exist on type 'Request<...>'.
+});
+```
+
+Express 타입은 전역 `Express` namespace에 빈 `Request` interface를 열어두었다. 여기에 병합한다.
+
+```ts
+// src/types/express.d.ts
+import type { Role } from "../auth/role";
+
+declare global {
+  namespace Express {
+    interface Request {
+      user?: {
+        id: string;
+        role: Role;
+      };
+      requestId: string;
+    }
+  }
+}
+
+export {}; // 이 파일을 모듈로 만들어 declare global을 쓸 수 있게 함
+```
+
+```ts
+app.get("/me", (req, res) => {
+  if (!req.user) return res.status(401).end();
+  res.json({ id: req.user.id, role: req.user.role }); // O
+});
+```
+
+module augmentation 방식으로 특정 모듈을 직접 확장할 수도 있다.
+
+```ts
+// express의 Request는 express-serve-static-core에 정의되어 있음
+import "express-serve-static-core";
+
+declare module "express-serve-static-core" {
+  interface Request {
+    tenantId?: string;
+  }
+}
+```
+
+> **주의**: augmentation 파일이 `tsconfig`의 `include` 범위에 있어야 적용된다. 또 파일 안에 최상위 `import`/`export`가 하나도 없으면 "스크립트"로 취급되어 `declare module "x"`가 확장이 아닌 **새 모듈 선언**이 되어버린다.
+
+### 9.3 NestJS와의 연관
+
+NestJS는 기본적으로 Express 어댑터 위에서 동작하므로 같은 augmentation이 그대로 적용된다.
+
+```ts
+// Passport를 쓰면 @types/passport가 이미 Request.user?: Express.User를 선언함
+// → User interface를 병합해 모양만 채워준다
+declare global {
+  namespace Express {
+    interface User {
+      id: string;
+      email: string;
+    }
+  }
+}
+export {};
+
+// 컨트롤러
+@Get("me")
+me(@Req() req: Request) {
+  return req.user?.email; // O string | undefined
+}
+```
+
+> **포인트**: 실무에서는 `@CurrentUser()` 같은 커스텀 parameter decorator를 만들어 `req.user`에 직접 접근하는 코드를 줄이는 편이다. decorator 자체는 "TypeScript 심화" 노트 참고.
+
+### 9.4 declare global
+
+```ts
+// src/types/global.d.ts
+declare global {
+  interface Window {
+    dataLayer: unknown[];       // GA 스크립트가 넣는 전역
+  }
+  var __APP_VERSION__: string;  // 번들러 define으로 주입하는 상수 (var만 globalThis에 붙음)
+
+  interface Array<T> {
+    last(): T | undefined;      // 내장 타입 확장 (런타임 구현은 별도로 필요!)
+  }
+}
+export {};
+```
+
+> **주의**: `declare`는 "어딘가에 존재한다"고 TS에게 **약속**하는 것뿐이다. 실제 구현(polyfill, 스크립트 주입)이 없으면 런타임에 `undefined`다. 전역 오염은 최소화하자.
+
+## 10. 타입 안전 EventEmitter
+
+> **비유**: 방송국 채널표다. "7번 채널은 뉴스, 9번은 스포츠"처럼 이벤트 이름마다 어떤 내용(인자)이 나오는지 미리 정해두면, 구독자는 틀린 채널을 틀거나 잘못된 형식을 기대할 일이 없다.
+
+Node의 기본 `EventEmitter`는 `emit("logn", ...)` 같은 오타나 인자 타입 실수를 잡지 못한다.
+
+```ts
+type Listener<Args extends unknown[]> = (...args: Args) => void;
+
+class TypedEmitter<Events extends { [K in keyof Events]: unknown[] }> {
+  private listeners: { [K in keyof Events]?: Listener<Events[K]>[] } = {};
+
+  on<K extends keyof Events>(event: K, listener: Listener<Events[K]>): () => void {
+    (this.listeners[event] ??= []).push(listener);
+    return () => this.off(event, listener); // unsubscribe 함수 반환
+  }
+
+  off<K extends keyof Events>(event: K, listener: Listener<Events[K]>): void {
+    this.listeners[event] = this.listeners[event]?.filter((l) => l !== listener);
+  }
+
+  emit<K extends keyof Events>(event: K, ...args: Events[K]): void {
+    this.listeners[event]?.forEach((l) => l(...args));
+  }
+}
+```
+
+```ts
+interface AppEvents {
+  login: [user: { id: string; name: string }];
+  logout: [];
+  error: [err: Error, retryable: boolean];
+}
+
+const bus = new TypedEmitter<AppEvents>();
+
+bus.on("login", (user) => console.log(user.name)); // user 타입 자동 추론
+bus.on("error", (err, retryable) => {});            // O
+
+bus.emit("login", { id: "1", name: "Kim" });        // O
+bus.emit("logout");                                  // O
+bus.emit("logn", {});                                // X '"logn"' is not assignable to '"login" | "logout" | "error"'
+bus.emit("error", new Error("x"));                   // X Expected 3 arguments, but got 2.
+```
+
+> **포인트**: 제약을 `Record<string, unknown[]>`로 쓰면 `interface`로 정의한 이벤트 맵이 통과하지 못한다(interface에는 암묵적 index signature가 없음). `{ [K in keyof Events]: unknown[] }` 형태의 자기 참조 제약을 쓰면 interface와 type 모두 받을 수 있다. 최신 `@types/node`의 `EventEmitter`도 제네릭 이벤트 맵을 지원한다.
+
+## 11. 스키마에서 타입 추론 (z.infer 원리)
+
+> **비유**: 쿠키 틀(스키마)을 하나 만들면 쿠키(런타임 검증)도 찍어낼 수 있고, 틀 모양을 본떠 포장 상자(타입)도 만들 수 있다. 틀 하나로 두 가지를 얻으니 둘이 어긋날 일이 없다.
+
+Zod의 핵심은 "스키마 객체가 자신이 검증하는 타입을 **제네릭 매개변수로 들고 다닌다**"는 것이다.
+
+```ts
+// 1) 스키마는 parse 결과 타입 T를 기억한다
+interface Schema<T> {
+  parse(input: unknown): T;
+}
+
+// 2) 스키마에서 T를 꺼내는 것이 곧 z.infer
+type Infer<S> = S extends Schema<infer T> ? T : never;
+
+// 3) 기본 스키마
+const z = {
+  string: (): Schema<string> => ({
+    parse(input) {
+      if (typeof input !== "string") throw new Error("Expected string");
+      return input;
+    },
+  }),
+
+  number: (): Schema<number> => ({
+    parse(input) {
+      if (typeof input !== "number") throw new Error("Expected number");
+      return input;
+    },
+  }),
+
+  array: <T>(item: Schema<T>): Schema<T[]> => ({
+    parse(input) {
+      if (!Array.isArray(input)) throw new Error("Expected array");
+      return input.map((v) => item.parse(v));
+    },
+  }),
+
+  // 4) 객체 스키마: shape의 각 스키마에서 타입을 꺼내 mapped type으로 조립
+  object: <Shape extends Record<string, Schema<unknown>>>(
+    shape: Shape,
+  ): Schema<{ [K in keyof Shape]: Infer<Shape[K]> }> => ({
+    parse(input) {
+      if (typeof input !== "object" || input === null) throw new Error("Expected object");
+      const record = input as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const key in shape) {
+        out[key] = shape[key].parse(record[key]);
+      }
+      return out as { [K in keyof Shape]: Infer<Shape[K]> };
+    },
+  }),
+};
+```
+
+```ts
+const UserSchema = z.object({
+  name: z.string(),
+  age: z.number(),
+  tags: z.array(z.string()),
+});
+
+type User = Infer<typeof UserSchema>;
+// { name: string; age: number; tags: string[] }
+
+const user = UserSchema.parse(JSON.parse('{"name":"Kim","age":30,"tags":[]}'));
+user.age.toFixed(); // O number로 추론
+
+UserSchema.parse({ name: "Kim" }); // 런타임: Error: Expected number
+```
+
+동작 원리를 단계로 정리하면 다음과 같다.
+
+1. `z.string()`은 `Schema<string>`을 반환 → 타입 정보가 제네릭에 실림
+2. `z.object(shape)`의 `Shape`가 `{ name: Schema<string>; age: Schema<number>; ... }`로 추론됨
+3. mapped type이 각 키에 `Infer`를 적용해 `{ name: string; age: number; ... }` 생성
+4. `Infer<typeof UserSchema>`가 최종 타입을 꺼냄
+
+> **포인트**: 실제 Zod는 optional 키 처리(`?` 붙이기), 입력/출력 타입 분리(`z.input`/`z.output`), transform 등이 추가되어 훨씬 복잡하지만, 뼈대는 "제네릭으로 타입을 운반 + `infer`로 꺼내기"다. 타입이 "단일 진실 공급원(스키마)"에서 파생되므로 런타임 검증과 정적 타입이 어긋나지 않는다.
+
+## 12. 타입 성능과 재귀 한계
+
+> **비유**: 컴파일러는 계산기를 들고 있는 사람이다. 타입이 복잡할수록 손으로 계산할 양이 늘어나고, 일정 깊이를 넘으면 "너무 깊어서 못 하겠다"며 포기한다.
+
+### 12.1 대표적인 한계 에러
+
+```ts
+type Countdown<N extends number, Acc extends unknown[] = []> =
+  Acc["length"] extends N ? Acc : Countdown<N, [...Acc, unknown]>;
+
+type Ok = Countdown<500>["length"];  // O 500 (tail recursion이라 최대 약 1000 단계)
+
+type NotTail<N extends number, Acc extends unknown[] = []> =
+  Acc["length"] extends N ? [] : [unknown, ...NotTail<N, [...Acc, unknown]>];
+
+type Bad = NotTail<300>;
+// X error TS2589: Type instantiation is excessively deep and possibly infinite.
+```
+
+| 에러 | 원인 |
+| --- | --- |
+| TS2589 excessively deep | 재귀·instantiation 깊이 초과 (일반 재귀는 수십~100단계 수준, tail 재귀는 약 1000단계) |
+| union too complex to represent | union 멤버 수 폭발 (템플릿 리터럴 조합 등, 약 10만 개 한도) |
+| 에디터가 느려짐, 자동완성 지연 | 거대한 intersection, 깊은 conditional type 남용 |
+
+### 12.2 실전 팁
+
+1. **Tail recursion으로 작성**: 재귀 호출이 conditional type 분기의 **최상위**에 오도록 accumulator 매개변수를 쓴다(TS 4.5+ 최적화).
+2. **템플릿 리터럴 조합 폭발 주의**: `` `${A}-${B}-${C}` ``에서 각각 100개면 100만 개 union이 된다.
+3. **intersection보다 interface extends**: interface는 관계가 캐싱되어 비교가 빠르다.
+4. **공개 함수에 반환 타입 명시**: 추론 결과를 매번 다시 계산하지 않고, `.d.ts`도 작아진다.
+5. **재귀 깊이에 상한 두기**: `DeepPartial`에 depth 카운터 튜플을 넣어 일정 깊이에서 멈추게 한다.
+6. **측정하기**: 감으로 최적화하지 말고 진단 도구를 쓴다.
+
+```bash
+# 컴파일 통계 (타입 개수, instantiation 수, 시간)
+npx tsc --noEmit --extendedDiagnostics
+
+# 어떤 타입이 오래 걸리는지 trace 생성 → @typescript/analyze-trace로 분석
+npx tsc --noEmit --generateTrace ./trace
+npx @typescript/analyze-trace ./trace
+```
+
+```ts
+// 깊이 제한 예시
+type DeepPartialLimited<T, Depth extends unknown[] = []> =
+  Depth["length"] extends 5
+    ? T
+    : T extends object
+      ? { [K in keyof T]?: DeepPartialLimited<T[K], [...Depth, unknown]> }
+      : T;
+```
+
+> **주의**: 타입 레벨 프로그래밍은 강력하지만 **읽는 사람의 비용**도 크다. 라이브러리 내부에는 정교한 타입을, 애플리케이션 코드에는 단순한 타입을 두는 것이 일반적인 균형점이다. "타입 퍼즐을 푸는 데 30분"이 걸린다면 단순한 런타임 검사나 테스트가 더 나을 수 있다.
+
+## 셀프 체크
+
+**Q1. `RouteParams<"/users/:id/posts/:postId">`가 `{ id: string; postId: string }`이 되는 과정을 설명하라.**
+
+**A.** `ParamNames`가 템플릿 리터럴 패턴 `${string}:${infer Param}/${infer Rest}`로 첫 `:` 뒤부터 다음 `/` 전까지를 `Param`(`"id"`)으로, 나머지를 `Rest`로 잡고 재귀한다. 마지막 조각은 `/`가 없으므로 두 번째 패턴으로 `"postId"`를 잡는다. 결과 union `"id" | "postId"`를 mapped type의 키로 사용해 각 값을 `string`으로 만든다.
+
+**Q2. `strictFunctionTypes`가 켜져 있는데도 `{ handle(a: Animal): void }` 타입에 `(d: Dog) => void` 구현을 넣을 수 있는 이유는?**
+
+**A.** `strictFunctionTypes`의 반공변 검사는 함수 타입 프로퍼티에만 적용되고, 메서드 문법으로 선언된 멤버는 하위 호환성(예: `Array`의 `push`) 때문에 여전히 bivariant로 검사되기 때문이다. 안전하게 하려면 `handle: (a: Animal) => void` 형태의 프로퍼티 문법을 쓴다.
+
+**Q3. Branded 타입은 런타임에 어떤 비용이 있으며, brand를 안전하게 부여하는 방법은?**
+
+**A.** brand 프로퍼티는 타입 레벨에만 존재하므로 런타임 비용은 0이다. 아무 곳에서나 `as UserId`로 단언하지 않고, 형식을 검증한 뒤 brand 타입을 반환하는 생성 함수(예: `toUserId`) 한 곳에서만 단언하도록 해서 "검증된 값만 brand를 가진다"를 보장한다.
+
+**Q4. Express에서 `req.user`를 타입에 추가할 때 `.d.ts`에 `export {}`가 필요한 이유는?**
+
+**A.** `declare global`은 모듈 파일 안에서만 쓸 수 있고, 최상위 `import`/`export`가 없는 파일은 전역 스크립트로 취급되기 때문이다. `export {}`로 파일을 모듈로 만들어야 `declare global { namespace Express { interface Request ... } }`가 기존 Express 타입과 선언 병합된다.
+
+**Q5. 재귀 타입에서 TS2589 에러가 났다. 어떤 방향으로 고칠 수 있나?**
+
+**A.** 재귀 호출이 conditional 분기의 최상위에 오도록 accumulator를 사용한 tail recursion 형태로 바꾸면 허용 깊이가 크게 늘어난다. 그 외에 depth 카운터로 재귀 깊이에 상한을 두거나, union 폭발을 줄이거나, `--extendedDiagnostics`/`--generateTrace`로 병목 타입을 찾아 단순화한다.
+
+## 핵심 정리
+
+- 타입 시스템은 conditional type(분기), 재귀(반복), `infer`(패턴 매칭), 튜플(배열·카운터)로 이루어진 함수형 언어다.
+- `DeepPartial`/`DeepReadonly`는 함수 분기 + 객체 재귀가 기본형, JSON 타입은 자기 참조 union으로 표현한다.
+- 튜플은 `infer`와 variadic spread로 Head/Tail/Concat/Reverse를 구현하며, `length`로 숫자를 센다.
+- 템플릿 리터럴 + `infer` + 재귀로 라우트 문자열에서 파라미터 타입을 추출할 수 있다.
+- 키 리매핑(`as`)으로 키 이름 변환과 필터링(`never`)을 한다.
+- Branded 타입은 구조적 타이핑의 빈틈을 런타임 비용 없이 막는다. 검증 함수 한 곳에서만 부여.
+- 매개변수는 반공변, 반환은 공변. 메서드 문법은 bivariant이므로 콜백은 프로퍼티 문법으로.
+- 오버로드는 불규칙한 입출력, 제네릭은 규칙적인 입출력에 사용.
+- 라이브러리 타입 확장은 interface 선언 병합 + `declare global`/`declare module`, 파일은 반드시 모듈로.
+- 스키마 → 타입 추론은 "제네릭으로 타입 운반 + `infer`로 추출"이 핵심이다.
+- 깊은 재귀는 tail recursion과 depth 제한으로, 성능은 진단 도구로 측정하며 다룬다.

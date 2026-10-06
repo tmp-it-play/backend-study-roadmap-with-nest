@@ -1,0 +1,601 @@
+---
+title: "Module 시스템"
+description: "@Module의 4가지 속성, 내부 스캔·인스턴스화 과정, Global/Dynamic Module, 순환 의존성까지 정리"
+order: 1
+---
+
+## 한눈에 보기
+
+- Module은 provider를 묶는 **캡슐화 경계**다. 기본적으로 provider는 모듈 안에서만 보이고, `exports`에 넣어야 밖에서 쓸 수 있다.
+- `@Module`의 4가지 속성: `imports`(가져오기), `providers`(등록), `controllers`(라우트), `exports`(공개).
+- 부트스트랩 시 `DependenciesScanner`가 모듈 그래프를 스캔하고, `InstanceLoader`/`Injector`가 인스턴스를 만든다.
+- 설정이 필요한 모듈은 Dynamic Module(`forRoot`, `register` 등)로 만든다.
+- 순환 의존성은 `forwardRef`로 풀 수 있지만, 설계로 없애는 것이 정답이다.
+
+## Module이란
+
+> **비유**: 회사의 **부서**를 떠올려 보자. 각 부서(Module)에는 직원(provider)이 있고, 다른 부서 직원에게 일을 시키려면 그 부서가 "이 사람은 외부 협업 가능"이라고 공개(`exports`)해야 하며, 우리 부서도 그 부서와 협업 계약(`imports`)을 맺어야 한다. 안내 데스크(controller)는 외부 손님(HTTP 요청)을 맞이하는 창구다.
+
+NestJS 애플리케이션은 **Module 그래프**로 구성된다. 모든 앱에는 최소 하나의 root module(보통 `AppModule`)이 있고, Nest는 이 root module에서 출발해 `imports`를 따라가며 전체 의존성 그래프를 만든다.
+
+Module은 단순한 "폴더 묶음"이 아니라 **DI의 캡슐화 경계(encapsulation boundary)** 다. 어떤 provider가 어디서 주입 가능한지는 전적으로 Module 경계와 `exports`에 의해 결정된다.
+
+```ts
+import { Module } from '@nestjs/common';
+import { UsersController } from './users.controller';
+import { UsersService } from './users.service';
+import { DatabaseModule } from '../database/database.module';
+
+@Module({
+  imports: [DatabaseModule],
+  controllers: [UsersController],
+  providers: [UsersService],
+  exports: [UsersService],
+})
+export class UsersModule {}
+```
+
+## @Module의 4가지 속성
+
+| 속성 | 역할 | 들어가는 것 |
+| --- | --- | --- |
+| `imports` | 다른 모듈이 export한 provider를 이 모듈에서 사용 | Module 클래스, Dynamic Module, `forwardRef` |
+| `providers` | 이 모듈의 Injector가 생성·관리할 provider | 클래스, Custom Provider 객체 |
+| `controllers` | 이 모듈에 속한 controller (라우트 진입점) | Controller 클래스 |
+| `exports` | 이 모듈을 import한 쪽에 공개할 것 | provider 토큰 또는 Module (re-export) |
+
+### imports
+
+다른 모듈이 **export한 provider만** 가져올 수 있다. 모듈을 import했다고 해서 그 모듈의 모든 provider가 보이는 것이 아니다.
+
+```ts
+@Module({
+  imports: [
+    UsersModule,                       // 정적 모듈
+    ConfigModule.forRoot({ isGlobal: true }), // Dynamic Module
+    TypeOrmModule.forFeature([Order]), // feature 단위 Dynamic Module
+  ],
+  providers: [OrdersService],
+})
+export class OrdersModule {}
+```
+
+### providers
+
+해당 모듈 스코프에 등록되는 provider 목록이다. 기본적으로 **이 모듈 내부에서만** 주입 가능하다.
+
+```ts
+@Module({
+  providers: [
+    OrdersService,                                     // 축약형 (useClass와 동일)
+    { provide: 'PAYMENT_GATEWAY', useClass: TossPaymentGateway },
+    { provide: 'ORDER_CONFIG', useValue: { maxItems: 50 } },
+  ],
+})
+export class OrdersModule {}
+```
+
+### controllers
+
+HTTP 라우트를 처리하는 controller를 등록한다. Controller도 DI 대상이라서 같은 모듈의 provider, 혹은 import한 모듈이 export한 provider를 생성자로 주입받을 수 있다. 단, controller는 **export할 수 없다** (provider가 아님).
+
+```ts
+@Controller('orders')
+export class OrdersController {
+  constructor(
+    private readonly ordersService: OrdersService, // 같은 모듈
+    private readonly usersService: UsersService,   // UsersModule이 export
+  ) {}
+
+  @Get(':id')
+  findOne(@Param('id', ParseIntPipe) id: number) {
+    return this.ordersService.findOne(id);
+  }
+}
+```
+
+### exports
+
+`exports`에는 두 종류가 올 수 있다.
+
+1. **provider 토큰**: 클래스 자체 또는 `provide`에 쓴 string/symbol 토큰
+2. **Module**: import한 모듈을 그대로 다시 공개하는 **re-export**
+
+```ts
+@Module({
+  imports: [DatabaseModule, CacheModule],
+  providers: [
+    UsersService,
+    { provide: 'USER_REPOSITORY', useClass: TypeOrmUserRepository },
+  ],
+  exports: [
+    UsersService,       // 클래스 토큰
+    'USER_REPOSITORY',  // 문자열 토큰
+    CacheModule,        // re-export: UsersModule을 import하면 CacheModule의 export도 보임
+  ],
+})
+export class UsersModule {}
+```
+
+> **포인트**: `exports`에는 provider **인스턴스**가 아니라 **토큰**을 넣는다. 그리고 자기 `providers`에 없는(또는 import하지 않은) 것을 export하면 부트스트랩 시 에러가 난다.
+
+## 내부 동작: 부트스트랩 과정
+
+> **비유**: 회사 창립일에 인사팀이 하는 일과 같다. (1) 조직도를 따라 모든 부서를 찾아 명부에 올리고(Scanner), (2) 부서마다 직원 명단과 공개 범위를 기록한 뒤(Container), (3) 실제로 직원을 채용하는데, 어떤 직원이 다른 직원을 필요로 하면 그 사람부터 먼저 채용한다(Injector).
+
+`NestFactory.create(AppModule)`을 호출하면 내부적으로 대략 다음 순서로 진행된다.
+
+1. `NestContainer`(전체 명부)를 만든다.
+2. `DependenciesScanner`가 root module부터 `imports`를 따라가며 모든 모듈을 찾아 등록한다.
+3. 각 모듈의 providers / controllers / exports 메타데이터를 읽어 기록한다.
+4. `InstanceLoader`가 `Injector`를 통해 의존성 순서대로 인스턴스를 만든다.
+5. HTTP 어댑터와 라우터를 연결해 `NestApplication`을 만든다.
+
+```text
+NestFactory.create(AppModule)
+  │
+  ├─ NestContainer 생성
+  │
+  ├─ DependenciesScanner.scan(AppModule)
+  │    ├─ scanForModules()         : imports를 재귀적으로 따라가며 모든 모듈 발견
+  │    │     └─ container.addModule() → Module 인스턴스 생성, 모듈 토큰 부여
+  │    ├─ scanModulesForDependencies()
+  │    │     ├─ reflectImports()    : 모듈 간 연결 (Module._imports)
+  │    │     ├─ reflectProviders()  : Module._providers 에 InstanceWrapper 등록
+  │    │     ├─ reflectControllers(): Module._controllers 에 등록
+  │    │     └─ reflectExports()    : Module._exports 에 토큰 등록
+  │    └─ calculateModulesDistance(): 모듈 간 거리 계산 (lifecycle hook 순서에 사용)
+  │
+  ├─ InstanceLoader.createInstancesOfDependencies()
+  │    ├─ createPrototypes()       : 각 InstanceWrapper에 prototype 준비
+  │    └─ createInstances()        : Injector.loadProvider / loadController ...
+  │          └─ 생성자 파라미터 토큰 해석 → 의존성 재귀 resolve → new 호출
+  │
+  └─ NestApplication 생성 (HTTP adapter, 라우터 등록 등)
+```
+
+### NestContainer와 Module 객체
+
+`NestContainer`는 내부적으로 `Map<string, Module>` 형태로 모든 모듈을 보관한다. 여기서 key가 **모듈 토큰**이다. 각 `Module` 객체(데코레이터가 붙은 클래스가 아니라 Nest 내부의 `Module` 클래스 인스턴스)는 다음과 같은 컬렉션을 가진다.
+
+| 내부 필드 | 타입 | 의미 |
+| --- | --- | --- |
+| `_providers` | `Map<InjectionToken, InstanceWrapper>` | 이 모듈의 provider |
+| `_controllers` | `Map<InjectionToken, InstanceWrapper>` | 이 모듈의 controller |
+| `_injectables` | `Map<InjectionToken, InstanceWrapper>` | guard, interceptor, pipe 등 enhancer |
+| `_imports` | `Set<Module>` | import한 모듈들 |
+| `_exports` | `Set<InjectionToken>` | 외부에 공개한 토큰 |
+
+`InstanceWrapper`는 실제 인스턴스뿐 아니라 metatype(클래스), scope, 의존성 목록, 해결 여부(`isResolved`), REQUEST/TRANSIENT scope일 때 context별 인스턴스 등을 담는 래퍼다.
+
+또한 모듈 자체도 provider로 등록된다. 그래서 모듈 클래스의 생성자에서 provider를 주입받을 수 있다.
+
+```ts
+@Module({ providers: [SeedService] })
+export class AppModule {
+  constructor(private readonly seed: SeedService) {} // 모듈 클래스도 DI 대상
+}
+```
+
+### 모듈 토큰
+
+같은 클래스라도 Dynamic Module로 다른 옵션과 함께 import되면 **서로 다른 모듈 인스턴스**가 된다. 이를 구분하기 위해 `ModuleTokenFactory`가 모듈 클래스와 dynamic metadata를 기반으로 토큰을 만든다.
+
+- 정적 모듈: 같은 클래스 → 같은 토큰 → 앱 전체에서 **한 번만** 등록 (여러 곳에서 import해도 하나)
+- Dynamic Module: 클래스 + 메타데이터(옵션 객체)를 해시 → 옵션이 다르면 별개 모듈
+
+### 캡슐화는 어떻게 강제되나
+
+> **비유**: 직원을 찾을 때 먼저 **우리 부서 명단**을 보고, 없으면 **협업 계약한 부서들의 공개 명단**만 확인한다. 계약하지 않은 부서나, 계약했어도 공개하지 않은 직원은 찾을 수 없다.
+
+`Injector`가 어떤 토큰을 해석할 때의 탐색 순서는 다음과 같다.
+
+1. 현재 모듈의 `_providers`에서 찾는다.
+2. 없으면 `lookupComponentInParentModules()` → 현재 모듈의 `_imports`에 있는 각 모듈을 순회하며, 그 모듈의 `_exports`에 해당 토큰이 있는지 확인한다.
+3. export된 것이 또 다른 모듈(re-export)이면 그 모듈의 exports로 재귀적으로 내려간다.
+4. Global 모듈은 모든 모듈의 imports에 자동으로 연결된 것처럼 동작한다.
+5. 끝까지 못 찾으면 `UnknownDependenciesException` 발생.
+
+```text
+Nest can't resolve dependencies of the OrdersService (?, PaymentGateway).
+Please make sure that the argument UsersService at index [0] is available in the OrdersModule context.
+```
+
+> **포인트**: 이 에러는 거의 항상 "provider를 export하지 않았거나, 해당 모듈을 import하지 않았다" 둘 중 하나다. 해결책으로 같은 Service를 여러 모듈의 `providers`에 중복 등록하면 **인스턴스가 여러 개** 생기므로 주의.
+
+## 공유 모듈과 싱글톤
+
+> **비유**: 회사에 **복사기가 한 대** 있고 여러 부서가 같이 쓴다. 부서마다 복사기를 따로 사면(중복 등록) 토너 잔량(상태)이 제각각이 되어 혼란이 생긴다.
+
+Nest에서 모듈은 기본적으로 **싱글톤**이다. `UsersModule`을 `OrdersModule`과 `AuthModule`이 각각 import해도 `UsersModule`은 한 번만 생성되고, 그 안의 `UsersService` 인스턴스도 하나다.
+
+```ts
+@Module({
+  providers: [UsersService],
+  exports: [UsersService],
+})
+export class UsersModule {}
+
+@Module({ imports: [UsersModule], providers: [OrdersService] })
+export class OrdersModule {}
+
+@Module({ imports: [UsersModule], providers: [AuthService] })
+export class AuthModule {}
+// OrdersService와 AuthService가 받는 UsersService는 동일한 인스턴스
+```
+
+> **주의**: 반면 다음은 흔한 안티패턴이다.
+
+```ts
+// X 각 모듈의 providers에 직접 등록 → 모듈마다 별도 인스턴스 생성
+@Module({ providers: [OrdersService, UsersService] })
+export class OrdersModule {}
+
+@Module({ providers: [AuthService, UsersService] })
+export class AuthModule {}
+```
+
+캐시, 커넥션 풀처럼 상태를 가진 provider가 중복 생성되면 버그로 이어지므로, **소유 모듈 하나에서 등록하고 export**하는 것이 원칙이다.
+
+## @Global 모듈
+
+> **비유**: 사내 **공용 와이파이**나 **정수기**처럼 협업 계약 없이 누구나 쓸 수 있는 설비다. 편하지만 모든 것을 공용으로 만들면 누가 무엇에 의존하는지 아무도 모르게 된다.
+
+`@Global()`을 붙이면 해당 모듈이 export한 provider를 **import 없이 어디서든** 주입받을 수 있다. 단, Global 모듈도 root(또는 어딘가)에서 **한 번은 import 되어야** 그래프에 등록된다.
+
+```ts
+@Global()
+@Module({
+  providers: [AppLogger],
+  exports: [AppLogger],
+})
+export class LoggerModule {}
+
+@Module({
+  imports: [LoggerModule], // 한 번만 등록
+})
+export class AppModule {}
+
+// 이후 어떤 모듈에서도 import 없이 주입 가능
+@Injectable()
+export class OrdersService {
+  constructor(private readonly logger: AppLogger) {}
+}
+```
+
+Dynamic Module에서는 반환 객체에 `global: true`를 넣어 같은 효과를 낸다.
+
+```ts
+static forRoot(options: LoggerOptions): DynamicModule {
+  return {
+    module: LoggerModule,
+    global: true,
+    providers: [{ provide: LOGGER_OPTIONS, useValue: options }, AppLogger],
+    exports: [AppLogger],
+  };
+}
+```
+
+> **주의**: (남용 금지) 모든 것을 Global로 만들면 모듈의 의존 관계가 코드에서 드러나지 않게 되고, 테스트 시 어떤 모듈을 준비해야 하는지 파악하기 어려워진다. Config, Logger, DB 커넥션처럼 **진짜 횡단 관심사**에만 사용하자. 공식 문서도 "Making everything global is not a good design decision"이라는 취지로 권고한다.
+
+## Dynamic Module
+
+> **비유**: 정적 모듈은 **기성복**, Dynamic Module은 **맞춤 정장**이다. 같은 디자인(모듈 클래스)이지만 주문할 때 치수(옵션)를 넘겨주면 그에 맞게 재단된 결과물(provider 구성)이 나온다.
+
+정적 모듈은 항상 같은 provider 구성을 갖는다. **import 시점에 설정값을 받아 provider 구성을 바꾸고 싶을 때** Dynamic Module을 쓴다. Dynamic Module은 `DynamicModule` 인터페이스를 만족하는 객체를 반환하는 static 메서드다.
+
+```ts
+export interface DynamicModule extends ModuleMetadata {
+  module: Type<any>;
+  global?: boolean;
+}
+```
+
+`module` 외의 속성(`imports`, `providers`, `exports`, `controllers`)은 `@Module()` 데코레이터의 메타데이터와 **병합(extend)** 된다.
+
+### 네이밍 컨벤션
+
+| 메서드 | 의미 | 예시 |
+| --- | --- | --- |
+| `forRoot` | 앱 전체에서 한 번 설정, 이후 공유 | `ConfigModule.forRoot()`, `TypeOrmModule.forRoot()` |
+| `forRootAsync` | `forRoot`인데 옵션을 다른 provider(Config 등)에 의존해 비동기로 생성 | `TypeOrmModule.forRootAsync()` |
+| `forFeature` | `forRoot`의 설정을 공유하면서 모듈별로 부분 구성 | `TypeOrmModule.forFeature([User])` |
+| `register` | import하는 곳마다 각기 다른 설정의 인스턴스 | `HttpModule.register()`, `JwtModule.register()` |
+| `registerAsync` | `register`의 비동기 버전 | `JwtModule.registerAsync()` |
+
+### 수동 구현 예시
+
+```ts
+// mail.constants.ts
+export const MAIL_OPTIONS = Symbol('MAIL_OPTIONS');
+
+export interface MailModuleOptions {
+  host: string;
+  port: number;
+  from: string;
+}
+
+export interface MailModuleAsyncOptions {
+  imports?: any[];
+  inject?: any[];
+  useFactory: (...args: any[]) => MailModuleOptions | Promise<MailModuleOptions>;
+}
+```
+
+```ts
+// mail.module.ts
+import { DynamicModule, Module } from '@nestjs/common';
+
+@Module({})
+export class MailModule {
+  static forRoot(options: MailModuleOptions): DynamicModule {
+    return {
+      module: MailModule,
+      providers: [
+        { provide: MAIL_OPTIONS, useValue: options },
+        MailService,
+      ],
+      exports: [MailService],
+    };
+  }
+
+  static forRootAsync(options: MailModuleAsyncOptions): DynamicModule {
+    return {
+      module: MailModule,
+      imports: options.imports ?? [],
+      providers: [
+        {
+          provide: MAIL_OPTIONS,
+          useFactory: options.useFactory,
+          inject: options.inject ?? [],
+        },
+        MailService,
+      ],
+      exports: [MailService],
+    };
+  }
+}
+```
+
+```ts
+// mail.service.ts
+@Injectable()
+export class MailService {
+  constructor(@Inject(MAIL_OPTIONS) private readonly options: MailModuleOptions) {}
+
+  async send(to: string, subject: string, body: string) {
+    // this.options.host, this.options.port 사용
+  }
+}
+```
+
+```ts
+// app.module.ts
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    MailModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        host: config.getOrThrow<string>('MAIL_HOST'),
+        port: config.get<number>('MAIL_PORT', 587),
+        from: 'no-reply@example.com',
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+### ConfigurableModuleBuilder
+
+위의 boilerplate(옵션 토큰, `forRoot`/`forRootAsync`, `useClass`/`useExisting` 지원 등)를 자동으로 생성해 주는 헬퍼다.
+
+```ts
+// mail.module-definition.ts
+import { ConfigurableModuleBuilder } from '@nestjs/common';
+import { MailModuleOptions } from './interfaces';
+
+export const {
+  ConfigurableModuleClass,
+  MODULE_OPTIONS_TOKEN,
+  OPTIONS_TYPE,
+  ASYNC_OPTIONS_TYPE,
+} = new ConfigurableModuleBuilder<MailModuleOptions>()
+  .setClassMethodName('forRoot')     // 기본값은 register / registerAsync
+  .setExtras(
+    { isGlobal: false },
+    (definition, extras) => ({ ...definition, global: extras.isGlobal }),
+  )
+  .build();
+```
+
+```ts
+// mail.module.ts
+@Module({
+  providers: [MailService],
+  exports: [MailService],
+})
+export class MailModule extends ConfigurableModuleClass {}
+
+// mail.service.ts
+@Injectable()
+export class MailService {
+  constructor(@Inject(MODULE_OPTIONS_TOKEN) private readonly options: MailModuleOptions) {}
+}
+```
+
+```ts
+// 사용하는 쪽: forRoot / forRootAsync 가 자동 생성됨
+MailModule.forRoot({ host: 'smtp.example.com', port: 587, from: 'a@b.com', isGlobal: true });
+
+MailModule.forRootAsync({
+  imports: [ConfigModule],
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    host: config.getOrThrow('MAIL_HOST'),
+    port: 587,
+    from: 'a@b.com',
+  }),
+});
+
+// useClass 방식도 지원: 해당 클래스는 create() 메서드를 구현
+MailModule.forRootAsync({ useClass: MailConfigService });
+```
+
+> **포인트**: `OPTIONS_TYPE`, `ASYNC_OPTIONS_TYPE`은 값이 아니라 타입 추출용이다. static 메서드를 오버라이드해서 추가 로직을 넣을 때 `typeof OPTIONS_TYPE` 형태로 사용한다. `setFactoryMethodName()`으로 `useClass` 클래스가 구현할 메서드 이름(기본 `create`)도 바꿀 수 있다.
+
+## 순환 의존성 (Circular Dependency)
+
+> **비유**: A가 "B가 오면 출발할게", B가 "A가 오면 출발할게"라고 서로 기다리는 상황이다. `forwardRef`는 "일단 자리만 맡아 두고, 상대가 도착하면 그때 연결하자"라는 약속이다.
+
+### 왜 생기는가
+
+TypeScript의 데코레이터와 `emitDecoratorMetadata`는 **클래스 정의 시점(모듈 파일 평가 시점)** 에 실행된다. A 파일이 B를 import하고 B 파일이 A를 import하면, Node.js의 CommonJS 모듈 로딩 순서상 한쪽 파일이 평가될 때 상대 클래스는 아직 **`undefined`** 다.
+
+```ts
+// a.module.ts
+import { BModule } from './b.module'; // b.module.ts 평가 시작 → 그 안에서 a.module 을 import
+@Module({ imports: [BModule] })       // BModule이 아직 undefined일 수 있음
+export class AModule {}
+```
+
+이 경우 Nest는 아래와 같은 에러를 낸다.
+
+```text
+Nest cannot create the AModule instance.
+The module at index [0] of the AModule "imports" array is undefined.
+
+Potential causes:
+- A circular dependency between modules. Use forwardRef() to avoid it.
+```
+
+provider 간에도 마찬가지로, `design:paramtypes` 메타데이터에 기록되는 생성자 파라미터 타입이 `undefined`가 되어 Nest가 토큰을 알 수 없게 된다.
+
+### 모듈 간 순환: `forwardRef(() => XModule)`
+
+```ts
+// users.module.ts
+@Module({
+  imports: [forwardRef(() => AuthModule)],
+  providers: [UsersService],
+  exports: [UsersService],
+})
+export class UsersModule {}
+
+// auth.module.ts
+@Module({
+  imports: [forwardRef(() => UsersModule)],
+  providers: [AuthService],
+  exports: [AuthService],
+})
+export class AuthModule {}
+```
+
+`forwardRef`는 클래스 참조를 **함수로 감싸서 평가를 지연**시킨다. 스캔 시점에는 두 파일 모두 평가가 끝났으므로 함수를 호출하면 실제 클래스를 얻는다.
+
+### provider 간 순환: `@Inject(forwardRef(() => X))`
+
+```ts
+@Injectable()
+export class UsersService {
+  constructor(
+    @Inject(forwardRef(() => AuthService))
+    private readonly authService: AuthService,
+  ) {}
+}
+
+@Injectable()
+export class AuthService {
+  constructor(
+    @Inject(forwardRef(() => UsersService))
+    private readonly usersService: UsersService,
+  ) {}
+}
+```
+
+> **주의**: 아래 함정들을 꼭 기억하자.
+
+- **양쪽 모두**에 `forwardRef`를 적용해야 안전하다.
+- 인스턴스 생성 순서가 보장되지 않는다. 생성자 안에서 상대 provider의 메서드를 호출하면 안 되고, `onModuleInit` 이후에 사용해야 한다.
+- 순환 관계에 `Scope.REQUEST` provider가 끼어 있으면 의존성이 `undefined`로 주입될 수 있다 (공식 문서 경고).
+- barrel 파일(`index.ts`)로 re-export하는 구조가 의도치 않은 순환 import를 만드는 경우가 많다. 같은 모듈 내부에서는 barrel을 통하지 말고 직접 경로로 import하자.
+
+### 대안: ModuleRef로 지연 조회
+
+```ts
+@Injectable()
+export class UsersService implements OnModuleInit {
+  private authService: AuthService;
+
+  constructor(private readonly moduleRef: ModuleRef) {}
+
+  onModuleInit() {
+    this.authService = this.moduleRef.get(AuthService, { strict: false });
+  }
+}
+```
+
+### 설계로 회피하기
+
+`forwardRef`는 증상 완화일 뿐이고, 순환 의존성은 대부분 **책임 분리가 덜 된 신호**다.
+
+1. **공통 로직 추출**: A와 B가 서로 필요로 하는 부분을 제3의 `CModule`로 빼고, A와 B가 C에 의존하게 한다.
+2. **의존 방향 정리**: 상위 레벨(유스케이스) → 하위 레벨(도메인/인프라)로만 흐르게 한다. 예를 들어 `AuthService`는 `UsersService`에 의존하되, `UsersService`는 `AuthService`를 모르게 한다.
+3. **이벤트 기반 분리**: `@nestjs/event-emitter`의 `EventEmitter2`로 "회원 가입됨" 이벤트를 발행하고 다른 모듈이 구독하면 직접 참조가 사라진다.
+4. **인터페이스 + 토큰**: 구체 클래스 대신 symbol 토큰과 인터페이스에 의존하게 해서 파일 수준 import 순환을 끊는다.
+
+```ts
+// 이벤트로 순환 제거 예시
+@Injectable()
+export class UsersService {
+  constructor(private readonly events: EventEmitter2) {}
+
+  async signUp(dto: SignUpDto) {
+    const user = await this.repo.save(dto);
+    this.events.emit('user.created', { userId: user.id });
+    return user;
+  }
+}
+
+@Injectable()
+export class AuthListener {
+  @OnEvent('user.created')
+  handleUserCreated(payload: { userId: number }) {
+    // 기본 권한 부여 등
+  }
+}
+```
+
+## 셀프 체크
+
+**Q1. `UsersModule`을 import했는데 `UsersService`를 주입받을 때 "can't resolve dependencies" 에러가 난다. 가장 유력한 원인은?**
+
+**A.** `UsersModule`이 `UsersService`를 `exports`에 넣지 않았기 때문이다. import는 "공개된 것만" 가져온다.
+
+**Q2. 같은 정적 모듈을 세 군데에서 import하면 모듈 인스턴스는 몇 개 생기나?**
+
+**A.** 하나다. 정적 모듈은 같은 클래스 → 같은 모듈 토큰이므로 컨테이너에 한 번만 등록되고, 그 안의 provider도 공유된다.
+
+**Q3. `forRoot`와 `register`의 관례적 차이는?**
+
+**A.** `forRoot`는 앱 전체에서 한 번 설정하고 공유하는 용도, `register`는 import하는 곳마다 서로 다른 설정의 인스턴스를 만드는 용도다.
+
+**Q4. 순환 import 시 데코레이터에서 상대 클래스가 `undefined`가 되는 이유는?**
+
+**A.** 데코레이터와 `design:paramtypes` 메타데이터는 파일이 평가되는 시점에 실행되는데, 순환 import 상황에서는 상대 파일의 평가가 아직 끝나지 않아 클래스가 정의되지 않았기 때문이다. `forwardRef`는 이 참조를 함수로 감싸 평가를 늦춘다.
+
+**Q5. `@Global()` 모듈은 import를 전혀 하지 않아도 동작하나?**
+
+**A.** 아니다. 모듈 그래프에 등록되려면 root module 등 어딘가에서 한 번은 import해야 한다. 그 이후 다른 모듈에서는 import 없이 주입받을 수 있다.
+
+## 핵심 정리
+
+- Module은 DI의 **캡슐화 경계**다. provider는 기본적으로 모듈 내부 전용이며, `exports`에 넣어야 외부에 공개된다.
+- `@Module`의 4가지 속성: `imports`(가져오기), `providers`(등록), `controllers`(라우트), `exports`(공개 — provider 토큰 또는 모듈 re-export).
+- 부트스트랩: `NestFactory.create` → `DependenciesScanner`가 모듈 그래프 스캔 → `NestContainer`에 Module 등록(각 Module은 `Map<token, InstanceWrapper>` 보유) → `InstanceLoader`/`Injector`가 인스턴스화.
+- Injector는 현재 모듈 → import한 모듈의 exports → Global 모듈 순으로 토큰을 찾고, 못 찾으면 `UnknownDependenciesException`.
+- 모듈은 싱글톤이다. 같은 Service를 여러 모듈 `providers`에 중복 등록하지 말고 **소유 모듈에서 export** 하자.
+- `@Global`은 Config/Logger 같은 횡단 관심사에만. 남용하면 의존 관계가 숨겨진다.
+- Dynamic Module: `forRoot`(전역 1회 설정), `forFeature`(부분 구성), `register`(사용처별 설정), `*Async`(다른 provider에 의존하는 비동기 옵션). `ConfigurableModuleBuilder`로 boilerplate 제거.
+- 순환 의존성은 데코레이터 평가 시점에 상대 클래스가 `undefined`라서 발생한다. 모듈 간 `forwardRef(() => XModule)`, provider 간 `@Inject(forwardRef(() => X))`로 해결하되, 근본적으로는 공통 모듈 추출·의존 방향 정리·이벤트로 **설계 단계에서 제거**하는 것이 좋다.

@@ -1,0 +1,538 @@
+---
+title: "데이터베이스 연동"
+description: "TypeORM과 Prisma를 NestJS에 붙이는 방법, 트랜잭션 전파(nestjs-cls), Repository 패턴, N+1, 커넥션 풀, ORM 비교"
+order: 10
+---
+
+## 한눈에 보기
+
+- TypeORM은 `TypeOrmModule.forRootAsync`로 연결하고 `forFeature`로 엔티티별 Repository를 모듈에 등록한 뒤 `@InjectRepository`로 주입받는다.
+- Prisma는 공식 Nest 모듈 없이 `PrismaService extends PrismaClient` 하나를 provider로 만들고 `onModuleInit`에서 `$connect()` 하는 패턴이 표준이다.
+- 트랜잭션은 같은 커넥션(QueryRunner / tx client)을 끝까지 넘겨야 한다. 이걸 매번 파라미터로 넘기기 싫으면 `nestjs-cls` + `@nestjs-cls/transactional`의 `@Transactional()`을 쓴다. 원리는 Node의 `AsyncLocalStorage`.
+- 운영 환경에서 `synchronize: true`는 금지. 스키마 변경은 항상 migration으로.
+- N+1과 커넥션 풀 고갈은 ORM 종류와 무관하게 가장 흔한 성능 사고다.
+
+## 큰 그림: Nest에서 DB는 "그냥 provider"다
+
+> **비유**: Nest 입장에서 DB 커넥션은 **건물에 들어온 수도관**이다. 수도관 자체(DataSource, PrismaClient)는 건물 전체에서 하나만 깔고, 각 층(모듈)은 자기 층에 필요한 수도꼭지(Repository)만 단다. 수도관을 까는 일은 건물 준공(부트스트랩) 때 한 번, 잠그는 일은 철거(shutdown) 때 한 번이다.
+
+DB 연동 라이브러리가 무엇이든 Nest가 하는 일은 같다.
+
+1. 앱 시작 시 커넥션 객체를 **비동기 provider**(`useFactory` + `async`)로 만든다.
+2. 이 provider를 global 혹은 export된 모듈에 둔다.
+3. 각 feature 모듈은 필요한 Repository/Client를 토큰으로 주입받는다.
+4. 종료 시 `onModuleDestroy` / `beforeApplicationShutdown`에서 커넥션을 닫는다.
+
+`@nestjs/typeorm`, `@nestjs/mongoose`, `@mikro-orm/nestjs` 같은 패키지는 결국 이 1~4번을 dynamic module(`forRoot` / `forFeature`)로 포장한 것이다.
+
+> **포인트**: DB 모듈의 `forRoot`/`forFeature` 구조는 dynamic module 패턴의 교과서다. `forRoot`는 커넥션 provider를 만들고, `forFeature`는 그 커넥션에서 파생된 Repository provider를 만든다.
+
+## TypeORM 연동
+
+### forRootAsync + ConfigService
+
+> **비유**: `forRoot`에 설정값을 하드코딩하는 것은 **집 열쇠를 현관 매트 밑에 두는 것**이다. `forRootAsync`는 열쇠를 관리실(ConfigService)에 맡기고, 입주 시점에 받아오게 하는 방식이다.
+
+```ts
+// app.module.ts
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    TypeOrmModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        type: 'postgres',
+        host: config.getOrThrow<string>('DB_HOST'),
+        port: config.get<number>('DB_PORT', 5432),
+        username: config.getOrThrow<string>('DB_USER'),
+        password: config.getOrThrow<string>('DB_PASSWORD'),
+        database: config.getOrThrow<string>('DB_NAME'),
+        autoLoadEntities: true,
+        synchronize: false, // 운영에서는 절대 true 금지
+        migrations: ['dist/migrations/*.js'],
+        migrationsRun: false,
+        logging: config.get('NODE_ENV') !== 'production' ? ['query', 'error'] : ['error'],
+        extra: { max: 20 }, // pg Pool 옵션: 커넥션 풀 크기
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+- `ConfigModule`이 `isGlobal: true`라면 `imports: [ConfigModule]`은 생략해도 된다.
+- `useFactory`는 `async`일 수 있다. 예를 들어 Secrets Manager에서 비밀번호를 읽어와도 된다.
+- 내부적으로 `TypeOrmModule`은 `DataSource`를 만드는 비동기 provider를 등록하고, Nest는 이 provider가 resolve될 때까지 의존하는 provider 생성을 기다린다.
+
+### forFeature와 @InjectRepository
+
+```ts
+// users/users.module.ts
+@Module({
+  imports: [TypeOrmModule.forFeature([User, Profile])],
+  providers: [UsersService],
+  exports: [UsersService],
+})
+export class UsersModule {}
+
+// users/users.service.ts
+@Injectable()
+export class UsersService {
+  constructor(
+    @InjectRepository(User) private readonly users: Repository<User>,
+    private readonly dataSource: DataSource,
+  ) {}
+
+  findByEmail(email: string) {
+    return this.users.findOne({ where: { email }, relations: { profile: true } });
+  }
+}
+```
+
+`forFeature([User])`는 `getRepositoryToken(User)`라는 토큰으로 `dataSource.getRepository(User)`를 반환하는 provider를 만든다. `@InjectRepository(User)`는 사실상 `@Inject(getRepositoryToken(User))`의 단축형이다.
+
+> **포인트**: 테스트에서 Repository를 mock할 때도 같은 토큰을 쓴다. `{ provide: getRepositoryToken(User), useValue: mockRepo }`.
+
+### autoLoadEntities
+
+`entities: ['dist/**/*.entity.js']` 같은 glob 경로는 빌드 결과물 경로, monorepo, webpack 번들에서 자주 깨진다. `autoLoadEntities: true`를 켜면 `forFeature`로 등록된 엔티티들이 자동으로 DataSource의 엔티티 목록에 추가된다.
+
+> **주의**: `autoLoadEntities`는 `forFeature`에 한 번도 등장하지 않은 엔티티는 모른다. 관계로만 참조되는 엔티티(예: `Profile`을 `User`에서만 참조)도 어딘가의 `forFeature`에 넣어야 한다.
+
+### 엔티티와 관계 (간단히)
+
+```ts
+@Entity('users')
+export class User {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ unique: true })
+  email: string;
+
+  @OneToOne(() => Profile, (p) => p.user, { cascade: true })
+  @JoinColumn()
+  profile: Profile;
+
+  @OneToMany(() => Order, (o) => o.user)
+  orders: Order[];
+
+  @CreateDateColumn()
+  createdAt: Date;
+}
+
+@Entity('orders')
+export class Order {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @ManyToOne(() => User, (u) => u.orders, { onDelete: 'CASCADE' })
+  user: User;
+
+  @Column('int')
+  amount: number;
+}
+```
+
+- 관계 대상은 `() => Order`처럼 **함수로** 감싼다. 순환 import에서 클래스가 아직 `undefined`일 수 있기 때문이다(Nest의 `forwardRef`와 같은 이유).
+- `eager: true`는 편하지만 모든 조회에 JOIN이 붙는다. 기본은 lazy하게 두고 필요할 때 `relations`로 명시하는 편이 안전하다.
+
+### synchronize 운영 금지와 migrations
+
+> **비유**: `synchronize: true`는 **인테리어 업자가 설계도와 다르면 벽을 그냥 부수는 것**이다. 개발 중 빈 집에서는 편하지만, 사람이 사는 집(운영 DB)에서는 컬럼 이름 하나 바꿨다고 기존 데이터가 담긴 컬럼을 drop하고 새로 만들 수 있다.
+
+```text
+synchronize: true 의 동작
+  엔티티 메타데이터  ──비교──  실제 스키마
+          │
+          └─ 다르면 ALTER / DROP / CREATE 를 앱 시작 시 즉시 실행
+             (리뷰 없음, 롤백 없음, 여러 인스턴스가 동시에 실행할 수도 있음)
+```
+
+운영에서는 migration 파일을 생성해서 리뷰하고, 배포 파이프라인에서 실행한다. TypeORM CLI는 Nest DI를 모르므로 **별도의 DataSource 파일**이 필요하다.
+
+```ts
+// src/database/data-source.ts  (CLI 전용)
+import 'dotenv/config';
+import { DataSource } from 'typeorm';
+
+export default new DataSource({
+  type: 'postgres',
+  url: process.env.DATABASE_URL,
+  entities: ['dist/**/*.entity.js'],
+  migrations: ['dist/migrations/*.js'],
+});
+```
+
+```bash
+npx typeorm migration:generate -d dist/database/data-source.js src/migrations/AddUserNickname
+npx typeorm migration:run -d dist/database/data-source.js
+```
+
+> **주의**: `migrationsRun: true`로 앱 시작 시 migration을 돌리면, 인스턴스 여러 개가 동시에 뜰 때 경쟁 조건이 생길 수 있다. 배포 단계에서 한 번만 실행하는 job으로 분리하는 것을 권장한다.
+
+### TypeORM 트랜잭션: DataSource.transaction
+
+가장 간단한 방법은 콜백 기반 `transaction`이다. 콜백 안에서는 **반드시 인자로 받은 `manager`** 를 써야 같은 트랜잭션에 묶인다.
+
+```ts
+@Injectable()
+export class OrdersService {
+  constructor(private readonly dataSource: DataSource) {}
+
+  async placeOrder(userId: string, amount: number) {
+    return this.dataSource.transaction(async (manager) => {
+      const user = await manager.findOneByOrFail(User, { id: userId });
+      await manager.decrement(Wallet, { userId }, 'balance', amount);
+      return manager.save(Order, manager.create(Order, { user, amount }));
+    });
+  }
+}
+```
+
+> **주의**: 콜백 안에서 `this.usersRepository.save()`처럼 주입받은 Repository를 쓰면 **트랜잭션 밖**의 다른 커넥션으로 실행된다. 에러도 안 나고 조용히 원자성이 깨지는 가장 흔한 실수다.
+
+### TypeORM 트랜잭션: QueryRunner
+
+isolation level, savepoint, 중간 commit 등을 세밀하게 제어하려면 QueryRunner를 직접 쓴다.
+
+```ts
+async transfer(from: string, to: string, amount: number) {
+  const qr = this.dataSource.createQueryRunner();
+  await qr.connect();
+  await qr.startTransaction('REPEATABLE READ');
+  try {
+    await qr.manager.decrement(Wallet, { userId: from }, 'balance', amount);
+    await qr.manager.increment(Wallet, { userId: to }, 'balance', amount);
+    await qr.commitTransaction();
+  } catch (e) {
+    await qr.rollbackTransaction();
+    throw e;
+  } finally {
+    await qr.release(); // 빠뜨리면 커넥션 풀 누수
+  }
+}
+```
+
+| 방식 | 장점 | 단점 |
+| --- | --- | --- |
+| `dataSource.transaction(cb)` | 자동 commit/rollback/release | 세밀한 제어 어려움 |
+| `QueryRunner` | isolation, savepoint, 수동 제어 | `release()` 누락 시 풀 누수 |
+| `@Transactional()` (cls) | 서비스 코드에서 트랜잭션 코드 제거 | 라이브러리 의존, 동작 원리 이해 필요 |
+
+## Prisma 연동
+
+> **비유**: TypeORM 모듈이 **풀옵션 빌트인 가구**라면, Prisma는 **좋은 가구 하나를 사 와서 직접 벽에 고정하는 것**이다. Nest 전용 공식 모듈은 없고, PrismaClient를 provider로 감싸는 얇은 코드만 직접 쓰면 된다.
+
+### PrismaService
+
+```ts
+// prisma/prisma.service.ts
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { PrismaClient } from '@prisma/client';
+
+@Injectable()
+export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+  constructor() {
+    super({ log: ['warn', 'error'] });
+  }
+
+  async onModuleInit() {
+    await this.$connect(); // 첫 쿼리 때 lazy connect 되지만, 기동 시점에 실패를 드러내기 위해
+  }
+
+  async onModuleDestroy() {
+    await this.$disconnect();
+  }
+}
+
+// prisma/prisma.module.ts
+@Global()
+@Module({ providers: [PrismaService], exports: [PrismaService] })
+export class PrismaModule {}
+```
+
+- `onModuleDestroy`가 호출되려면 `main.ts`에서 `app.enableShutdownHooks()`를 켜야 SIGTERM 시점에 정상 동작한다.
+- Prisma 5 이후로는 `$on('beforeExit')` 기반 shutdown hook 예제는 더 이상 필요 없다(library engine에서 지원 중단).
+
+### $transaction: 배열형과 interactive
+
+```ts
+// 1) 배열형(sequential): 독립 쿼리 여러 개를 한 트랜잭션으로
+await this.prisma.$transaction([
+  this.prisma.wallet.update({ where: { userId: from }, data: { balance: { decrement: amount } } }),
+  this.prisma.wallet.update({ where: { userId: to }, data: { balance: { increment: amount } } }),
+]);
+
+// 2) interactive: 중간 결과에 따라 분기해야 할 때
+await this.prisma.$transaction(
+  async (tx) => {
+    const wallet = await tx.wallet.findUniqueOrThrow({ where: { userId: from } });
+    if (wallet.balance < amount) throw new BadRequestException('잔액 부족');
+    await tx.wallet.update({ where: { userId: from }, data: { balance: { decrement: amount } } });
+    await tx.wallet.update({ where: { userId: to }, data: { balance: { increment: amount } } });
+  },
+  { isolationLevel: 'Serializable', timeout: 10_000 },
+);
+```
+
+> **주의**: interactive transaction 콜백 안에서는 `this.prisma`가 아니라 **인자로 받은 `tx`** 를 써야 한다. TypeORM의 `manager` 실수와 똑같은 함정이다. 또 콜백 안에서 외부 HTTP 호출 같은 느린 작업을 하면 커넥션을 오래 점유해 풀이 고갈된다.
+
+## 트랜잭션을 서비스 계층 밖으로: nestjs-cls
+
+> **비유**: 트랜잭션 객체(`manager`, `tx`)를 함수 인자로 계속 넘기는 것은 **릴레이 경주에서 바통을 손에서 손으로 넘기는 것**이다. 주자(함수)가 많아질수록 빠뜨리기 쉽다. `AsyncLocalStorage`는 **경기장 전체에 깔린 전광판**이다. 지금 이 경주(비동기 흐름)의 바통이 무엇인지 누구든 고개만 들면 볼 수 있다.
+
+### 문제
+
+```ts
+// 트랜잭션 객체가 모든 함수 시그니처를 오염시킨다
+async placeOrder(dto: PlaceOrderDto) {
+  return this.dataSource.transaction(async (manager) => {
+    await this.walletService.withdraw(dto.userId, dto.amount, manager);
+    await this.orderRepo.create(dto, manager);
+    await this.outbox.append('OrderPlaced', dto, manager);
+  });
+}
+```
+
+### AsyncLocalStorage 원리
+
+Node.js의 `AsyncLocalStorage`(`node:async_hooks`)는 `run(store, fn)`으로 시작된 비동기 실행 흐름 안에서는 `await`, `setTimeout`, Promise 체인을 거쳐도 같은 `store`를 `getStore()`로 꺼낼 수 있게 해 준다. 요청마다 다른 store를 가지므로 동시 요청끼리 섞이지 않는다.
+
+```ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+const als = new AsyncLocalStorage<{ tx: unknown }>();
+
+als.run({ tx: 'TX-1' }, async () => {
+  await sleep(10);
+  console.log(als.getStore()?.tx); // TX-1
+});
+als.run({ tx: 'TX-2' }, async () => {
+  console.log(als.getStore()?.tx); // TX-2
+});
+```
+
+```text
+요청 A ─ run(storeA) ─┬─ service.a() ── await ── repo.save()  → getStore() = storeA
+요청 B ─ run(storeB) ─┼─ service.a() ── await ── repo.save()  → getStore() = storeB
+                      └─ 같은 코드, 같은 싱글톤 인스턴스, 다른 컨텍스트
+```
+
+> **포인트**: REQUEST scope provider로도 요청별 상태를 만들 수 있지만, scope가 의존 체인 위로 전파되어 요청마다 인스턴스를 새로 만드는 비용이 든다. ALS는 **싱글톤은 그대로 두고 데이터만 요청별로** 분리한다.
+
+### @nestjs-cls/transactional 설정
+
+```ts
+// app.module.ts
+import { ClsModule } from 'nestjs-cls';
+import { ClsPluginTransactional } from '@nestjs-cls/transactional';
+import { TransactionalAdapterTypeOrm } from '@nestjs-cls/transactional-adapter-typeorm';
+
+@Module({
+  imports: [
+    ClsModule.forRoot({
+      global: true,
+      middleware: { mount: true }, // 요청마다 ALS 컨텍스트 시작
+      plugins: [
+        new ClsPluginTransactional({
+          imports: [TypeOrmModule],
+          adapter: new TransactionalAdapterTypeOrm({ dataSourceToken: getDataSourceToken() }),
+        }),
+      ],
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+```ts
+@Injectable()
+export class OrdersService {
+  constructor(
+    private readonly txHost: TransactionHost<TransactionalAdapterTypeOrm>,
+    private readonly wallet: WalletService,
+  ) {}
+
+  @Transactional()
+  async placeOrder(dto: PlaceOrderDto) {
+    await this.wallet.withdraw(dto.userId, dto.amount); // 내부에서 txHost.tx 사용
+    await this.txHost.tx.getRepository(Order).save({ userId: dto.userId, amount: dto.amount });
+  }
+}
+
+@Injectable()
+export class WalletService {
+  constructor(private readonly txHost: TransactionHost<TransactionalAdapterTypeOrm>) {}
+
+  withdraw(userId: string, amount: number) {
+    // 활성 트랜잭션이 있으면 그 EntityManager, 없으면 기본 EntityManager
+    return this.txHost.tx.decrement(Wallet, { userId }, 'balance', amount);
+  }
+}
+```
+
+동작 흐름은 다음과 같다.
+
+1. 요청이 들어오면 `ClsMiddleware`가 `als.run(newStore, next)`로 컨텍스트를 연다.
+2. `@Transactional()`이 붙은 메서드가 호출되면 adapter가 트랜잭션을 시작하고, 트랜잭션용 클라이언트(`EntityManager` 혹은 Prisma `tx`)를 cls store에 넣는다.
+3. 하위 서비스는 `txHost.tx`로 store의 클라이언트를 꺼내 쓴다.
+4. 메서드가 정상 종료하면 commit, throw하면 rollback.
+
+Prisma adapter(`@nestjs-cls/transactional-adapter-prisma`)를 쓰면 `txHost.tx`가 Prisma interactive transaction의 `tx`가 된다. `@Transactional()`은 propagation 옵션(`Propagation.Required`, `RequiresNew`, `Nested` 등)도 지원한다.
+
+> **주의**: HTTP 요청 밖(cron, 큐 consumer, `onModuleInit`)에서는 미들웨어가 ALS 컨텍스트를 열어주지 않는다. 이때는 `ClsService.run()`으로 직접 감싸거나, `@UseCls()` 데코레이터로 컨텍스트를 만들어야 한다.
+
+## Repository 패턴으로 ORM 추상화
+
+> **비유**: 도메인 서비스가 ORM API를 직접 부르는 것은 **요리사가 특정 브랜드 냉장고 사용법을 외우는 것**이다. Repository 인터페이스는 "재료 꺼내줘"라는 **주방 보조**다. 냉장고를 바꿔도(TypeORM → Prisma) 요리사는 몰라도 된다.
+
+TypeScript `interface`는 런타임에 사라지므로 DI 토큰이 될 수 없다. 그래서 **abstract class를 토큰 겸 계약**으로 쓰는 것이 Nest에서 가장 깔끔하다.
+
+```ts
+// domain/order.repository.ts
+export abstract class OrderRepository {
+  abstract findById(id: string): Promise<OrderAggregate | null>;
+  abstract save(order: OrderAggregate): Promise<void>;
+}
+
+// infra/prisma-order.repository.ts
+@Injectable()
+export class PrismaOrderRepository implements OrderRepository {
+  constructor(private readonly txHost: TransactionHost<TransactionalAdapterPrisma>) {}
+
+  async findById(id: string) {
+    const row = await this.txHost.tx.order.findUnique({ where: { id }, include: { items: true } });
+    return row ? OrderMapper.toDomain(row) : null;
+  }
+
+  async save(order: OrderAggregate) {
+    const data = OrderMapper.toPersistence(order);
+    await this.txHost.tx.order.upsert({ where: { id: data.id }, create: data, update: data });
+  }
+}
+
+// orders.module.ts
+@Module({
+  providers: [OrdersService, { provide: OrderRepository, useClass: PrismaOrderRepository }],
+})
+export class OrdersModule {}
+```
+
+| 항목 | ORM Repository 직접 사용 | 추상 Repository |
+| --- | --- | --- |
+| 코드량 | 적음 | Mapper, 구현체 추가 |
+| ORM 교체 | 서비스 전부 수정 | 구현체만 교체 |
+| 단위 테스트 | ORM mock 필요 | 인메모리 구현체로 대체 쉬움 |
+| 도메인 모델 | 엔티티 = 테이블 | 도메인 객체와 persistence 모델 분리 |
+| 추천 상황 | CRUD 위주 서비스 | 도메인 로직이 복잡한 서비스 |
+
+> **포인트**: 모든 프로젝트에 추상 Repository가 필요한 것은 아니다. CRUD 중심이면 ORM Repository를 그대로 쓰고, 도메인 규칙이 쌓이기 시작할 때 도입해도 늦지 않다.
+
+## N+1 문제
+
+> **비유**: 반 학생 30명의 부모님 연락처가 필요할 때, 교무실에 **30번 왕복**하는 것이 N+1이다. 명단을 들고 **한 번에** 받아오면 1+1이다.
+
+```ts
+// X N+1: 사용자 목록 1번 + 사용자마다 주문 조회 N번
+const users = await this.users.find();
+for (const u of users) {
+  u.orders = await this.orders.find({ where: { user: { id: u.id } } });
+}
+```
+
+해결책은 크게 세 가지다.
+
+1. **JOIN으로 한 번에**: TypeORM `relations: { orders: true }` 혹은 QueryBuilder `leftJoinAndSelect`, Prisma `include`.
+2. **IN 쿼리로 배치 로딩**: id 목록을 모아 `WHERE user_id IN (...)` 한 번. Prisma의 `include`는 내부적으로 이 방식을 쓴다.
+3. **DataLoader**: GraphQL resolver처럼 필드 단위로 흩어진 조회를 같은 tick 안에서 모아 배치 처리. REQUEST scope 혹은 cls store에 요청별로 두어야 캐시가 요청 간에 섞이지 않는다.
+
+```ts
+// O 배치 로딩
+const users = await this.users.find({ take: 50 });
+const orders = await this.orders.find({ where: { user: { id: In(users.map((u) => u.id)) } }, relations: { user: true } });
+const byUser = Map.groupBy(orders, (o) => o.user.id);
+```
+
+> **주의**: JOIN이 항상 정답은 아니다. 1:N 관계를 여러 개 JOIN하면 결과 행이 곱해지는(cartesian) 문제가 생기고, `take`/`skip` 페이지네이션이 행 기준으로 잘려 틀어질 수 있다. 개발 중에는 쿼리 로깅을 켜서 실제 쿼리 수를 확인하는 습관이 가장 확실하다.
+
+## 커넥션 풀
+
+> **비유**: 커넥션 풀은 **택시 승강장**이다. 택시(커넥션)를 매번 새로 부르면(TCP + TLS + 인증) 느리니 몇 대를 대기시킨다. 너무 적으면 손님이 줄 서고(대기, timeout), 너무 많으면 DB 서버라는 도로가 막힌다.
+
+- TypeORM(postgres)은 `extra: { max, idleTimeoutMillis, connectionTimeoutMillis }`로 `pg.Pool` 옵션을 넘긴다. MySQL은 `extra.connectionLimit` 혹은 `poolSize`.
+- Prisma는 connection string에 `?connection_limit=10&pool_timeout=10`을 붙인다. 기본값은 대략 `CPU 코어 수 * 2 + 1`.
+- 총 커넥션 수 = **인스턴스 수 x 인스턴스당 풀 크기**. Pod가 20개고 풀이 20이면 DB에 400개가 붙는다. Postgres `max_connections`(기본 100)를 쉽게 넘는다.
+- 서버리스/오토스케일 환경에서는 PgBouncer, RDS Proxy 같은 외부 풀러를 앞에 둔다. PgBouncer transaction mode에서는 prepared statement 관련 옵션(Prisma의 `pgbouncer=true`)을 확인한다.
+
+```text
+풀 고갈의 전형적인 패턴
+  트랜잭션 시작 → 외부 API 호출(3초) → commit
+       └─ 이 3초 동안 커넥션 1개 점유
+  동시 요청 30개, 풀 20개 → 10개는 커넥션 대기 → timeout → 연쇄 실패
+```
+
+> **포인트**: 트랜잭션 범위는 짧게. 외부 호출은 트랜잭션 밖으로 빼거나, Outbox 패턴(patterns 문서 참고)으로 commit 이후에 처리한다.
+
+## ORM 비교: TypeORM vs Prisma vs MikroORM vs Drizzle
+
+> **비유**: TypeORM은 **오래된 만능 공구 세트**, Prisma는 **설명서가 훌륭한 전동 공구**, MikroORM은 **정밀한 장인 공구(Unit of Work)**, Drizzle은 **SQL이라는 맨손에 얇은 장갑을 낀 것**이다.
+
+| 항목 | TypeORM | Prisma | MikroORM | Drizzle |
+| --- | --- | --- | --- | --- |
+| 스키마 정의 | 데코레이터 엔티티 | `schema.prisma` DSL | 데코레이터 또는 `defineEntity` | TS 코드(`pgTable`) |
+| 타입 안정성 | 보통(relations 결과 타입 약함) | 매우 강함(생성 코드) | 강함 | 매우 강함(추론) |
+| Nest 공식 통합 | `@nestjs/typeorm` | 없음(직접 service) | `@mikro-orm/nestjs` | 없음(커뮤니티 모듈) |
+| 패턴 | Active Record / Data Mapper | 쿼리 클라이언트 | Data Mapper + Unit of Work + Identity Map | SQL-like 쿼리 빌더 |
+| 트랜잭션 | `transaction`, QueryRunner | `$transaction`(배열/interactive) | `em.transactional`, 자동 flush | `db.transaction` |
+| migration | CLI generate/run | `prisma migrate` | CLI, 스키마 diff | `drizzle-kit` |
+| raw SQL 친화도 | 보통 | `$queryRaw` | 보통 | 매우 높음 |
+| 러닝커브 | 낮음~보통, 함정 많음 | 낮음 | 높음 | 낮음(SQL 알면) |
+| 추천 상황 | 레거시, Nest 예제 다수 | 빠른 개발, 타입 중시 | 복잡한 도메인, DDD | 성능/SQL 통제, 엣지 런타임 |
+
+> **포인트**: 선택 기준은 "팀이 SQL을 얼마나 직접 통제하고 싶은가"와 "도메인 모델이 얼마나 풍부한가"다. Nest와의 궁합은 어느 쪽이든 provider 하나로 해결되므로 결정적 요인이 아니다.
+
+## 실전 체크리스트
+
+1. 커넥션 설정은 `forRootAsync` + `ConfigService`로, 비밀값은 환경변수/시크릿 저장소에서.
+2. 운영 `synchronize: false`, migration은 배포 파이프라인에서 1회 실행.
+3. `app.enableShutdownHooks()`로 종료 시 커넥션 정리.
+4. 트랜잭션 안에서는 트랜잭션용 클라이언트(`manager`, `tx`, `txHost.tx`)만 사용.
+5. 트랜잭션 범위 안에 외부 I/O 금지.
+6. 개발 환경 쿼리 로깅으로 N+1 감시.
+7. 풀 크기는 인스턴스 수와 DB `max_connections`를 함께 보고 계산.
+
+## 셀프 체크
+
+**Q1. `TypeOrmModule.forFeature([User])`와 `@InjectRepository(User)`는 내부적으로 어떻게 연결되는가?**
+
+**A.** `forFeature`는 `getRepositoryToken(User)`를 토큰으로 `dataSource.getRepository(User)`를 반환하는 provider를 해당 모듈에 등록하고 export한다. `@InjectRepository(User)`는 `@Inject(getRepositoryToken(User))`와 같아서 같은 토큰으로 그 provider를 주입받는다. 그래서 테스트에서도 같은 토큰으로 mock을 끼워 넣을 수 있다.
+
+**Q2. `dataSource.transaction()` 콜백 안에서 주입받은 `this.userRepository.save()`를 호출하면 어떻게 되는가?**
+
+**A.** 에러 없이 실행되지만 트랜잭션과 다른 커넥션에서 실행되어 트랜잭션에 포함되지 않는다. 롤백되어도 이 저장은 남는다. 콜백 인자로 받은 `manager`(또는 `manager.getRepository(User)`)를 써야 한다.
+
+**Q3. `@Transactional()`이 함수 인자 없이도 하위 서비스에 트랜잭션 클라이언트를 전달할 수 있는 원리는?**
+
+**A.** Node의 `AsyncLocalStorage`가 `run()`으로 시작된 비동기 흐름 전체에서 같은 store를 유지하기 때문이다. `@Transactional()`이 트랜잭션을 시작하며 트랜잭션 클라이언트를 cls store에 넣고, 하위 코드는 `txHost.tx`로 store에서 꺼낸다. 요청마다 store가 달라 동시 요청끼리 섞이지 않는다.
+
+**Q4. 운영에서 `synchronize: true`가 위험한 이유 두 가지는?**
+
+**A.** 첫째, 엔티티와 스키마의 차이를 리뷰 없이 즉시 적용하므로 컬럼 rename 같은 변경이 drop + create로 처리되어 데이터가 사라질 수 있다. 둘째, 여러 인스턴스가 동시에 시작하면 스키마 변경이 경쟁적으로 실행될 수 있고 롤백 경로도 없다.
+
+**Q5. Pod 15개, Prisma `connection_limit=10`, Postgres `max_connections=100`이면 무슨 문제가 생기고 어떻게 해결하는가?**
+
+**A.** 최대 150개의 커넥션이 필요해 DB 한도를 넘으므로 피크 때 연결 실패가 난다. 인스턴스당 풀 크기를 줄이거나, PgBouncer/RDS Proxy 같은 외부 풀러를 두거나, DB `max_connections`를 리소스에 맞게 조정한다. 동시에 트랜잭션 점유 시간을 줄여 같은 풀로 더 많은 요청을 처리하게 한다.
+
+## 핵심 정리
+
+- Nest에서 DB 커넥션은 비동기 provider이고, `forRoot`/`forFeature`는 그걸 감싼 dynamic module이다.
+- TypeORM: `forRootAsync` + `ConfigService`, `forFeature` + `@InjectRepository`, `autoLoadEntities`, 운영 `synchronize: false`, CLI용 DataSource로 migration.
+- Prisma: `PrismaService extends PrismaClient` + `onModuleInit`에서 `$connect`, 트랜잭션은 `$transaction` 배열형 또는 interactive(`tx` 사용).
+- 트랜잭션 클라이언트를 인자로 넘기기 싫다면 `nestjs-cls` + `@Transactional()`. 원리는 `AsyncLocalStorage`, HTTP 밖에서는 컨텍스트를 직접 열어야 한다.
+- abstract class를 토큰으로 쓰는 Repository 패턴으로 ORM 의존을 격리할 수 있다.
+- N+1은 JOIN/IN 배치/DataLoader로, 풀 고갈은 짧은 트랜잭션과 풀 크기 계산(인스턴스 수 x 풀)으로 막는다.

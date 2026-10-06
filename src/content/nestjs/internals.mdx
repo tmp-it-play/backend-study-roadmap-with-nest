@@ -1,0 +1,508 @@
+---
+title: "NestJS 내부 동작"
+description: "NestFactory.create부터 라우터 등록까지의 부트스트랩 흐름, NestContainer/Injector/InstanceWrapper 구조, 에러 메시지 해석, ModuleRef, DiscoveryService, packages/core 소스 읽기 가이드"
+order: 14
+---
+
+## 한눈에 보기
+
+- `NestFactory.create`는 크게 **스캔(DependenciesScanner) → 인스턴스화(InstanceLoader + Injector) → 앱 객체 생성**까지 하고, 미들웨어/라우터 등록과 라이프사이클 훅은 `app.init()`(또는 `listen()`) 시점에 일어난다.
+- 모든 provider/controller/injectable은 `InstanceWrapper`로 감싸져 `Module`의 Map에 저장되고, 인스턴스는 `contextId`별로 보관된다. static은 `STATIC_CONTEXT` 하나, request/transient는 컨텍스트(그리고 inquirer)별로 따로.
+- `Module.addCustomProvider`는 provider 객체를 `useClass` → `useValue` → `useFactory` → `useExisting` 순으로 분류한다. `useExisting`은 내부적으로 alias factory가 된다.
+- "Nest can't resolve dependencies of X (?, Y)"의 `?`는 **그 자리의 토큰을 현재 모듈 문맥에서 못 찾았다**는 뜻이다. `NEST_DEBUG=1`로 해석 과정을 로그로 볼 수 있다.
+- `DiscoveryService` + `MetadataScanner` + `Reflector`면 `@Cron` 같은 "메서드에 데코레이터 붙이면 자동 등록" 기능을 직접 만들 수 있다.
+
+## 들어가기 전에: 이 문서를 읽는 방법
+
+> **비유**: 이 문서는 **공장 견학 안내도**다. 모든 기계의 나사 규격(정확한 private 메서드 시그니처)까지 외우는 것이 목적이 아니라, "원자재가 어느 문으로 들어와 어느 라인을 거쳐 완제품이 되는지"를 알고 나서 실제 공장(소스)에 들어가 길을 잃지 않는 것이 목적이다.
+
+- 클래스 이름과 파일 위치는 v10/v11 기준이다. private 메서드 이름은 버전마다 조금씩 바뀌므로, 이름보다 **역할**을 기억하고 실제 이름은 소스에서 확인하자.
+- module/provider/lifecycle 문서에서 다룬 "무엇을 하는가"는 반복하지 않고 "어떻게 구현되어 있는가"에 집중한다.
+
+## 부트스트랩 전체 흐름
+
+> **비유**: 새 건물 입주 과정이다. ① 관리사무소(NestContainer)를 연다 → ② 층별 입주 신청서(@Module 메타데이터)를 모두 수거해 명부를 만든다(scan) → ③ 명부를 보며 가구를 실제로 들인다(instantiate) → ④ 출입구와 안내판을 단다(router) → ⑤ 개업식(lifecycle hooks).
+
+```text
+NestFactory.create(AppModule)
+ │
+ ├─ 1. ApplicationConfig, NestContainer 생성
+ │
+ ├─ 2. DependenciesScanner.scan(AppModule)
+ │     ├─ core 모듈(InternalCoreModule) 등록
+ │     ├─ scanForModules: imports 재귀 탐색 → insertModule → container.addModule
+ │     ├─ scanModulesForDependencies: 모듈마다
+ │     │     reflectImports / reflectProviders / reflectControllers / reflectExports
+ │     │     (+ controller/메서드의 @UseGuards 등 enhancer를 injectable로 등록)
+ │     ├─ 모듈 distance 계산 (훅 호출 순서에 사용)
+ │     └─ container.bindGlobalScope(): global 모듈을 모든 모듈의 import에 연결
+ │
+ ├─ 3. InstanceLoader.createInstancesOfDependencies()
+ │     ├─ createPrototypes: 각 wrapper에 Object.create(prototype) 자리 확보
+ │     └─ createInstances: 모듈별 providers → injectables → controllers
+ │           └─ Injector.loadInstance → resolveConstructorParams
+ │                 → 각 파라미터 토큰 lookup (자기 모듈 → imports의 exports)
+ │                 → instantiateClass (new 또는 factory 호출)
+ │
+ ├─ 4. scanner.applyApplicationProviders(): APP_GUARD/APP_PIPE 등을 global enhancer로 적용
+ │
+ └─ 5. new NestApplication(container, httpAdapter, config, ...) → Proxy로 감싸 반환
+
+app.listen() → (아직 init 안 됐으면) app.init()
+ ├─ 6. WebSocket/Microservice/Middleware 모듈 register
+ ├─ 7. registerRouter: 미들웨어 적용 → RoutesResolver.resolve → RouterExplorer
+ ├─ 8. onModuleInit 훅 호출
+ ├─ 9. 404 핸들러, 전역 예외 핸들러 등록
+ ├─ 10. onApplicationBootstrap 훅 호출
+ └─ 11. httpAdapter.listen(port)
+```
+
+> **포인트**: `onModuleInit`은 `NestFactory.create`가 끝났을 때가 아니라 **`init()`/`listen()` 안에서** 호출된다. 그래서 `create()` 직후 `app.get(Service)`로 꺼낸 인스턴스는 생성은 됐지만 `onModuleInit`은 아직 안 불린 상태다. e2e 테스트에서 `app.init()`을 꼭 호출하는 이유이기도 하다.
+
+### 1단계: NestContainer 생성
+
+`NestContainer`는 DI 세계의 루트 객체다. 내부에 `ModulesContainer`(모듈 key → `Module`의 Map), 전역 모듈 Set, 동적 모듈 메타데이터, 모듈 key를 계산하는 compiler 등을 가진다. `NestFactory`는 이 컨테이너를 만든 뒤 스캐너와 인스턴스 로더에 넘겨준다.
+
+전체 과정은 `ExceptionsZone`으로 감싸져 있어서, 스캔/인스턴스화 중 예외가 나면 로그를 찍고 기본적으로 프로세스를 종료한다(`abortOnError: false` 옵션이면 throw).
+
+### 2단계: DependenciesScanner.scan
+
+> **비유**: 스캐너는 **인구 조사원**이다. 아직 아무도 이사시키지 않고, 누가 어디에 살 예정이고 누구와 아는 사이인지만 명부에 적는다.
+
+1. **모듈 재귀 스캔**: 루트 모듈부터 `@Module`의 `imports` 메타데이터를 읽어 DFS로 내려간다. `forwardRef`는 풀어서 실제 클래스를 얻고, 이미 방문한 모듈은 건너뛴다. dynamic module(`{ module, providers, ... }` 객체)도 여기서 처리된다.
+2. **insertModule**: 각 모듈을 `container.addModule`로 등록한다. 이때 모듈의 고유 key가 계산된다. 같은 클래스라도 dynamic module 메타데이터가 다르면 다른 모듈 인스턴스가 된다.
+3. **reflect 단계**: 등록된 모든 모듈에 대해
+   - `reflectImports`: `imports`를 `Module.addImport`로 연결(모듈 그래프의 간선)
+   - `reflectProviders`: `providers`를 `Module.addProvider`로 등록. 클래스/메서드에 붙은 enhancer 메타데이터도 함께 훑는다
+   - `reflectControllers`: `controllers`를 등록하고, 컨트롤러/핸들러에 붙은 `@UseGuards` 등에 등장하는 **클래스**를 injectable로 등록
+   - `reflectExports`: `exports` 토큰을 기록. export하려는 토큰이 provider나 import된 모듈이 아니면 여기서 에러
+4. **distance 계산**: 루트에서의 깊이를 계산한다. 라이프사이클 훅 호출 순서에 쓰인다.
+5. **global 연결**: `@Global()` 모듈을 다른 모든 모듈의 import 목록에 연결한다. "global"이 특별한 검색 경로가 아니라 **자동으로 추가된 import**라는 점이 핵심이다.
+
+모듈 key 계산은 v10에서는 `ModuleTokenFactory`가 모듈 클래스와 dynamic 메타데이터를 해시하는 방식이었고, v11에서는 opaque key factory 구조로 바뀌어 기본적으로 **객체 참조 기반**으로 key를 만든다(옵션으로 deep hash 방식 선택 가능). 큰 dynamic module 메타데이터를 매번 직렬화/해시하는 비용을 줄이기 위한 변경이다.
+
+### 3단계: InstanceLoader와 Injector
+
+> **비유**: InstanceLoader는 **이사 총괄 반장**, Injector는 **실제로 가구를 조립하는 기사**다. 반장은 "이 층 가구 다 조립해" 하고 지시만 하고, 기사는 조립하다 필요한 부품(의존성)이 다른 층에 있으면 찾아다닌다.
+
+`InstanceLoader.createInstancesOfDependencies`의 흐름은 다음과 같다.
+
+1. **createPrototypes**: 모든 wrapper에 대해 `Object.create(metatype.prototype)`로 빈 객체를 먼저 만들어 둔다. `forwardRef` 순환 의존 시 아직 생성 전인 상대에게 이 "껍데기"를 먼저 넘겨줄 수 있는 근거다.
+2. **createInstances**: 모듈마다 providers → injectables → controllers 순으로 `Injector`의 load 메서드를 호출한다. 모듈 간, 그리고 같은 모듈 안의 provider들은 `Promise.all`로 **동시에** 진행된다. 끝나면 `XxxModule dependencies initialized` 로그가 찍힌다.
+
+`Injector`의 핵심 흐름(역할 중심):
+
+1. **loadInstance**: 이미 resolve된 wrapper면 바로 반환. 다른 경로에서 생성 중(pending)이면 그 완료 Promise를 기다린다.
+2. **resolveConstructorParams**: 생성자 파라미터 토큰 목록을 얻는다. 클래스면 `design:paramtypes`(TypeScript `emitDecoratorMetadata`)와 `@Inject()`로 덮어쓴 self-declared 토큰을 합치고, factory면 `inject` 배열을 쓴다. `@Optional()` 인덱스도 함께 읽는다.
+3. **토큰별 resolve**: 각 토큰에 대해 wrapper를 찾는다.
+   - 먼저 **자기 모듈의 providers**에서 찾는다.
+   - 없으면 **lookupComponentInParentModules**: import된 모듈들을 따라가며, 그 모듈이 해당 토큰을 **export**한 경우에만 사용한다. export된 것이 다시 모듈이면(re-export) 재귀적으로 내려간다.
+   - 끝까지 없으면 `@Optional()`이면 `undefined`, 아니면 `UnknownDependenciesException`.
+4. 찾은 의존성 wrapper가 아직 생성 전이면 재귀적으로 `loadProvider`를 호출해 먼저 만든다.
+5. **instantiateClass**: 클래스면 `new metatype(...instances)`, factory면 `await factory(...instances)`. 결과를 wrapper의 해당 context 슬롯에 저장하고 `isResolved = true`.
+6. **property injection**: `@Inject()`를 프로퍼티에 붙인 경우 생성 후 프로퍼티에 주입한다.
+
+> **포인트**: "import했는데 못 찾는다"는 거의 항상 **상대 모듈이 export하지 않았거나**, import를 엉뚱한 모듈에 했기 때문이다. lookup은 import 그래프를 따라가되 **exports라는 문을 통과할 때만** 성공한다.
+
+### 순환 대기 처리: settlement signal과 Barrier
+
+> **비유**: 두 기사가 서로 상대가 조립을 끝내기를 기다리면(교착) 영원히 끝나지 않는다. settlement signal은 **"지금 누가 누구를 기다리는지" 적어 두는 대기표**다. 대기표를 보고 "내가 기다리는 사람이 결국 나를 기다리고 있다"는 걸 발견하면 즉시 순환 의존 에러를 낸다.
+
+provider 생성이 병렬로 진행되기 때문에, A가 생성 중일 때 B가 A를 요구하면 B는 A의 완료 Promise를 기다린다. 그런데 A도 (직접 혹은 간접으로) B를 기다리고 있다면 아무도 끝나지 않는 hang이 된다.
+
+- **SettlementSignal**(`injector/settlement-signal.ts`): 생성 중인 wrapper마다 하나씩 붙어, 이 wrapper의 생성이 끝났는지(settled)와 이 wrapper가 생성 중에 의존하게 된 대상들의 id를 기록한다. pending인 wrapper를 기다리려 할 때 "기다리는 쪽이 이미 이 신호의 참조 목록에 있으면" 순환으로 판단해 `CircularDependencyException`을 던진다. 덕분에 `forwardRef` 없는 순환은 hang 대신 명확한 에러가 된다.
+- **Barrier**(`helpers/barrier.ts`): 정해진 수의 참가자가 모두 도착할 때까지 기다리게 하는 동기화 도구다. 생성자 파라미터들을 병렬로 resolve할 때, 모든 파라미터가 특정 지점에 도달한 뒤에 다음 단계로 넘어가도록 맞춰 주는 용도로 쓰인다. 파라미터마다 resolve 속도가 달라 생기던 비결정적 동작(예: 의존 트리가 static인지 판단하는 시점 차이)을 없애기 위한 장치로 이해하면 된다.
+
+> **주의**: `forwardRef`는 순환을 "허용"할 뿐 해결하지 않는다. 생성자 안에서 forwardRef로 받은 상대의 메서드를 호출하면 아직 껍데기(prototype만 있는 객체)일 수 있다. 사용은 `onModuleInit` 이후로 미루자.
+
+### 4~5단계: 앱 객체와 global enhancer
+
+스캔 중 `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, `APP_FILTER` 토큰으로 등록된 provider는 별도로 기억해 두었다가, 인스턴스화가 끝난 뒤 `ApplicationConfig`의 global enhancer 목록에 추가된다. `app.useGlobalGuards()`와 달리 DI가 가능한 이유가 이것이다. 이후 `NestApplication` 인스턴스가 만들어지고, http adapter 메서드를 바로 호출할 수 있도록 Proxy로 감싸져 반환된다.
+
+### 6~11단계: init()과 라우터 등록
+
+> **비유**: 가구는 다 들어왔고, 이제 **출입문에 호실 안내판을 붙이는 단계**다. RoutesResolver는 "어느 층(모듈)의 어느 방(컨트롤러)인지" 정리하고, RouterExplorer는 방 안의 각 창구(핸들러 메서드)를 찾아 안내판(경로 + HTTP 메서드)을 단다.
+
+1. `RoutesResolver.resolve(httpAdapter, globalPrefix)`가 모든 모듈의 controller wrapper를 순회한다.
+2. 각 컨트롤러에 대해 `RouterExplorer`가 `@Controller` path와 `RouterModule` 경로, 버전 정보를 합쳐 base path를 만든다.
+3. `MetadataScanner`로 prototype의 메서드 이름을 모두 얻고, `@Get()` 등이 남긴 path/method 메타데이터가 있는 메서드만 route로 추린다.
+4. 각 route마다 `RouterExecutionContext.create()`가 **실제 Express/Fastify 핸들러 함수**를 만든다. 이 함수 안에 guards → interceptors → pipes(파라미터 변환) → 핸들러 호출 → 응답 처리 순서가 들어 있다.
+5. `RouterProxy`가 이 함수를 예외 처리(`ExceptionsHandler` + 필터)로 감싸 http adapter에 `router.get(path, handler)` 식으로 등록한다.
+6. 그다음 `onModuleInit` → 404/에러 핸들러 등록 → `onApplicationBootstrap` 순으로 진행된다.
+
+REQUEST scope 컨트롤러라면 4번에서 만든 핸들러가 요청마다 `contextId`를 만들고 컨트롤러 인스턴스를 그 컨텍스트로 새로 resolve한다. 이것이 REQUEST scope의 성능 비용이 발생하는 지점이다.
+
+## 핵심 클래스 역할 표
+
+| 클래스 | 위치(packages/core) | 역할 |
+| --- | --- | --- |
+| `NestContainer` | `injector/container.ts` | DI 세계의 루트. 모듈 추가/조회, global 모듈 관리, provider/controller 등록 위임 |
+| `Module` | `injector/module.ts` | 모듈 하나. providers/controllers/injectables Map, imports Set, exports Set 보유 |
+| `InstanceWrapper` | `injector/instance-wrapper.ts` | provider 하나의 메타데이터 + contextId별 인스턴스 저장소 |
+| `Injector` | `injector/injector.ts` | 의존성 lookup, 생성자/프로퍼티 주입, 인스턴스 생성 |
+| `InstanceLoader` | `injector/instance-loader.ts` | 모든 모듈의 인스턴스 생성 오케스트레이션 |
+| `ModulesContainer` | `injector/modules-container.ts` | 모듈 key → `Module` Map. DI로 주입받아 모든 모듈 순회 가능 |
+| `ModuleTokenFactory` | `injector/` (v10) | 모듈 클래스 + dynamic 메타데이터로 모듈 key 생성. v11은 opaque key factory로 대체 |
+| `DependenciesScanner` | `scanner.ts` | 모듈 그래프 스캔, provider/controller/import/export 등록 |
+| `MetadataScanner` | `metadata-scanner.ts` | prototype 체인의 메서드 이름 수집(`getAllMethodNames`) |
+| `ExternalContextCreator` | `helpers/external-context-creator.ts` | HTTP 밖(microservice, websocket, GraphQL)에서 guard/pipe/interceptor가 적용된 핸들러 생성 |
+| `RouterExecutionContext` | `router/router-execution-context.ts` | HTTP 핸들러 생성: 파라미터 추출, guard/interceptor/pipe 적용, 응답 처리 |
+| `GuardsConsumer` | `guards/guards-consumer.ts` | guard 배열을 순서대로 실행, 하나라도 false면 거부 |
+| `InterceptorsConsumer` | `interceptors/interceptors-consumer.ts` | interceptor를 `next.handle()` 체인으로 엮고 핸들러를 Observable로 감쌈 |
+| `PipesConsumer` | `pipes/pipes-consumer.ts` | 파라미터 값에 pipe들을 reduce로 순차 적용 |
+
+> **포인트**: `GuardsConsumer`/`InterceptorsConsumer`/`PipesConsumer`는 HTTP 전용이 아니다. `RouterExecutionContext`(HTTP)와 `ExternalContextCreator`(그 외) 모두 이 consumer들을 재사용한다. 그래서 interceptor 쪽 수정(예: SSE나 스트림 teardown 처리)은 HTTP뿐 아니라 microservice/websocket 경로에도 영향이 갈 수 있다는 점을 기억하자.
+
+## InstanceWrapper: scope를 contextId로 관리하는 방식
+
+> **비유**: InstanceWrapper는 **사물함 관리 대장**이다. 싱글톤은 "공용 사물함" 한 칸(STATIC_CONTEXT)만 쓰고, REQUEST scope는 **손님(요청)마다 번호표(contextId)** 를 받아 각자 칸을 쓴다. TRANSIENT는 한 걸음 더 나가 **주문한 사람(inquirer)별로** 칸을 나눈다.
+
+```text
+InstanceWrapper (UsersService)
+ ├─ metatype, name, token, scope, inject, isAlias, durable ...
+ ├─ values: WeakMap<ContextId, InstancePerContext>
+ │     STATIC_CONTEXT → { instance, isResolved, isPending, donePromise }
+ │     ctx#1042       → { instance, ... }   (REQUEST scope일 때 요청마다)
+ └─ transientMap: Map<inquirerId, WeakMap<ContextId, InstancePerContext>>
+       "OrdersService#id" → { STATIC_CONTEXT → instance }
+       "CartService#id"   → { STATIC_CONTEXT → instance }
+```
+
+- `contextId`는 단순한 `{ id: number }` 객체다. `WeakMap`의 키로 쓰기 때문에 요청이 끝나 contextId 참조가 사라지면 그 요청용 인스턴스들도 GC 대상이 된다.
+- `STATIC_CONTEXT`는 정적 컨텍스트를 나타내는 상수 contextId다. DEFAULT scope는 여기에만 인스턴스가 있다.
+- REQUEST scope wrapper는 부트스트랩 때 STATIC 슬롯에 실제 인스턴스를 만들지 않고, 요청이 들어와 해당 contextId로 resolve될 때 만든다.
+- **트리 정적성**: wrapper는 자기 의존 트리 전체가 static인지(`isDependencyTreeStatic`)를 계산해 캐시한다. 의존성 중 하나라도 REQUEST scope면 자신도 사실상 요청마다 새로 만들어야 한다. scope가 "위로 전파된다"는 규칙의 구현이 이것이다.
+- **durable**: durable provider는 `ContextIdStrategy`가 돌려준 tenant별 contextId를 써서, 요청마다가 아니라 tenant마다 인스턴스를 재사용한다.
+
+> **주의**: `InstancePerContext.isPending`/`donePromise`가 위의 "생성 중인 wrapper 기다리기"에 쓰인다. 인스턴스 값만 보는 것이 아니라 이 상태 플래그들을 같이 봐야 Injector 코드가 읽힌다.
+
+## Module 클래스의 provider 분류 로직
+
+> **비유**: 우편물 분류기다. 봉투에 `useClass` 도장이 있으면 1번 통, `useValue`면 2번, `useFactory`면 3번, `useExisting`이면 4번. 도장이 없는 그냥 클래스는 별도의 일반 통으로 간다.
+
+`Module.addProvider(provider)`의 판단 순서는 다음과 같다.
+
+1. provider가 객체이고 `provide` 프로퍼티가 있으면 **custom provider** → `addCustomProvider`.
+2. 그렇지 않으면 클래스 provider → 토큰 = 클래스 자신으로 `InstanceWrapper` 생성.
+
+`addCustomProvider` 안의 분기:
+
+| 판별 | 조건(개념) | 등록 방식 |
+| --- | --- | --- |
+| `isCustomClass` | `useClass`가 nil이 아님 | `metatype = useClass`로 wrapper 생성, scope는 provider 옵션 또는 클래스의 `@Injectable` scope |
+| `isCustomValue` | 객체가 `useValue` 키를 **own property로 가짐** | `instance = useValue`, 이미 resolved 상태로 STATIC 슬롯에 저장 |
+| `isCustomFactory` | `useFactory`가 nil이 아님 | `metatype = useFactory`, `inject` 배열 보관, 생성 시 함수 호출 |
+| `isCustomUseExisting` | `useExisting`이 nil이 아님 | `(instance) => instance` 형태의 factory + `inject: [useExisting]`, `isAlias = true` |
+
+포인트 몇 가지:
+
+- `isCustomValue`가 "값이 정의됐는가"가 아니라 "키가 있는가"로 판단하는 이유는 `useValue: undefined`나 `useValue: null`도 의도된 값일 수 있기 때문이다. 반대로 class/factory/existing은 nil(`null` 또는 `undefined`)이면 해당 종류가 아니라고 봐야 한다. 여기서 `isUndefined`만 쓰면 `useClass: null` 같은 값이 잘못 분류되므로 `isNil`이 더 정확하다.
+- 판별 순서가 class → value → factory → existing이라, 하나의 객체에 여러 키를 넣으면 앞선 것이 이긴다. 에러 없이 조용히 하나만 적용되므로 주의.
+- `useExisting`은 별도 인스턴스를 만들지 않는 alias다. 내부적으로는 "대상 토큰을 inject받아 그대로 반환하는 factory"로 바뀌므로, factory 경로의 코드(예: `inject` 배열의 null/undefined 항목 처리)가 alias에도 그대로 적용된다.
+
+```ts
+// 분류 결과를 직접 확인해 보는 방법
+const app = await NestFactory.createApplicationContext(AppModule, { logger: false });
+const container = (app as any).container as NestContainer;
+for (const [, moduleRef] of container.getModules()) {
+  for (const [token, wrapper] of moduleRef.providers) {
+    console.log(moduleRef.name, String(token), {
+      isAlias: wrapper.isAlias,
+      isFactory: !!wrapper.inject,
+      scope: wrapper.scope,
+      isTreeStatic: wrapper.isDependencyTreeStatic(),
+    });
+  }
+}
+```
+
+## 에러 메시지 읽는 법
+
+> **비유**: 에러 메시지는 **택배 배송 실패 안내문**이다. "누구에게 가는 택배(X)의 몇 번째 상자(index)를, 어느 동네(module context)에서 못 찾았는지"가 정확히 적혀 있다. 대부분은 안내문만 제대로 읽어도 해결된다.
+
+```text
+Nest can't resolve dependencies of the OrdersService (PrismaService, ?, ConfigService).
+Please make sure that the argument PaymentsClient at index [1] is available in the OrdersModule context.
+
+Potential solutions:
+- Is OrdersModule a valid NestJS module?
+- If PaymentsClient is a provider, is it part of the current OrdersModule?
+- If PaymentsClient is exported from a separate @Module, is that module imported within OrdersModule?
+```
+
+해석 순서:
+
+1. **괄호 안**은 생성자 파라미터 목록이다. 이름이 찍힌 것은 resolve 성공, `?`는 실패한 자리다.
+2. **index [1]**: 0부터 센다. 두 번째 파라미터가 문제다.
+3. **argument 이름**: 못 찾은 토큰이다. 문자열/심볼 토큰이면 그 값이 찍힌다.
+4. **OrdersModule context**: lookup을 시작한 모듈이다. 이 모듈의 providers와 imports의 exports만 검색했다는 뜻이다.
+
+특수한 경우:
+
+| 메시지 형태 | 의미 | 흔한 원인 |
+| --- | --- | --- |
+| `argument dependency at index [1]` / `Object` | 토큰 타입이 `undefined` 또는 `Object` | 순환 import로 클래스가 아직 `undefined`, `interface`나 type alias를 타입으로 사용, `emitDecoratorMetadata` 꺼짐 |
+| `argument String at index [0]` | 원시 타입을 그대로 주입 시도 | `@Inject('TOKEN')` 누락 |
+| `A circular dependency between modules` | 모듈 import 순환 | 양쪽에 `forwardRef(() => Module)` 필요하거나 구조 개선 |
+| `Nest cannot export a provider/module that is not a part of the currently processed module` | export 대상이 없음 | providers에 넣지 않고 exports에만 적음 |
+
+> **주의**: `?`가 찍혔는데 분명 import도 export도 했다면, 그 모듈이 **다른 dynamic module 인스턴스**일 가능성을 의심하자. `forRoot()`를 두 군데서 다른 옵션으로 호출하면 별개 모듈이 생긴다.
+
+### NEST_DEBUG
+
+환경변수 `NEST_DEBUG`를 설정하면 Injector가 resolve 과정을 로그로 남긴다. 어떤 토큰을 어느 모듈에서 찾고 있는지, 어디서 찾았는지가 순서대로 찍힌다.
+
+```bash
+NEST_DEBUG=true npm run start:dev
+```
+
+```text
+[Nest] LOG [InjectorLogger] Resolving dependency PaymentsClient in the OrdersService provider
+[Nest] LOG [InjectorLogger] Looking for PaymentsClient in OrdersModule
+[Nest] LOG [InjectorLogger] Looking for PaymentsClient in PaymentsModule
+...
+```
+
+출력 문구는 버전에 따라 다를 수 있지만, "어느 모듈들을 거쳐 찾았는가"를 보여 준다는 점은 같다. export 누락이나 잘못된 import 경로를 찾을 때 매우 유용하다.
+
+## ModuleRef
+
+> **비유**: 생성자 주입이 **입사 첫날 받는 정해진 장비**라면, ModuleRef는 **필요할 때 창고에 가서 꺼내 오는 출입증**이다. 편하지만 남용하면 "이 클래스가 무엇에 의존하는지"가 생성자에서 안 보이게 된다.
+
+```ts
+@Injectable()
+export class HandlerRegistry implements OnModuleInit {
+  private handlers = new Map<string, PaymentHandler>();
+  constructor(private readonly moduleRef: ModuleRef) {}
+
+  onModuleInit() {
+    // 기본 strict: true → 현재 모듈 안에서만 찾음
+    this.handlers.set('card', this.moduleRef.get(CardHandler));
+    // strict: false → 전체 모듈 그래프에서 찾음
+    this.handlers.set('bank', this.moduleRef.get(BankHandler, { strict: false }));
+  }
+
+  async forRequest(req: Request) {
+    const contextId = ContextIdFactory.getByRequest(req);
+    return this.moduleRef.resolve(TenantContext, contextId); // REQUEST scope는 resolve
+  }
+
+  createFresh() {
+    return this.moduleRef.create(ReportBuilder); // 등록 안 된 클래스를 DI로 인스턴스화
+  }
+}
+```
+
+| 메서드 | 대상 | 반환 | 비고 |
+| --- | --- | --- | --- |
+| `get(token, opts)` | static(싱글톤) | 인스턴스(동기) | scoped provider면 에러. `strict` 기본 true |
+| `resolve(token, contextId?, opts)` | request/transient | Promise | contextId 없으면 호출마다 새 컨텍스트 → 매번 다른 인스턴스 |
+| `create(type)` | 등록 안 된 클래스 | Promise | 컨테이너에 등록되지 않음 |
+| `registerRequestByContextId(req, ctxId)` | 수동 컨텍스트 | - | 직접 만든 contextId에 `REQUEST` 객체 연결 |
+
+> **주의**: `resolve()`를 contextId 없이 두 번 부르면 서로 다른 인스턴스가 나온다. 같은 요청 안에서 공유하려면 `ContextIdFactory.getByRequest(req)` 또는 직접 만든 contextId를 넘긴다.
+
+## DiscoveryService로 데코레이터 기반 기능 만들기
+
+> **비유**: `@nestjs/schedule`의 `@Cron`은 마법이 아니다. 앱이 다 뜬 뒤 **순찰원(Explorer)이 모든 사무실(provider)을 돌며 "이 직원(메서드) 명찰에 cron 스티커가 붙어 있나"** 를 확인하고, 붙어 있으면 타이머에 등록하는 것뿐이다.
+
+`DiscoveryModule`(from `@nestjs/core`)이 제공하는 `DiscoveryService`는 모든 모듈의 provider/controller wrapper 목록을 돌려준다. 여기에 `MetadataScanner`(메서드 이름 수집)와 `Reflector`(메타데이터 읽기)를 조합하면 된다.
+
+### 1) 데코레이터
+
+```ts
+// on-schedule.decorator.ts
+import { SetMetadata } from '@nestjs/common';
+
+export const ON_SCHEDULE = Symbol('ON_SCHEDULE');
+export interface OnScheduleOptions {
+  everyMs: number;
+  name?: string;
+}
+export const OnSchedule = (options: OnScheduleOptions) => SetMetadata(ON_SCHEDULE, options);
+```
+
+### 2) Explorer
+
+```ts
+// schedule.explorer.ts
+import { Injectable, Logger, OnApplicationBootstrap, OnApplicationShutdown } from '@nestjs/common';
+import { DiscoveryService, MetadataScanner, Reflector } from '@nestjs/core';
+import { InstanceWrapper } from '@nestjs/core/injector/instance-wrapper';
+
+@Injectable()
+export class ScheduleExplorer implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger(ScheduleExplorer.name);
+  private readonly timers: NodeJS.Timeout[] = [];
+
+  constructor(
+    private readonly discovery: DiscoveryService,
+    private readonly scanner: MetadataScanner,
+    private readonly reflector: Reflector,
+  ) {}
+
+  onApplicationBootstrap() {
+    const wrappers: InstanceWrapper[] = [
+      ...this.discovery.getProviders(),
+      ...this.discovery.getControllers(),
+    ];
+
+    for (const wrapper of wrappers) {
+      const { instance } = wrapper;
+      // 인스턴스가 없거나(값 provider 등) REQUEST/TRANSIENT 트리면 건너뜀
+      if (!instance || typeof instance !== 'object' || !wrapper.isDependencyTreeStatic()) continue;
+
+      const prototype = Object.getPrototypeOf(instance);
+      for (const methodName of this.scanner.getAllMethodNames(prototype)) {
+        const options = this.reflector.get<OnScheduleOptions>(ON_SCHEDULE, instance[methodName]);
+        if (!options) continue;
+        this.register(instance, methodName, options);
+      }
+    }
+  }
+
+  private register(instance: any, methodName: string, { everyMs, name }: OnScheduleOptions) {
+    const label = name ?? `${instance.constructor.name}.${methodName}`;
+    const timer = setInterval(async () => {
+      try {
+        await instance[methodName]();
+      } catch (err) {
+        this.logger.error(`${label} failed`, err as Error);
+      }
+    }, everyMs);
+    this.timers.push(timer);
+    this.logger.log(`registered ${label} every ${everyMs}ms`);
+  }
+
+  onApplicationShutdown() {
+    this.timers.forEach(clearInterval);
+  }
+}
+
+// schedule.module.ts
+@Module({ imports: [DiscoveryModule], providers: [ScheduleExplorer] })
+export class MyScheduleModule {}
+```
+
+### 3) 사용
+
+```ts
+@Injectable()
+export class CleanupService {
+  @OnSchedule({ everyMs: 60_000 })
+  async purgeExpiredSessions() {
+    // ...
+  }
+}
+```
+
+동작 순서를 다시 정리하면:
+
+1. `@OnSchedule`이 **메서드 함수 객체**에 메타데이터를 붙인다(`SetMetadata`는 method decorator일 때 `descriptor.value`에 정의).
+2. 부트스트랩이 끝난 뒤(`onApplicationBootstrap`) 모든 wrapper를 순회한다.
+3. `getAllMethodNames`로 prototype 체인의 메서드 이름을 얻고, `Reflector.get`으로 메타데이터를 읽는다.
+4. 메타데이터가 있으면 `instance[methodName]`을 타이머에 등록한다. `this` 바인딩을 위해 `instance`에서 호출하는 점에 주의.
+
+> **포인트**: v10 이후에는 `DiscoveryService.createDecorator()`로 discoverable 데코레이터를 만들고 `getProviders({ metadataKey: Decorator.KEY })`로 **클래스 레벨**에서 미리 필터링하는 방법도 있다. 데코레이터가 붙은 클래스만 순회하므로 대규모 앱에서 효율적이다. 메서드 레벨 탐색은 위 예제처럼 MetadataScanner를 쓴다.
+
+> **주의**: Interceptor로 감싸지 않고 직접 메서드를 호출하므로 guard/interceptor/filter는 적용되지 않는다. 컨텍스트가 필요하면 `ExternalContextCreator`로 핸들러를 감싸야 한다. `@nestjs/microservices`나 `@nestjs/websockets`가 바로 이 방식으로 핸들러를 만든다.
+
+## 소스 읽기 가이드
+
+> **비유**: 큰 코드베이스는 **처음 가는 도시**다. 모든 골목을 걸어 다니기 전에, 중앙역(진입점)과 간선도로(핵심 흐름)를 먼저 익히면 나머지 골목은 필요할 때 찾아가면 된다.
+
+### packages/core 디렉터리 구조
+
+```text
+packages/core/
+├─ nest-factory.ts            # 진입점: create / createApplicationContext / createMicroservice
+├─ nest-application.ts        # init(), listen(), 라우터/미들웨어 등록
+├─ nest-application-context.ts# get/resolve, 라이프사이클 훅 호출, close()
+├─ scanner.ts                 # DependenciesScanner
+├─ metadata-scanner.ts
+├─ injector/                  # DI의 심장
+│  ├─ container.ts            # NestContainer
+│  ├─ module.ts               # Module (provider 분류 로직)
+│  ├─ instance-wrapper.ts     # InstanceWrapper, contextId별 저장
+│  ├─ injector.ts             # 의존성 lookup과 생성
+│  ├─ instance-loader.ts
+│  ├─ settlement-signal.ts
+│  ├─ module-ref.ts, abstract-instance-resolver.ts
+│  └─ ...
+├─ router/                    # RoutesResolver, RouterExplorer, RouterExecutionContext, RouterProxy
+├─ guards/  interceptors/  pipes/   # *-consumer.ts, *-context-creator.ts
+├─ exceptions/                # BaseExceptionFilter, ExceptionsHandler
+├─ middleware/                # MiddlewareModule, 라우트 매칭
+├─ hooks/                     # on-module-init.hook.ts 등 라이프사이클 호출 구현
+├─ helpers/                   # ExternalContextCreator, Barrier, ContextIdFactory, 메시지 등
+├─ discovery/                 # DiscoveryModule, DiscoveryService
+├─ errors/                    # 에러 클래스, messages.ts(에러 문구 생성)
+└─ test/                      # 위 구조를 거의 그대로 미러링한 spec
+```
+
+### 어디부터 읽을까
+
+1. `nest-factory.ts`의 `create` → 내부 initialize 흐름. 전체 지도를 얻는다.
+2. `scanner.ts`의 `scan`과 그 하위 단계. 모듈 그래프가 어떻게 만들어지는지.
+3. `injector/module.ts`. provider 등록과 분류. 이미 기여해 본 파일이므로 출발점으로 좋다.
+4. `injector/instance-wrapper.ts`. contextId와 scope.
+5. `injector/injector.ts`의 `loadInstance` → `resolveConstructorParams` → lookup 계열 메서드. 가장 길고 중요하다.
+6. `nest-application.ts`의 `init`과 `router/` 디렉터리. 요청 처리 쪽으로 넘어간다.
+7. `router/router-execution-context.ts`와 `interceptors/interceptors-consumer.ts`. 요청 하나가 실제로 어떻게 실행되는지.
+
+### 테스트로 동작 확인하기
+
+- 단위 테스트는 `packages/core/test/` 아래에 소스 구조를 미러링해 있다. mocha + chai + sinon 기반이다. 특정 파일만 돌려 보며 breakpoint를 거는 것이 소스를 이해하는 가장 빠른 방법이다.
+- 저장소 루트의 `integration/` 디렉터리에는 실제 Nest 앱을 띄워 검증하는 통합 테스트가 있다(일부는 docker 필요). 버그 재현은 여기의 패턴을 참고하면 좋다.
+- 내 앱에서 확인할 때는 `node_modules/@nestjs/core`의 컴파일된 JS에 직접 `console.log`나 breakpoint를 걸 수 있다. sourcemap이 없어도 구조가 거의 같아서 읽힌다.
+
+```bash
+# 저장소에서 (스크립트 이름은 package.json에서 확인)
+npm ci
+npm run build
+npx mocha packages/core/test/injector/module.spec.ts
+```
+
+### 기여할 때 팁
+
+1. **재현 저장소부터**: 이슈에는 최소 재현 코드가 있어야 리뷰가 빠르다. 직접 이슈를 낼 때도 마찬가지다.
+2. **spec을 먼저**: 버그를 드러내는 실패 테스트를 먼저 추가하고 수정한다. `module.spec.ts`, `injector.spec.ts`처럼 해당 소스 옆 spec에 추가하면 된다.
+3. **영향 범위 확인**: consumer나 helper는 HTTP, microservice, websocket이 공유한다. 한 경로만 보고 수정하면 다른 경로에서 회귀가 난다.
+4. **커밋 메시지 규칙**: `fix(core): ...`, `feat(microservices): ...`처럼 conventional commit 형식에 패키지 scope를 붙인다.
+5. **public API 변경은 신중히**: private 메서드라도 생태계 패키지(`@nestjs/graphql`, `@nestjs/cqrs` 등)가 쓰는 경우가 있다. 시그니처 변경은 검색부터.
+
+> **포인트**: `isNil` 같은 작은 수정도 "어떤 입력에서 어떻게 잘못 분류되는가"를 spec으로 보여 주면 설득력이 크게 올라간다. 작은 PR + 명확한 테스트가 머지되는 지름길이다.
+
+## 셀프 체크
+
+**Q1. `NestFactory.create()`가 반환된 직후, 모든 provider 인스턴스는 생성됐는가? `onModuleInit`은 호출됐는가?**
+
+**A.** 스캔과 `InstanceLoader.createInstancesOfDependencies()`가 `create()` 안에서 끝나므로 static provider 인스턴스는 생성되어 있다. 하지만 라우터 등록과 `onModuleInit`/`onApplicationBootstrap` 호출은 `app.init()`(또는 `listen()`)에서 일어나므로 아직 호출되지 않았다.
+
+**Q2. "Nest can't resolve dependencies of the OrdersService (PrismaService, ?). ... argument dependency at index [1]"이 나왔다. 무엇을 의심해야 하는가?**
+
+**A.** 두 번째 생성자 파라미터의 토큰을 얻지 못했고, 이름이 `dependency`로 찍혔다는 것은 메타데이터상 타입이 `undefined`라는 뜻이다. 파일 간 순환 import로 클래스가 아직 정의되지 않았거나, `interface`/type alias를 타입으로 썼거나, `emitDecoratorMetadata`가 꺼져 있는 경우를 의심한다. 순환이면 `forwardRef`나 구조 분리, interface면 `@Inject(TOKEN)`으로 해결한다.
+
+**Q3. InstanceWrapper는 DEFAULT, REQUEST, TRANSIENT scope의 인스턴스를 각각 어디에 저장하는가?**
+
+**A.** contextId를 키로 하는 `WeakMap`에 저장한다. DEFAULT는 `STATIC_CONTEXT` 한 슬롯, REQUEST는 요청마다 생성된 contextId 슬롯, TRANSIENT는 inquirer(주입받는 쪽)별 Map 아래에 다시 contextId별로 저장한다. WeakMap이라 요청 contextId가 사라지면 해당 인스턴스도 GC 대상이 된다.
+
+**Q4. `{ provide: A, useExisting: B }`는 내부적으로 어떻게 등록되며, `useValue: undefined`는 왜 value provider로 인식되는가?**
+
+**A.** `useExisting`은 `B`를 inject받아 그대로 반환하는 factory로 변환되고 `isAlias`가 true로 표시된다. 별도 인스턴스를 만들지 않으므로 A와 B는 같은 객체다. `isCustomValue`는 값이 정의됐는지가 아니라 `useValue` 키가 own property로 존재하는지로 판단하므로 `undefined`도 의도된 값으로 등록된다.
+
+**Q5. 메서드에 `@OnSchedule()`을 붙이면 자동으로 주기 실행되게 하려면 어떤 구성 요소가 필요한가?**
+
+**A.** 메서드 함수에 메타데이터를 붙이는 데코레이터(`SetMetadata`), `DiscoveryModule`의 `DiscoveryService`로 모든 provider wrapper 순회, `MetadataScanner.getAllMethodNames`로 메서드 이름 수집, `Reflector.get`으로 메타데이터 확인이 필요하다. 이를 `onApplicationBootstrap`에서 수행해 타이머를 등록하고, static 트리가 아닌 wrapper는 제외하며, 종료 훅에서 타이머를 정리한다.
+
+## 핵심 정리
+
+- 부트스트랩: `NestContainer` 생성 → `DependenciesScanner.scan`(모듈 재귀 스캔, reflect, global 연결) → `InstanceLoader`/`Injector`로 인스턴스화 → `NestApplication` 생성. 라우터 등록과 라이프사이클 훅은 `init()`/`listen()`에서.
+- global 모듈은 특별한 검색 경로가 아니라 모든 모듈에 자동 추가되는 import다. lookup은 자기 모듈 → imports의 **exports**만 통과한다.
+- `InstanceWrapper`는 contextId 키의 WeakMap으로 인스턴스를 관리한다. STATIC_CONTEXT는 싱글톤, REQUEST는 요청별, TRANSIENT는 inquirer별.
+- `Module.addCustomProvider`는 class → value → factory → existing 순으로 분류하며, value만 키 존재로 판단한다. `useExisting`은 alias factory다.
+- 병렬 인스턴스화 중 순환 대기는 settlement signal로 감지해 에러로 바꾸고, Barrier는 병렬 파라미터 resolve의 동기화 지점을 맞춘다.
+- 에러 메시지의 `?` 위치, index, argument 이름, module context를 순서대로 읽고, 필요하면 `NEST_DEBUG`로 lookup 경로를 본다.
+- `ModuleRef`는 `get`(static, strict 기본 true) / `resolve`(scoped, contextId) / `create`(미등록 클래스).
+- `DiscoveryService` + `MetadataScanner` + `Reflector`로 데코레이터 기반 자동 등록 기능을 만들 수 있다.
+- 소스는 `nest-factory.ts` → `scanner.ts` → `injector/` → `nest-application.ts` → `router/` 순으로 읽고, `packages/core/test`의 spec으로 동작을 확인한다.

@@ -1,0 +1,514 @@
+---
+title: "테스트"
+description: "Test.createTestingModule로 DI 컨테이너를 테스트에 쓰는 법, provider/guard/module override, 단위·통합·e2e 구분, 실제 DB 테스트와 흔한 함정"
+order: 9
+---
+
+## 한눈에 보기
+
+- Nest 테스트의 핵심은 `Test.createTestingModule()`로 **진짜 DI 컨테이너를 테스트용으로 하나 더 만드는 것**이다. 의존성 교체는 `overrideProvider()`로 한다.
+- `get()`은 singleton 조회, `resolve()`는 request/transient scope provider 조회용이다.
+- Guard/Interceptor/Pipe/Filter도 `overrideGuard()` 등으로 갈아끼울 수 있고, 모듈 통째로는 `overrideModule()`을 쓴다.
+- e2e는 `createNestApplication()` → `app.init()` → `supertest(app.getHttpServer())` 흐름이다. **`main.ts`의 전역 설정은 자동으로 적용되지 않는다.**
+- DB가 얽힌 로직은 mock보다 testcontainers 같은 실제 DB + 트랜잭션 롤백/truncate로 검증하는 편이 신뢰도가 높다.
+
+## Test.createTestingModule
+
+> **비유**: 실제 공장(AppModule)과 똑같은 설계도로 축소 모형 공장을 하나 더 짓는다. 다만 몇몇 기계는 모형 기계(mock)로 바꿔 끼워도 된다.
+
+`@nestjs/testing`의 `Test` 클래스는 `@Module()`과 같은 메타데이터를 받아 `TestingModuleBuilder`를 돌려준다.
+
+```ts
+import { Test, TestingModule } from '@nestjs/testing';
+
+describe('OrderService', () => {
+  let service: OrderService;
+  let repo: jest.Mocked<OrderRepository>;
+
+  beforeEach(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      providers: [
+        OrderService,
+        {
+          provide: OrderRepository,
+          useValue: { findById: jest.fn(), save: jest.fn() },
+        },
+      ],
+    }).compile();
+
+    service = moduleRef.get(OrderService);
+    repo = moduleRef.get(OrderRepository);
+  });
+
+  it('배송된 주문은 취소할 수 없다', async () => {
+    repo.findById.mockResolvedValue({ id: '1', status: 'SHIPPED' } as Order);
+    await expect(service.cancel('1')).rejects.toThrow(BusinessRuleViolationError);
+    expect(repo.save).not.toHaveBeenCalled();
+  });
+});
+```
+
+`compile()`이 하는 일을 순서대로 보면 다음과 같다.
+
+1. 전달한 메타데이터로 동적 루트 모듈을 만든다.
+2. `imports`를 따라 모듈 그래프를 스캔한다.
+3. override 설정을 반영해 provider 정의를 교체한다.
+4. 의존성을 해석하고 인스턴스를 생성한다(이 시점에 `onModuleInit`은 아직 호출되지 않음).
+5. `TestingModule`(= `NestApplicationContext` 확장)을 반환한다.
+
+> **포인트**: `compile()`만으로는 lifecycle hook(`onModuleInit`, `onApplicationBootstrap`)이 실행되지 않는다. 필요하면 `await moduleRef.init()`을 호출하거나 `createNestApplication()` 후 `app.init()`을 호출해야 한다.
+
+> **주의**: 테스트가 끝나면 `await moduleRef.close()`(또는 `app.close()`)로 정리하자. DB 커넥션, 큐 워커, 스케줄러가 남아 Jest가 종료되지 않는 `open handles` 문제의 대부분이 여기서 생긴다.
+
+## get()과 resolve()
+
+> **비유**: `get()`은 공용 비품 창고에서 하나 뿐인 공용 도구를 꺼내는 것이고, `resolve()`는 요청마다 새로 만들어 주는 개인 지급품을 받는 것이다.
+
+| 메서드 | 대상 scope | 반환 | 비고 |
+| --- | --- | --- | --- |
+| `get(token)` | DEFAULT(singleton) | 인스턴스 즉시 | scoped provider에 쓰면 에러 |
+| `get(token, { strict: false })` | singleton | 인스턴스 | 하위 모듈까지 전역 탐색 |
+| `resolve(token)` | REQUEST, TRANSIENT | `Promise` | 호출마다 새 context id로 새 인스턴스 |
+| `resolve(token, contextId)` | REQUEST | `Promise` | 같은 contextId면 같은 인스턴스 서브트리 |
+
+```ts
+// request-scoped provider
+const a = await moduleRef.resolve(RequestLogger);
+const b = await moduleRef.resolve(RequestLogger);
+expect(a).not.toBe(b); // contextId가 매번 달라서 다른 인스턴스
+
+const contextId = ContextIdFactory.create();
+const c = await moduleRef.resolve(RequestLogger, contextId);
+const d = await moduleRef.resolve(RequestLogger, contextId);
+expect(c).toBe(d);
+```
+
+> **주의**: scope는 의존성을 따라 위로 전파된다(provider 문서 참고). 어떤 서비스가 request-scoped provider를 주입받고 있으면 그 서비스도 request-scoped가 되어 `get()`이 실패한다. 이때 에러 메시지가 혼란스러우니 scope 전파부터 의심하자.
+
+## overrideProvider와 교체 방식
+
+> **비유**: 모형 공장을 짓기 직전에 "이 기계 자리에는 이걸 넣어 주세요"라고 설계도에 포스트잇을 붙이는 것이다.
+
+`providers`에 직접 mock을 넣는 대신, **실제 모듈을 import하고 일부만 갈아끼우는** 방식이 통합 테스트에서 유용하다.
+
+```ts
+const moduleRef = await Test.createTestingModule({
+  imports: [OrdersModule], // 실제 모듈 그래프 그대로
+})
+  .overrideProvider(PaymentGateway)
+  .useValue({ charge: jest.fn().mockResolvedValue({ ok: true }) })
+  .overrideProvider(Clock)
+  .useClass(FixedClock)
+  .overrideProvider(MAILER_OPTIONS)
+  .useFactory({
+    factory: (config: ConfigService) => ({ host: config.get('TEST_SMTP') }),
+    inject: [ConfigService],
+  })
+  .compile();
+```
+
+| 메서드 | 넣는 것 | 언제 |
+| --- | --- | --- |
+| `useValue(obj)` | 이미 만든 객체 | `jest.fn()` mock, 고정 설정값 |
+| `useClass(Cls)` | 대체 클래스 | Fake 구현(InMemoryRepository, FixedClock) |
+| `useFactory({ factory, inject })` | 팩토리 함수 | 다른 provider에 의존하는 대체물 |
+
+> **포인트**: `providers`에 직접 나열하는 방식은 "단위 테스트", `imports` + `overrideProvider`는 "모듈 통합 테스트"에 어울린다. 후자는 실제 provider 배선(누락된 export 등)까지 검증해 준다.
+
+### 토큰이 클래스가 아닐 때
+
+`@InjectRepository(User)` 같은 경우 실제 토큰은 헬퍼 함수로 얻는다.
+
+```ts
+import { getRepositoryToken } from '@nestjs/typeorm';
+import { getModelToken } from '@nestjs/mongoose';
+import { getQueueToken } from '@nestjs/bullmq';
+
+providers: [
+  UsersService,
+  { provide: getRepositoryToken(User), useValue: mockRepo },
+  { provide: getQueueToken('email'), useValue: { add: jest.fn() } },
+]
+```
+
+## Enhancer override
+
+> **비유**: 모형 공장에서는 출입 게이트(guard)를 "항상 열림" 상태로 바꿔 두고 내부 기계만 시험한다.
+
+| 메서드 | 대상 |
+| --- | --- |
+| `overrideGuard(Guard)` | `@UseGuards`로 붙은 guard |
+| `overrideInterceptor(Interceptor)` | `@UseInterceptors` |
+| `overridePipe(Pipe)` | `@UsePipes`, 파라미터 pipe |
+| `overrideFilter(Filter)` | `@UseFilters` |
+
+```ts
+const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+  .overrideGuard(JwtAuthGuard)
+  .useValue({
+    canActivate: (ctx: ExecutionContext) => {
+      ctx.switchToHttp().getRequest().user = { id: 'u1', roles: ['admin'] };
+      return true;
+    },
+  })
+  .overrideInterceptor(CacheInterceptor)
+  .useValue({ intercept: (_ctx, next) => next.handle() })
+  .compile();
+```
+
+> **주의**: `APP_GUARD`로 등록된 전역 guard는 `overrideGuard(JwtAuthGuard)`로 교체되지 않는 경우가 있다. `APP_GUARD` 토큰 자체는 여러 개라 override 대상이 모호하기 때문이다. 해결책은 `useExisting`으로 등록해 클래스 토큰을 override하는 것이다.
+
+```ts
+// app.module.ts
+providers: [
+  JwtAuthGuard,
+  { provide: APP_GUARD, useExisting: JwtAuthGuard },
+]
+
+// test
+.overrideProvider(JwtAuthGuard).useValue(fakeGuard)
+```
+
+## overrideModule
+
+> **비유**: 공장 안의 "외부 결제 부서" 전체를 모형 부서로 통째로 바꾼다. 기계 하나하나 바꾸는 것보다 빠르다.
+
+Nest v10부터 모듈 단위 교체가 가능하다.
+
+```ts
+@Module({
+  providers: [{ provide: PaymentGateway, useClass: FakePaymentGateway }],
+  exports: [PaymentGateway],
+})
+class FakePaymentModule {}
+
+const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+  .overrideModule(PaymentModule)
+  .useModule(FakePaymentModule)
+  .compile();
+```
+
+> **포인트**: `TypeOrmModule.forRoot()`처럼 import하는 순간 외부 연결을 맺는 모듈을 테스트에서 차단하고 싶을 때 특히 유용하다. 대체 모듈은 원래 모듈이 export하던 토큰을 똑같이 export해야 한다.
+
+## mock 팩토리: createMock 패턴
+
+> **비유**: 의존성마다 마네킹을 손으로 깎지 않고, 틀에 넣으면 자동으로 찍혀 나오는 마네킹 공장을 쓰는 것이다.
+
+의존성이 많아지면 `{ findById: jest.fn(), save: jest.fn(), ... }`를 손으로 나열하기 지친다. 두 가지 방법이 있다.
+
+### 1. useMocker로 누락된 의존성 자동 mock
+
+```ts
+import { ModuleMocker, MockFunctionMetadata } from 'jest-mock';
+
+const moduleMocker = new ModuleMocker(global);
+
+const moduleRef = await Test.createTestingModule({
+  controllers: [OrderController],
+})
+  .useMocker((token) => {
+    if (token === OrderService) {
+      return { cancel: jest.fn().mockResolvedValue(undefined) };
+    }
+    if (typeof token === 'function') {
+      const meta = moduleMocker.getMetadata(token) as MockFunctionMetadata<any, any>;
+      const Mock = moduleMocker.generateFromMetadata(meta);
+      return new Mock();
+    }
+  })
+  .compile();
+```
+
+`useMocker()`는 **등록되지 않은 의존성을 만났을 때만** 호출된다. 직접 등록한 provider는 그대로 쓰인다.
+
+### 2. @golevelup/ts-jest의 createMock
+
+```ts
+import { createMock, DeepMocked } from '@golevelup/ts-jest';
+
+let payment: DeepMocked<PaymentGateway>;
+
+const moduleRef = await Test.createTestingModule({ providers: [CheckoutService] })
+  .useMocker(createMock) // 모든 의존성을 자동 deep mock
+  .compile();
+
+payment = moduleRef.get(PaymentGateway);
+payment.charge.mockResolvedValue({ ok: true, txId: 'tx_1' });
+```
+
+`createMock<ExecutionContext>()`는 guard 단위 테스트에서 특히 편하다.
+
+```ts
+it('admin 역할이 없으면 거부', () => {
+  const reflector = createMock<Reflector>();
+  reflector.getAllAndOverride.mockReturnValue(['admin']);
+  const guard = new RolesGuard(reflector);
+
+  const ctx = createMock<ExecutionContext>();
+  ctx.switchToHttp().getRequest.mockReturnValue({ user: { roles: ['user'] } });
+
+  expect(guard.canActivate(ctx)).toBe(false);
+});
+```
+
+> **주의**: 자동 mock은 편하지만 "모든 메서드가 `undefined`를 반환하는" 상태라 테스트가 의도치 않게 통과할 수 있다. 검증 대상 경로의 반환값은 반드시 명시적으로 설정하자.
+
+## 단위 vs 통합 vs e2e
+
+> **비유**: 단위 테스트는 부품 검사, 통합 테스트는 엔진 조립 후 시동, e2e는 완성차 주행 시험이다.
+
+| 구분 | 범위 | 구성 방식 | 외부 의존성 | 속도 | 잡는 버그 |
+| --- | --- | --- | --- | --- | --- |
+| 단위 | 클래스 하나 | `providers`에 대상 + mock | 전부 mock | 매우 빠름 | 분기, 계산 로직 |
+| 통합 | 모듈 하나 ~ 여러 개 | `imports` + `overrideProvider` | DB는 실제, 외부 API는 fake | 중간 | 쿼리, 트랜잭션, 모듈 배선 |
+| e2e | HTTP 요청 → 응답 | `createNestApplication` + supertest | 실제에 가깝게 | 느림 | 직렬화, guard/pipe 설정, 라우팅 |
+
+> **포인트**: 서비스 로직이 대부분 DB 조작인 앱에서 repository를 전부 mock하면 "mock이 잘 호출됐는지"만 검증하게 된다. 그런 경우는 통합 테스트 비중을 높이는 것이 낫다.
+
+## e2e with supertest
+
+> **비유**: 완성된 차에 실제로 타서 시동을 걸고, 액셀을 밟아보고, 계기판(응답)을 확인한다.
+
+```ts
+// test/orders.e2e-spec.ts
+import { INestApplication, ValidationPipe } from '@nestjs/common';
+import request from 'supertest';
+
+describe('Orders (e2e)', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(PaymentGateway)
+      .useClass(FakePaymentGateway)
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    configureApp(app); // main.ts와 공유하는 전역 설정
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('POST /orders → 201', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/orders')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ productId: 'p1', quantity: 2 })
+      .expect(201);
+
+    expect(res.body).toMatchObject({ id: expect.any(String), status: 'PENDING' });
+  });
+
+  it('잘못된 body → 400', () => {
+    return request(app.getHttpServer())
+      .post('/orders')
+      .send({ quantity: -1 })
+      .expect(400);
+  });
+});
+```
+
+흐름을 정리하면 다음과 같다.
+
+1. `createTestingModule().compile()`로 DI 컨테이너를 만든다.
+2. `createNestApplication()`으로 HTTP 어댑터가 붙은 앱 인스턴스를 만든다.
+3. 전역 pipe/filter/prefix 등 `main.ts`에서 하던 설정을 적용한다.
+4. `app.init()`으로 라우트 등록과 lifecycle hook을 실행한다. **`listen()`은 하지 않는다.**
+5. `app.getHttpServer()`가 반환한 Node HTTP 서버를 supertest에 넘기면 임의 포트로 요청한다.
+
+Fastify를 쓴다면 `createNestApplication<NestFastifyApplication>(new FastifyAdapter())` 후 `await app.getHttpAdapter().getInstance().ready()`까지 호출하거나, `app.inject()`를 쓴다.
+
+## 함정: 전역 설정은 테스트 앱에 자동 적용되지 않는다
+
+> **비유**: 공장 정문에 붙인 안내문(`main.ts`)은 모형 공장에는 붙어 있지 않다. 설계도(`AppModule`)에 적힌 것만 복제된다.
+
+`main.ts`에서 `app.useGlobalPipes(new ValidationPipe(...))`를 했다면, e2e 테스트의 앱에는 그 파이프가 없다. 그래서 "운영에서는 400인데 테스트에서는 201" 같은 일이 생긴다.
+
+| 설정 방식 | 테스트 앱에 자동 적용 |
+| --- | --- |
+| `app.useGlobalPipes()` in `main.ts` | X |
+| `app.setGlobalPrefix()`, `enableVersioning()` | X |
+| `app.use(cookieParser())` 등 middleware | X |
+| `{ provide: APP_PIPE, useValue: new ValidationPipe() }` in module | O |
+| `APP_GUARD`, `APP_FILTER`, `APP_INTERCEPTOR` | O |
+
+해결책은 두 가지다.
+
+```ts
+// 1) 설정을 함수로 추출해 main.ts와 테스트에서 공유
+export function configureApp(app: INestApplication) {
+  app.setGlobalPrefix('api');
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+  app.use(cookieParser());
+  return app;
+}
+```
+
+```ts
+// 2) 가능한 것은 모듈 provider로 옮기기
+@Module({
+  providers: [
+    { provide: APP_PIPE, useValue: new ValidationPipe({ whitelist: true, transform: true }) },
+  ],
+})
+export class AppModule {}
+```
+
+> **포인트**: 둘 다 쓰는 것이 일반적이다. Pipe/Guard/Filter/Interceptor는 `APP_*` provider로, prefix·versioning·middleware처럼 앱 인스턴스 API만 있는 것은 `configureApp()`으로 공유한다.
+
+## 실제 DB로 테스트
+
+> **비유**: 모형 엔진 대신 진짜 엔진을 시험대에 올린다. 시험이 끝날 때마다 연료를 비우고 원상 복구한다.
+
+### testcontainers 개념
+
+testcontainers는 테스트 코드에서 Docker 컨테이너를 띄우고 내리는 라이브러리다. 테스트마다 깨끗한 PostgreSQL/Redis를 얻을 수 있다.
+
+1. Jest `globalSetup`에서 컨테이너를 시작하고 접속 정보를 환경 변수로 넘긴다.
+2. 마이그레이션을 실행해 스키마를 만든다.
+3. 각 테스트 파일은 그 DB에 접속하는 `TestingModule`을 만든다.
+4. `globalTeardown`에서 컨테이너를 정지한다.
+
+```ts
+// test/global-setup.ts
+import { PostgreSqlContainer } from '@testcontainers/postgresql';
+
+export default async () => {
+  const container = await new PostgreSqlContainer('postgres:16-alpine').start();
+  process.env.DATABASE_URL = container.getConnectionUri();
+  (globalThis as any).__PG__ = container;
+  await runMigrations(process.env.DATABASE_URL);
+};
+```
+
+### 테스트 간 격리
+
+| 방법 | 원리 | 장점 | 단점 |
+| --- | --- | --- | --- |
+| 트랜잭션 롤백 | 테스트 시작 시 BEGIN, 끝나면 ROLLBACK | 매우 빠름 | 앱 코드가 별도 트랜잭션을 열면 적용 어려움 |
+| TRUNCATE | 테스트 후 모든 테이블 비우기 | 단순, 확실 | 테이블 많으면 느림 |
+| 테스트별 schema/DB | 파일마다 다른 schema | 병렬 실행에 강함 | 설정 복잡 |
+
+트랜잭션 롤백은 앱이 같은 커넥션(QueryRunner/EntityManager)을 쓰도록 주입 지점을 열어둬야 한다. CLS 기반 트랜잭션 라이브러리를 쓰는 경우 테스트에서 바깥 트랜잭션을 열어두는 방식이 가능하다(database 문서 참고).
+
+```ts
+afterEach(async () => {
+  const ds = moduleRef.get(DataSource);
+  const tables = ds.entityMetadatas.map((m) => `"${m.tableName}"`).join(', ');
+  await ds.query(`TRUNCATE ${tables} RESTART IDENTITY CASCADE`);
+});
+```
+
+> **주의**: SQLite in-memory로 PostgreSQL을 대체하면 빠르지만, JSONB, 배열 타입, 잠금, 제약 조건 동작이 달라서 "테스트는 통과, 운영은 실패"가 생긴다. 운영과 같은 엔진을 쓰자.
+
+## request-scoped provider 테스트
+
+> **비유**: 손님마다 새로 배정되는 전담 웨이터를 테스트하려면, 테스트용 손님 번호표를 직접 만들어 웨이터를 배정받아야 한다.
+
+request-scoped provider는 요청마다 `contextId`로 인스턴스 서브트리를 구분한다. 테스트에서 특정 인스턴스를 붙잡으려면 contextId를 직접 만들고, Nest가 요청에서 contextId를 꺼낼 때 그 값을 쓰도록 spy한다.
+
+```ts
+import { ContextIdFactory } from '@nestjs/core';
+
+it('같은 요청 안에서 TenantContext를 공유한다', async () => {
+  const contextId = ContextIdFactory.create();
+  jest.spyOn(ContextIdFactory, 'getByRequest').mockImplementation(() => contextId);
+
+  // REQUEST 토큰에 가짜 request 객체 등록
+  moduleRef.registerRequestByContextId({ headers: { 'x-tenant-id': 't1' } }, contextId);
+
+  const tenant = await moduleRef.resolve(TenantContext, contextId);
+  const repo = await moduleRef.resolve(TenantAwareRepository, contextId);
+
+  expect(tenant.id).toBe('t1');
+  expect((repo as any).tenant).toBe(tenant); // 같은 서브트리
+});
+```
+
+| API | 역할 |
+| --- | --- |
+| `ContextIdFactory.create()` | 새 context id 생성 |
+| `ContextIdFactory.getByRequest(req)` | 요청 객체에서 context id 조회(spy 대상) |
+| `moduleRef.registerRequestByContextId(req, contextId)` | 해당 context의 `REQUEST` provider 값 지정 |
+| `moduleRef.resolve(token, contextId)` | 해당 context의 인스턴스 조회 |
+
+## 테스트 구조 팁
+
+> **비유**: 시험장 배치도를 미리 정해 두면 누가 와도 같은 순서로 시험을 치를 수 있다.
+
+```text
+src/
+  orders/
+    order.service.ts
+    order.service.spec.ts        단위 테스트: 소스 옆에
+test/
+  integration/
+    orders.int-spec.ts           통합 테스트: 실제 DB
+  e2e/
+    orders.e2e-spec.ts           HTTP 수준
+  utils/
+    create-test-app.ts           공통 앱 생성 헬퍼
+    factories.ts                 테스트 데이터 팩토리
+  global-setup.ts
+```
+
+1. 앱 생성 코드를 헬퍼로 모은다. override 목록과 `configureApp()` 호출을 한 곳에서 관리한다.
+2. 테스트 데이터는 팩토리 함수(`buildUser({ role: 'admin' })`)로 만든다. 필수 필드가 늘어도 테스트를 고치지 않아도 된다.
+3. `beforeAll`에서 앱을 한 번만 띄우고, 데이터 정리는 `afterEach`에서 한다. 앱 부팅이 가장 비싸다.
+4. 단위/통합/e2e를 Jest `projects` 또는 별도 config로 분리해 CI에서 단계별로 실행한다.
+5. 시간, UUID, 외부 API처럼 비결정적인 의존성은 provider로 추상화해 두면 override 한 줄로 고정할 수 있다.
+
+```ts
+// test/utils/create-test-app.ts
+export async function createTestApp(
+  customize?: (b: TestingModuleBuilder) => TestingModuleBuilder,
+) {
+  let builder = Test.createTestingModule({ imports: [AppModule] })
+    .overrideProvider(PaymentGateway).useClass(FakePaymentGateway)
+    .overrideProvider(Clock).useValue(new FixedClock('2026-01-01T00:00:00Z'));
+  if (customize) builder = customize(builder);
+
+  const moduleRef = await builder.compile();
+  const app = configureApp(moduleRef.createNestApplication());
+  await app.init();
+  return { app, moduleRef };
+}
+```
+
+> **포인트**: "테스트하기 어렵다"는 느낌은 대개 의존성이 provider로 추상화되지 않았다는 신호다. `new Date()`, `Math.random()`, `axios.get()`을 서비스에서 직접 부르고 있다면 provider로 빼자.
+
+## 셀프 체크
+
+**Q1. `compile()`만 하고 `get()`으로 서비스를 꺼냈는데 `onModuleInit`에서 초기화되는 값이 비어 있다. 왜인가?**
+
+**A.** `compile()`은 인스턴스 생성까지만 하고 lifecycle hook은 실행하지 않는다. `await moduleRef.init()` 또는 `app.init()`을 호출해야 `onModuleInit`이 실행된다.
+
+**Q2. `moduleRef.get(TenantRepository)`가 scoped provider라는 에러를 낸다. 해결 방법은?**
+
+**A.** request/transient scope이거나 scoped 의존성 때문에 scope가 전파된 provider다. `await moduleRef.resolve(TenantRepository, contextId)`로 조회해야 한다.
+
+**Q3. e2e 테스트에서 잘못된 body인데 400이 아니라 201이 나온다. 가장 먼저 의심할 것은?**
+
+**A.** `main.ts`의 `app.useGlobalPipes(new ValidationPipe())`가 테스트 앱에 적용되지 않은 것이다. `configureApp()` 공유 함수를 호출하거나 `APP_PIPE` provider로 옮긴다.
+
+**Q4. `APP_GUARD`로 등록한 전역 guard를 테스트에서 교체하려면?**
+
+**A.** guard 클래스를 provider로도 등록하고 `{ provide: APP_GUARD, useExisting: JwtAuthGuard }`로 연결한 뒤, 테스트에서 `overrideProvider(JwtAuthGuard)`로 교체한다.
+
+**Q5. DB 로직 테스트에서 SQLite in-memory 대신 testcontainers를 권장하는 이유는?**
+
+**A.** 운영 DB와 같은 엔진을 써야 타입, 제약 조건, 잠금, SQL 방언 차이로 인한 "테스트는 통과, 운영은 실패"를 막을 수 있다. 컨테이너로 매번 깨끗한 실제 DB를 얻을 수 있다.
+
+## 핵심 정리
+
+- `Test.createTestingModule()`은 테스트용 DI 컨테이너를 만들고, `compile()`로 인스턴스를 생성한다. lifecycle hook은 `init()`에서 실행된다.
+- singleton은 `get()`, request/transient scope는 `resolve()`로 꺼낸다.
+- `overrideProvider().useValue/useClass/useFactory`로 의존성을, `overrideGuard/Interceptor/Pipe/Filter`로 enhancer를, `overrideModule().useModule()`로 모듈을 교체한다.
+- `useMocker(createMock)`로 미등록 의존성을 자동 mock할 수 있지만 반환값은 명시적으로 설정한다.
+- e2e는 `createNestApplication()` → 전역 설정 적용 → `app.init()` → `supertest(app.getHttpServer())`.
+- `main.ts` 전역 설정은 테스트 앱에 자동 적용되지 않으므로 `APP_*` provider나 공유 설정 함수를 쓴다.
+- DB 로직은 실제 DB(testcontainers) + 트랜잭션 롤백/TRUNCATE로 격리한다.
+- request-scoped provider는 `ContextIdFactory.create()` + `getByRequest` spy + `resolve(token, contextId)`로 테스트한다.

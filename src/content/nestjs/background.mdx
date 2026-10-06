@@ -1,0 +1,587 @@
+---
+title: "스케줄링·큐·캐시·이벤트"
+description: "@nestjs/schedule, @nestjs/bullmq, @nestjs/cache-manager, @nestjs/event-emitter의 동작 방식과 다중 인스턴스 함정, 언제 무엇을 쓸지 선택 기준"
+order: 11
+---
+
+## 한눈에 보기
+
+- **schedule**은 "정해진 시각에 실행", **queue(BullMQ)** 는 "나중에 확실히 실행", **event-emitter**는 "같은 프로세스 안에서 느슨하게 알림", **cache**는 "비싼 결과를 잠깐 보관"이다.
+- `@Cron`은 **프로세스마다** 실행된다. 인스턴스가 3대면 3번 돈다. 분산 락이나 BullMQ job scheduler로 해결한다.
+- BullMQ는 Redis에 job을 저장하므로 서버가 죽어도 유실되지 않고, `attempts`/`backoff`로 재시도된다. Worker는 `@Processor` + `WorkerHost`로 만든다.
+- `CacheInterceptor`는 **GET 요청만** 캐시하며, 무효화는 직접 설계해야 한다. TTL 단위는 cache-manager v5 이상에서 **밀리초**다.
+- `@OnEvent` 리스너는 기본적으로 **동기 실행 + 에러가 삼켜진다**. 유실되면 안 되는 작업은 이벤트가 아니라 큐로 보낸다.
+
+## 전체 그림
+
+> **비유**: 식당 운영으로 보면, schedule은 "매일 오전 9시 재고 확인" 알람, queue는 주문서 꽂이(요리사가 하나씩 가져가고, 주문서는 사라지지 않음), event-emitter는 주방에서 "3번 테이블 요리 나왔어요!" 외치기(못 들으면 끝), cache는 자주 나가는 메뉴를 미리 데워두는 보온통이다.
+
+| 패키지 | 핵심 데코레이터/토큰 | 저장소 | 프로세스 경계 넘음 |
+| --- | --- | --- | --- |
+| `@nestjs/schedule` | `@Cron`, `@Interval`, `@Timeout`, `SchedulerRegistry` | 메모리 | X |
+| `@nestjs/bullmq` | `@Processor`, `WorkerHost`, `@InjectQueue` | Redis | O |
+| `@nestjs/cache-manager` | `CacheInterceptor`, `@CacheKey`, `@CacheTTL`, `CACHE_MANAGER` | 메모리 또는 Redis | Redis store 사용 시 O |
+| `@nestjs/event-emitter` | `@OnEvent`, `EventEmitter2` | 메모리 | X |
+
+## @nestjs/schedule
+
+> **비유**: 벽에 걸린 알람 시계다. 정해진 시각이 되면 울린다. 단, 시계는 각 지점(인스턴스)마다 하나씩 걸려 있다.
+
+```bash
+npm i @nestjs/schedule
+```
+
+```ts
+@Module({
+  imports: [ScheduleModule.forRoot()],
+  providers: [ReportTasks],
+})
+export class AppModule {}
+```
+
+`ScheduleModule.forRoot()`가 앱 부트스트랩 시점에 모든 provider를 스캔해 데코레이터가 붙은 메서드를 찾고, `cron` 라이브러리의 job과 `setInterval`/`setTimeout`으로 등록한다.
+
+```ts
+import { Cron, CronExpression, Interval, Timeout } from '@nestjs/schedule';
+
+@Injectable()
+export class ReportTasks {
+  private readonly logger = new Logger(ReportTasks.name);
+
+  @Cron('0 0 9 * * 1-5', { name: 'daily-report', timeZone: 'Asia/Seoul' })
+  async sendDailyReport() {
+    // 평일 오전 9시 0분 0초 (초 필드 포함 6자리)
+  }
+
+  @Cron(CronExpression.EVERY_10_MINUTES)
+  async cleanupExpiredSessions() {}
+
+  @Interval('health-ping', 30_000)
+  ping() {} // 30초마다
+
+  @Timeout(5_000)
+  warmUp() {} // 앱 시작 5초 후 한 번
+}
+```
+
+| 데코레이터 | 동작 | 내부 구현 |
+| --- | --- | --- |
+| `@Cron(expr, options?)` | cron 표현식에 맞춰 반복 | `cron` 패키지의 `CronJob` |
+| `@Interval(name?, ms)` | 고정 간격 반복 | `setInterval` |
+| `@Timeout(name?, ms)` | 앱 시작 후 한 번 | `setTimeout` |
+
+> **주의**: cron 표현식은 6자리(초 포함)와 5자리를 모두 받는다. 5자리 `0 9 * * *`와 6자리 `0 0 9 * * *`가 같은 의미다. 6자리로 `* * * * * *`를 쓰면 매초 실행되니 조심하자.
+
+> **주의**: `@Cron` 메서드가 실행 시간보다 오래 걸리면 다음 tick과 겹칠 수 있다. `@Interval`도 마찬가지다. 긴 작업은 실행 중 플래그로 중복 진입을 막거나 큐로 넘기자.
+
+### SchedulerRegistry로 동적 등록
+
+> **비유**: 고정 알람 외에 사용자가 앱에서 직접 추가·삭제하는 알람이다.
+
+데코레이터는 코드에 고정된다. 설정이나 DB 값에 따라 등록하려면 `SchedulerRegistry`를 쓴다.
+
+```ts
+import { SchedulerRegistry } from '@nestjs/schedule';
+import { CronJob } from 'cron';
+
+@Injectable()
+export class DynamicJobs implements OnApplicationBootstrap {
+  constructor(
+    private readonly registry: SchedulerRegistry,
+    private readonly settings: SettingsService,
+  ) {}
+
+  async onApplicationBootstrap() {
+    const expr = await this.settings.get('backup.cron'); // 예: '0 0 3 * * *'
+    this.register('backup', expr, () => this.backup());
+  }
+
+  register(name: string, expr: string, fn: () => Promise<void>) {
+    if (this.registry.doesExist('cron', name)) this.registry.deleteCronJob(name);
+    const job = new CronJob(expr, fn, null, false, 'Asia/Seoul');
+    this.registry.addCronJob(name, job);
+    job.start();
+  }
+
+  pause(name: string) {
+    this.registry.getCronJob(name).stop();
+  }
+
+  private async backup() {}
+}
+```
+
+| 메서드 | 설명 |
+| --- | --- |
+| `addCronJob(name, job)` / `getCronJob` / `deleteCronJob` | cron job 관리. 추가 후 `job.start()` 필요 |
+| `addInterval(name, id)` / `deleteInterval` | `setInterval` 반환값 등록 |
+| `addTimeout(name, id)` / `deleteTimeout` | `setTimeout` 반환값 등록 |
+| `getCronJobs()` | 전체 목록(Map) |
+
+> **포인트**: 데코레이터에 `name`을 붙여 두면 `SchedulerRegistry.getCronJob('daily-report')`로 정적 job도 런타임에 멈추거나 다시 시작할 수 있다. 장애 시 특정 배치를 끄는 관리 API를 만들 때 유용하다.
+
+### 다중 인스턴스에서 중복 실행 문제
+
+> **비유**: 체인점 3곳에 똑같은 알람이 걸려 있어서, 본사에 보고서가 3장 도착한다.
+
+`@nestjs/schedule`은 순수 in-process 스케줄러다. Kubernetes에서 replica를 3개 띄우면 `sendDailyReport()`가 3번 실행된다. 해결책을 비교하면 다음과 같다.
+
+| 방법 | 원리 | 장점 | 단점 |
+| --- | --- | --- | --- |
+| 스케줄러 전용 인스턴스 | 환경 변수로 한 인스턴스만 `ScheduleModule` 활성화 | 단순 | 그 인스턴스 장애 시 미실행 |
+| Redis 분산 락 | `SET key value NX PX ttl`로 락 획득한 인스턴스만 실행 | 기존 코드 유지 | 락 TTL 설계, 시계 오차 고려 |
+| DB advisory lock | PostgreSQL `pg_try_advisory_lock` | Redis 불필요 | DB 의존 |
+| BullMQ job scheduler | 반복 job을 Redis에 등록, worker 하나만 가져감 | 재시도, 이력, 유실 방지 | 큐 인프라 필요 |
+| 외부 스케줄러 | K8s CronJob이 엔드포인트/스크립트 호출 | 인프라에서 관리 | 앱 밖으로 로직 분산 |
+
+```ts
+// 1) 전용 인스턴스: 조건부 import
+@Module({
+  imports: [
+    ...(process.env.RUN_SCHEDULER === 'true' ? [ScheduleModule.forRoot()] : []),
+  ],
+})
+export class AppModule {}
+```
+
+```ts
+// 2) Redis 분산 락
+@Cron('0 0 9 * * *', { name: 'daily-report' })
+async sendDailyReport() {
+  const acquired = await this.redis.set('lock:daily-report', this.instanceId, 'PX', 60_000, 'NX');
+  if (acquired !== 'OK') return; // 다른 인스턴스가 실행 중
+  try {
+    await this.reportService.sendDaily();
+  } finally {
+    // 내 락일 때만 해제 (Lua 스크립트로 원자적으로 처리하는 것이 안전)
+    await this.releaseLock('lock:daily-report');
+  }
+}
+```
+
+> **포인트**: "실패하면 재시도"와 "실행 이력"까지 필요하면 처음부터 BullMQ의 반복 job으로 가는 것이 장기적으로 낫다. `@Cron`은 캐시 워밍, 메트릭 수집처럼 **인스턴스마다 돌아도 괜찮은 작업**에 가장 잘 맞는다.
+
+## @nestjs/bullmq
+
+> **비유**: 주방의 주문서 꽂이다. 홀 직원(Producer)은 주문서를 꽂고 바로 다음 손님을 받는다. 요리사(Worker)는 손이 비면 주문서를 하나씩 가져간다. 요리사가 쓰러져도 주문서는 꽂이에 남아 있다.
+
+BullMQ는 Redis 기반 job queue이고, `@nestjs/bullmq`는 이를 Nest DI와 데코레이터로 감싼다. 구 버전 `@nestjs/bull`(Bull 기반) 대신 신규 프로젝트는 BullMQ를 쓴다.
+
+```bash
+npm i @nestjs/bullmq bullmq
+```
+
+### 1단계: 연결과 큐 등록
+
+```ts
+@Module({
+  imports: [
+    BullModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        connection: {
+          host: config.getOrThrow('REDIS_HOST'),
+          port: config.get<number>('REDIS_PORT', 6379),
+        },
+        defaultJobOptions: {
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 1_000 },
+          removeOnComplete: 1_000, // 최근 1000개만 보관
+          removeOnFail: 5_000,
+        },
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+
+@Module({
+  imports: [BullModule.registerQueue({ name: 'email' })],
+  providers: [EmailProducer, EmailProcessor],
+  exports: [EmailProducer],
+})
+export class EmailModule {}
+```
+
+### 2단계: Producer
+
+```ts
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+
+@Injectable()
+export class EmailProducer {
+  constructor(@InjectQueue('email') private readonly queue: Queue) {}
+
+  async sendWelcome(userId: string) {
+    await this.queue.add(
+      'welcome',                  // job name
+      { userId },                 // data: JSON 직렬화 가능해야 함
+      {
+        jobId: `welcome:${userId}`, // 같은 id면 중복 추가 안 됨(멱등성)
+        delay: 60_000,              // 1분 뒤 실행
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 2_000 },
+        priority: 2,                // 숫자가 낮을수록 우선
+      },
+    );
+  }
+}
+```
+
+| 옵션 | 의미 |
+| --- | --- |
+| `attempts` | 최대 시도 횟수(첫 시도 포함) |
+| `backoff` | 재시도 간격. `fixed` 또는 `exponential` + `delay` |
+| `delay` | 첫 실행까지 지연(ms) |
+| `jobId` | 지정 시 같은 id의 job은 중복 생성되지 않음 |
+| `priority` | 우선순위. 낮은 숫자가 먼저 |
+| `removeOnComplete` / `removeOnFail` | 완료/실패 job 보관 개수 또는 `true` |
+
+### 3단계: Worker(Processor)
+
+```ts
+import { Processor, WorkerHost, OnWorkerEvent } from '@nestjs/bullmq';
+import { Job } from 'bullmq';
+
+@Processor('email', { concurrency: 5 })
+export class EmailProcessor extends WorkerHost {
+  private readonly logger = new Logger(EmailProcessor.name);
+
+  constructor(private readonly mailer: MailerService) {
+    super();
+  }
+
+  // 모든 job이 이 메서드로 들어온다. job.name으로 분기
+  async process(job: Job<{ userId: string }>): Promise<unknown> {
+    switch (job.name) {
+      case 'welcome':
+        await job.updateProgress(10);
+        return this.mailer.sendWelcome(job.data.userId);
+      case 'reset-password':
+        return this.mailer.sendReset(job.data.userId);
+      default:
+        throw new Error(`Unknown job ${job.name}`);
+    }
+  }
+
+  @OnWorkerEvent('failed')
+  onFailed(job: Job, error: Error) {
+    this.logger.warn(`job ${job.id} failed (${job.attemptsMade}/${job.opts.attempts}): ${error.message}`);
+  }
+
+  @OnWorkerEvent('completed')
+  onCompleted(job: Job) {
+    this.logger.debug(`job ${job.id} done`);
+  }
+}
+```
+
+동작 흐름은 다음과 같다.
+
+1. Producer가 `queue.add()` → Redis에 job이 `waiting`(또는 `delayed`) 상태로 저장된다.
+2. Worker가 job을 가져가 `active`로 바꾸고 `process()`를 호출한다.
+3. `process()`가 resolve되면 `completed`, 반환값은 `job.returnvalue`에 저장된다.
+4. throw하면 `attempts`가 남았을 때 backoff 후 다시 `delayed` → `waiting`, 다 쓰면 `failed`.
+5. Worker 프로세스가 처리 중 죽으면 lock이 만료되어 job이 stalled로 감지되고 다시 처리된다.
+
+> **포인트**: job은 **최소 한 번(at-least-once)** 실행된다. 재시도와 stalled 복구 때문에 같은 job이 두 번 실행될 수 있으니 `process()`는 멱등하게 작성하자(이미 보냈는지 기록 확인 등).
+
+> **주의**: Worker는 `@Processor`가 붙은 provider가 있는 **모든 인스턴스**에서 뜬다. API 서버와 worker를 분리하고 싶으면 worker 전용 앱(또는 조건부 provider 등록)으로 나누자. 무거운 CPU 작업은 `process()` 안에서 이벤트 루프를 막으므로 sandboxed processor나 별도 프로세스를 고려한다.
+
+### 이벤트 리스너: Worker 이벤트 vs Queue 이벤트
+
+| 구분 | 데코레이터 | 범위 | 용도 |
+| --- | --- | --- | --- |
+| Worker 이벤트 | `@OnWorkerEvent('completed')` in `@Processor` 클래스 | 이 인스턴스의 worker가 처리한 job만 | 로컬 로깅 |
+| Queue 이벤트 | `@QueueEventsListener('email')` + `QueueEventsHost` + `@OnQueueEvent('completed')` | 큐 전체(모든 worker) | 모니터링, 알림 |
+
+```ts
+@QueueEventsListener('email')
+export class EmailQueueEvents extends QueueEventsHost {
+  @OnQueueEvent('failed')
+  onFailed({ jobId, failedReason }: { jobId: string; failedReason: string }) {
+    // 어느 인스턴스에서 실패했든 받음 (Redis stream 기반)
+  }
+}
+```
+
+### 반복 job으로 cron 대체
+
+```ts
+// BullMQ v5.16+ job scheduler: 여러 인스턴스에서 호출해도 하나만 등록됨
+await this.reportQueue.upsertJobScheduler(
+  'daily-report',
+  { pattern: '0 0 9 * * *', tz: 'Asia/Seoul' },
+  { name: 'daily', data: {} },
+);
+```
+
+> **포인트**: scheduler id로 upsert되므로 앱이 뜰 때마다 호출해도 중복되지 않는다. 실행은 worker 하나가 가져가므로 다중 인스턴스 중복 문제도 해결된다. 구버전은 `queue.add(name, data, { repeat: { pattern } })`를 쓴다.
+
+## @nestjs/cache-manager
+
+> **비유**: 자주 나가는 메뉴를 미리 만들어 보온통에 넣어두는 것이다. 빠르지만, 레시피가 바뀌면 보온통을 비워야(무효화) 한다.
+
+```bash
+npm i @nestjs/cache-manager cache-manager
+```
+
+### CacheModule 등록
+
+```ts
+@Module({
+  imports: [
+    CacheModule.register({
+      isGlobal: true,
+      ttl: 30_000, // 밀리초 (cache-manager v5 이상)
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+> **주의**: cache-manager v4는 TTL이 **초**, v5 이상은 **밀리초**다. 블로그 예제를 복사하면 `ttl: 5`가 5ms가 되어 사실상 캐시가 안 되는 일이 흔하다.
+
+### CacheInterceptor로 자동 캐시
+
+```ts
+@Controller('products')
+@UseInterceptors(CacheInterceptor)
+export class ProductController {
+  @Get()
+  list(@Query() q: ListQuery) {} // 키: 요청 URL (쿼리스트링 포함)
+
+  @Get('featured')
+  @CacheKey('products:featured') // 고정 키
+  @CacheTTL(60_000)              // 이 라우트만 60초
+  featured() {}
+}
+```
+
+| 동작 | 설명 |
+| --- | --- |
+| 캐시 대상 | **GET 요청만**. POST/PUT 등은 통과 |
+| 기본 키 | HTTP의 경우 `request.url` (`trackBy()`에서 결정) |
+| `@Res()` 사용 핸들러 | 캐시 안 됨(응답을 직접 다뤄서 값을 모름) |
+| 전역 적용 | `{ provide: APP_INTERCEPTOR, useClass: CacheInterceptor }` |
+
+사용자별 응답이 다른 API에 URL 기준 캐시를 걸면 **다른 사용자의 데이터가 캐시에서 나간다**. `trackBy()`를 오버라이드해 키를 조정하거나 캐시를 끈다.
+
+```ts
+@Injectable()
+export class UserAwareCacheInterceptor extends CacheInterceptor {
+  protected trackBy(context: ExecutionContext): string | undefined {
+    const req = context.switchToHttp().getRequest();
+    if (req.method !== 'GET') return undefined; // undefined면 캐시 안 함
+    const userId = req.user?.id ?? 'anon';
+    return `${userId}:${req.url}`;
+  }
+}
+```
+
+### 수동 캐시
+
+> **비유**: 보온통에 무엇을 넣고 뺄지 요리사가 직접 정한다.
+
+인터셉터는 컨트롤러 응답 단위라 거칠다. 서비스 레벨에서 직접 다루는 경우가 더 많다.
+
+```ts
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { Cache } from 'cache-manager';
+
+@Injectable()
+export class ProductService {
+  constructor(
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly repo: ProductRepository,
+  ) {}
+
+  async findById(id: string): Promise<Product> {
+    const key = `product:${id}`;
+    const cached = await this.cache.get<Product>(key);
+    if (cached) return cached;
+
+    const product = await this.repo.findById(id);
+    await this.cache.set(key, product, 300_000); // 5분
+    return product;
+  }
+
+  async update(id: string, dto: UpdateProductDto) {
+    const product = await this.repo.update(id, dto);
+    await this.cache.del(`product:${id}`); // 쓰기 후 무효화
+    return product;
+  }
+}
+```
+
+### Redis store
+
+메모리 store는 인스턴스마다 따로라서, 한 인스턴스에서 `del`해도 다른 인스턴스 캐시는 남는다. 다중 인스턴스면 Redis store를 쓴다. cache-manager v6부터는 Keyv 기반 store를 사용한다.
+
+```ts
+import { createKeyv } from '@keyv/redis';
+
+CacheModule.registerAsync({
+  isGlobal: true,
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    ttl: 60_000,
+    stores: [createKeyv(config.getOrThrow('REDIS_URL'))],
+  }),
+});
+```
+
+> **주의**: cache-manager v5 이하에서는 `cache-manager-redis-yet` 같은 별도 store와 `store:` 옵션을 썼다. 버전에 따라 설정 키와 store 패키지가 다르므로 `package.json`의 cache-manager 메이저 버전부터 확인하자.
+
+### 캐시 무효화 전략
+
+| 전략 | 방식 | 장점 | 단점 |
+| --- | --- | --- | --- |
+| TTL만 | 시간이 지나면 만료 | 구현 0 | 그동안 stale 데이터 |
+| 쓰기 후 삭제(cache-aside) | update/delete 후 `del(key)` | 단순, 일관성 양호 | 목록 캐시 등 연관 키 추적 필요 |
+| 버전 키 | `products:v{n}:...`, 변경 시 n 증가 | 연관 키 일괄 무효화 | 오래된 키는 TTL로 정리 |
+| 이벤트 기반 삭제 | `product.updated` 이벤트 리스너에서 삭제 | 쓰기 코드와 분리 | 이벤트 유실 시 stale |
+
+> **포인트**: 가장 실용적인 조합은 "짧은 TTL + 쓰기 후 삭제"다. TTL이 안전망 역할을 해서 무효화를 빠뜨려도 피해가 제한된다. 목록 캐시처럼 키 추적이 어려운 경우 버전 키를 쓴다.
+
+## @nestjs/event-emitter
+
+> **비유**: 주방에서 "3번 테이블 요리 나왔어요!"라고 외치는 것이다. 듣고 있던 사람은 반응하지만, 그 순간 자리에 없던 사람은 못 듣고, 서버가 재시작되면 외침은 사라진다.
+
+```bash
+npm i @nestjs/event-emitter
+```
+
+```ts
+@Module({
+  imports: [
+    EventEmitterModule.forRoot({
+      wildcard: true,
+      delimiter: '.',
+      maxListeners: 20,
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+```ts
+// 이벤트 클래스
+export class OrderCreatedEvent {
+  constructor(readonly orderId: string, readonly userId: string, readonly total: number) {}
+}
+
+// 발행
+@Injectable()
+export class OrderService {
+  constructor(private readonly events: EventEmitter2) {}
+
+  async create(dto: CreateOrderDto) {
+    const order = await this.orders.save(dto);
+    this.events.emit('order.created', new OrderCreatedEvent(order.id, dto.userId, order.total));
+    return order;
+  }
+}
+
+// 구독
+@Injectable()
+export class OrderListeners {
+  @OnEvent('order.created')
+  recordMetric(event: OrderCreatedEvent) {} // 동기: emit 호출 안에서 실행됨
+
+  @OnEvent('order.created', { async: true })
+  async notifySlack(event: OrderCreatedEvent) {} // 다음 tick으로 미뤄 실행
+
+  @OnEvent('order.*')
+  audit(event: unknown) {} // order.created, order.cancelled 등
+
+  @OnEvent('**')
+  debugAll(event: unknown) {} // 모든 이벤트(멀티 레벨)
+}
+```
+
+| 옵션/메서드 | 의미 |
+| --- | --- |
+| `emit(name, payload)` | 리스너를 호출하고 바로 반환. 비동기 리스너를 기다리지 않음 |
+| `emitAsync(name, payload)` | 모든 리스너의 Promise를 기다림 |
+| `@OnEvent(..., { async: true })` | 리스너를 비동기로 실행(발행자 블로킹 방지) |
+| `@OnEvent(..., { suppressErrors: false })` | 리스너 에러를 다시 throw. 기본값은 `true`(삼킴) |
+| `wildcard: true` | `order.*`, `**` 패턴 사용 가능 |
+
+> **주의**: 리스너는 모든 모듈 초기화가 끝난 `onApplicationBootstrap` 시점에 등록된다. 그래서 `onModuleInit` 안에서 `emit`하면 아무도 받지 못한다. 초기화 이벤트는 `onApplicationBootstrap` 이후에 발행하거나 `EventEmitterReadinessWatcher.waitUntilReady()`를 기다리자.
+
+> **주의**: 기본 `suppressErrors: true` 때문에 리스너에서 난 에러는 조용히 사라진다. 리스너 안에서 try/catch로 직접 로깅하자. 그리고 `emit`은 트랜잭션 커밋 전에 호출하면, 롤백되었는데 이벤트는 이미 처리된 상황이 생긴다.
+
+## 이벤트 vs 큐: 선택 기준
+
+> **비유**: 외침(event)과 주문서(queue)의 차이다. 놓쳐도 되는 소식은 외치고, 반드시 처리되어야 하는 일은 주문서로 남긴다.
+
+| 기준 | event-emitter | BullMQ 큐 |
+| --- | --- | --- |
+| 저장 | 메모리, 프로세스 재시작 시 유실 | Redis에 영속 |
+| 재시도 | X (직접 구현) | O (`attempts`, `backoff`) |
+| 다른 인스턴스로 분산 | X | O |
+| 지연 실행 | X | O (`delay`) |
+| 처리량 제어 | X | O (`concurrency`, rate limiter) |
+| 실패 이력/모니터링 | X | O (failed 목록, Bull Board 등) |
+| 지연 시간 | 거의 0 | Redis 왕복 수 ms |
+| 인프라 | 불필요 | Redis 필요 |
+| 대표 용도 | 모듈 간 결합 끊기, 메트릭, 캐시 무효화 | 이메일, 결제 후처리, 이미지 처리, 외부 API 동기화 |
+
+> **포인트**: 둘을 조합하는 패턴이 흔하다. 도메인 이벤트는 event-emitter로 발행하고, 리스너가 "확실히 해야 하는 일"을 큐에 `add()`한다. 다만 DB 커밋과 큐 추가 사이의 원자성이 중요하면 Outbox 패턴(patterns 문서)을 쓴다.
+
+## 언제 무엇을 쓰나
+
+> **비유**: 공구함에서 망치, 드라이버, 테이프 중 하나를 고르는 일이다. 문제의 모양을 먼저 보자.
+
+| 상황 | 선택 | 이유 |
+| --- | --- | --- |
+| 매일 새벽 통계 집계(단일 인스턴스) | `@Cron` | 가장 단순 |
+| 매일 새벽 통계 집계(다중 인스턴스, 실패 재시도 필요) | BullMQ job scheduler | 중복 실행 방지 + 재시도 |
+| 회원가입 후 환영 메일 | BullMQ | 외부 SMTP 실패 재시도, 응답 지연 방지 |
+| 주문 생성 시 다른 모듈에 알림(실패해도 무방) | event-emitter | 모듈 결합 제거, 인프라 불필요 |
+| 상품 상세 조회 반복 | cache-manager 수동 캐시 | DB 부하 감소 |
+| 공개 목록 API 전체 응답 | `CacheInterceptor` | 코드 변경 최소 |
+| 인스턴스별 메모리 캐시 워밍 | `@Interval` | 인스턴스마다 실행되어야 함 |
+| 사용자가 설정한 시각에 알림 | BullMQ `delay` | 개별 job, 영속 |
+| 서비스 간(다른 앱) 이벤트 전달 | 메시지 브로커 | microservices 문서 참고 |
+
+판단 순서를 정리하면 다음과 같다.
+
+1. 유실되면 안 되는가? → 그렇다면 큐(또는 Outbox).
+2. 정해진 시각에 실행되어야 하는가? → 인스턴스가 하나면 `@Cron`, 여럿이면 분산 락이나 BullMQ scheduler.
+3. 같은 프로세스 안에서 모듈을 분리하고 싶을 뿐인가? → event-emitter.
+4. 같은 결과를 반복 계산하고 있는가? → cache. 무효화 전략부터 정한다.
+
+## 셀프 체크
+
+**Q1. replica 3개로 운영 중인 앱에서 `@Cron('0 0 9 * * *')`로 보고서 메일을 보냈더니 3통이 왔다. 원인과 해결책은?**
+
+**A.** `@nestjs/schedule`은 프로세스 내부 스케줄러라 인스턴스마다 실행된다. 스케줄러 전용 인스턴스만 `ScheduleModule`을 켜거나, Redis 분산 락, 또는 BullMQ `upsertJobScheduler`로 반복 job을 등록해 worker 하나만 처리하게 한다.
+
+**Q2. BullMQ job이 같은 데이터로 두 번 실행될 수 있는 경우와 대비책은?**
+
+**A.** 실패 후 재시도, worker가 처리 중 죽어 stalled로 재처리되는 경우다. 큐는 at-least-once이므로 `process()`를 멱등하게 작성하고, 추가 단계에서는 `jobId`로 중복 생성을 막는다.
+
+**Q3. `CacheInterceptor`를 전역으로 걸었더니 로그인한 사용자 A의 프로필이 B에게 보였다. 왜인가?**
+
+**A.** 기본 캐시 키가 요청 URL이라 `/me` 같은 사용자별 응답이 같은 키로 저장된다. `trackBy()`를 오버라이드해 사용자 id를 키에 포함하거나 해당 라우트를 캐시에서 제외한다.
+
+**Q4. `@OnEvent` 리스너에서 예외가 발생했는데 아무 로그도 없다. 이유는?**
+
+**A.** `@OnEvent`의 `suppressErrors` 기본값이 `true`라 에러가 삼켜진다. 리스너 내부에서 try/catch로 로깅하거나 `suppressErrors: false`로 설정한다.
+
+**Q5. "결제 완료 후 영수증 메일 발송"은 event-emitter와 큐 중 무엇이 적합한가?**
+
+**A.** 큐가 적합하다. 메일 발송은 외부 의존성이라 실패 재시도가 필요하고, 프로세스 재시작 시에도 유실되면 안 된다. event-emitter로 이벤트를 받더라도 실제 발송은 큐에 넣는 것이 안전하다.
+
+## 핵심 정리
+
+- `@nestjs/schedule`은 in-process 스케줄러다. `@Cron`/`@Interval`/`@Timeout`과 `SchedulerRegistry`로 정적·동적 job을 관리하지만 다중 인스턴스에서는 중복 실행된다.
+- 중복 실행은 전용 인스턴스, 분산 락, BullMQ job scheduler, 외부 스케줄러로 해결한다.
+- `@nestjs/bullmq`는 `BullModule.forRoot` + `registerQueue`로 설정하고, `@InjectQueue`로 추가, `@Processor` + `WorkerHost.process()`로 처리한다.
+- job 옵션 `attempts`, `backoff`, `delay`, `jobId`로 재시도와 멱등성을 설계하며, 처리 로직은 at-least-once를 전제로 멱등해야 한다.
+- `CacheInterceptor`는 GET만, URL 키 기준이며 사용자별 응답에는 `trackBy()` 조정이 필요하다. TTL은 v5 이상에서 밀리초다.
+- 다중 인스턴스 캐시는 Redis store를 쓰고, "짧은 TTL + 쓰기 후 삭제"가 기본 무효화 전략이다.
+- `@OnEvent`는 메모리 기반이라 유실 가능하고 에러가 기본적으로 삼켜진다. 놓치면 안 되는 작업은 큐로 보낸다.

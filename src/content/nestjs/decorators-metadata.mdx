@@ -1,0 +1,673 @@
+---
+title: "데코레이터와 메타데이터"
+description: "TS 데코레이터 실행 원리, reflect-metadata와 design:paramtypes, Nest 데코레이터의 실체, Reflector, 커스텀 데코레이터 합성까지"
+order: 3
+---
+
+## 한눈에 보기
+
+- 데코레이터는 **클래스가 정의되는 순간 한 번 실행되는 함수**다. 요청마다 실행되지 않는다.
+- `emitDecoratorMetadata`가 켜져 있으면 TS 컴파일러가 생성자 파라미터 타입을 `design:paramtypes` 메타데이터로 **JS 코드에 박아 넣는다**. Nest DI는 이것을 읽어서 주입한다.
+- `@Injectable()`, `@Controller()`, `@Module()`은 로직을 실행하지 않는다. 대상 클래스에 **메타데이터 키를 저장할 뿐**이고, 실제 일은 Nest의 Scanner/Injector가 부트스트랩 시점에 한다.
+- 커스텀 메타데이터는 `SetMetadata` 또는 `Reflector.createDecorator`(v10.2+)로 저장하고, Guard/Interceptor에서 `Reflector`로 읽는다.
+- `createParamDecorator`로 파라미터 추출을, `applyDecorators`로 여러 데코레이터 합성을 한다.
+
+## 데코레이터란 무엇인가
+
+> **비유**: 데코레이터는 택배 상자에 붙이는 **스티커**다. "취급주의", "냉장 보관" 스티커를 붙여도 상자 안의 물건은 바뀌지 않는다. 대신 물류 센터(Nest 런타임)가 스티커를 읽고 상자를 어떻게 다룰지 결정한다.
+
+TypeScript의 (legacy) 데코레이터는 결국 **특정 시그니처를 가진 함수**다. `@Something`은 문법 설탕이고, 컴파일되면 함수 호출로 바뀐다.
+
+### 네 가지 종류와 시그니처
+
+| 종류 | 붙는 위치 | 받는 인자 | Nest 예시 |
+| --- | --- | --- | --- |
+| Class | 클래스 선언 | `target`(생성자 함수) | `@Controller()`, `@Injectable()`, `@Module()` |
+| Method | 메서드 | `target`, `propertyKey`, `descriptor` | `@Get()`, `@UseGuards()`, `@HttpCode()` |
+| Property | 프로퍼티 | `target`, `propertyKey` | `@Inject()`(프로퍼티 주입), `@Expose()` |
+| Parameter | 메서드/생성자 파라미터 | `target`, `propertyKey`, `parameterIndex` | `@Body()`, `@Param()`, `@Inject(TOKEN)` |
+
+```ts
+// 클래스 데코레이터: 생성자 함수를 받는다
+function Tag(name: string): ClassDecorator {
+  return (target) => {
+    console.log(`class decorated: ${target.name} as ${name}`);
+  };
+}
+
+// 메서드 데코레이터: descriptor를 받아서 감쌀 수도 있다
+function Log(): MethodDecorator {
+  return (target, propertyKey, descriptor: PropertyDescriptor) => {
+    const original = descriptor.value;
+    descriptor.value = function (...args: unknown[]) {
+      console.log(`call ${String(propertyKey)}`, args);
+      return original.apply(this, args);
+    };
+  };
+}
+
+// 파라미터 데코레이터: "몇 번째 파라미터인지"만 알 수 있다
+function Mark(): ParameterDecorator {
+  return (target, propertyKey, index) => {
+    console.log(`param #${index} of ${String(propertyKey)}`);
+  };
+}
+
+@Tag('demo')
+class Demo {
+  @Log()
+  run(@Mark() input: string) {
+    return input.toUpperCase();
+  }
+}
+```
+
+> **포인트**: 파라미터 데코레이터는 값을 바꿀 수 없다. 받을 수 있는 정보는 "어느 클래스의, 어느 메서드의, 몇 번째 파라미터"뿐이다. 그래서 `@Body()` 같은 데코레이터는 **"이 위치에는 body를 넣어라"라는 메타데이터만 기록**하고, 실제 값 주입은 Nest가 요청 시점에 한다.
+
+### 실행 시점
+
+데코레이터는 **클래스 정의가 평가될 때**, 즉 모듈 파일이 `import`되는 순간 실행된다. 인스턴스를 만들 때도, 메서드를 호출할 때도 아니다.
+
+```ts
+@Tag('once')
+class OnlyOnce {}
+// 이 파일이 로드되는 순간 "class decorated: OnlyOnce as once" 출력
+
+new OnlyOnce(); // 아무것도 출력되지 않음
+new OnlyOnce(); // 역시 출력 없음
+```
+
+### 실행 순서
+
+legacy 데코레이터의 적용 순서는 다음 규칙을 따른다.
+
+1. **인스턴스 멤버**(프로퍼티, 메서드, 접근자)가 선언 순서대로 처리된다. 메서드 하나에 대해서는 **파라미터 데코레이터 → 메서드 데코레이터** 순이다.
+2. **static 멤버**가 처리된다.
+3. **생성자 파라미터 데코레이터**가 처리된다.
+4. 마지막으로 **클래스 데코레이터**가 적용된다.
+
+한 대상에 데코레이터가 여러 개 붙어 있으면, 데코레이터 팩토리 **표현식은 위에서 아래로 평가**되고, 반환된 데코레이터 함수는 **아래에서 위로 적용**된다(함수 합성 `f(g(x))`와 같다).
+
+```ts
+function A() {
+  console.log('A evaluated');
+  return (t: any, k: string, d: PropertyDescriptor) => console.log('A applied');
+}
+function B() {
+  console.log('B evaluated');
+  return (t: any, k: string, d: PropertyDescriptor) => console.log('B applied');
+}
+
+class Order {
+  @A()
+  @B()
+  method() {}
+}
+// A evaluated
+// B evaluated
+// B applied
+// A applied
+```
+
+> **포인트**: 클래스 데코레이터가 가장 마지막에 실행되므로, `@Controller()`가 적용되는 시점에는 이미 모든 메서드의 `@Get()`, `@Post()` 메타데이터가 기록된 상태다.
+
+## experimentalDecorators와 emitDecoratorMetadata
+
+> **비유**: `experimentalDecorators`는 "스티커를 붙일 수 있게 허용"하는 스위치이고, `emitDecoratorMetadata`는 "포장할 때 **내용물 목록표**를 자동으로 같이 넣어라"라는 스위치다. Nest는 이 목록표가 없으면 무엇을 주입할지 모른다.
+
+Nest 프로젝트의 `tsconfig.json`에는 항상 두 옵션이 켜져 있다.
+
+```json
+{
+  "compilerOptions": {
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "target": "ES2021"
+  }
+}
+```
+
+| 옵션 | 역할 | 끄면 |
+| --- | --- | --- |
+| `experimentalDecorators` | legacy(Stage 2 기반) 데코레이터 문법 활성화 | TS 5의 표준 데코레이터로 해석됨. 파라미터 데코레이터가 없어서 Nest 코드가 컴파일되지 않음 |
+| `emitDecoratorMetadata` | 데코레이터가 붙은 선언에 `design:*` 메타데이터 출력 | 생성자 파라미터 타입 정보가 사라져 DI 실패 |
+
+> **주의**: TS 5.0부터 들어온 **표준(ECMAScript) 데코레이터**는 파라미터 데코레이터와 `emitDecoratorMetadata`를 지원하지 않는다. Nest(v10/v11)는 여전히 legacy 데코레이터 기반이므로 `experimentalDecorators: true`를 반드시 유지해야 한다.
+
+### TS가 출력하는 세 가지 design 메타데이터
+
+| 키 | 붙는 곳 | 내용 |
+| --- | --- | --- |
+| `design:type` | 프로퍼티, 메서드 | 프로퍼티 타입 또는 `Function` |
+| `design:paramtypes` | 클래스(생성자), 메서드 | 파라미터 타입 배열 |
+| `design:returntype` | 메서드 | 반환 타입 |
+
+이 중 DI의 핵심은 **클래스에 붙는 `design:paramtypes`**, 즉 생성자 파라미터 타입 목록이다. 메서드에 붙는 `design:paramtypes`는 `ValidationPipe`가 `@Body()` 파라미터의 DTO 클래스를 알아내는 데 쓰인다.
+
+## reflect-metadata와 생성자 주입의 원리
+
+> **비유**: `reflect-metadata`는 클래스마다 붙어 있는 **보이지 않는 메모장**이다. TS 컴파일러와 Nest 데코레이터가 이 메모장에 적고, Nest Injector가 나중에 읽는다.
+
+`reflect-metadata`는 `Reflect.defineMetadata`, `Reflect.getMetadata` 같은 API를 전역 `Reflect` 객체에 추가하는 polyfill이다. 내부적으로는 `WeakMap`에 "대상 객체 → (프로퍼티 키 → (메타데이터 키 → 값))" 구조로 저장한다.
+
+```ts
+import 'reflect-metadata';
+
+class Foo {}
+Reflect.defineMetadata('role', 'admin', Foo);
+Reflect.getMetadata('role', Foo); // 'admin'
+
+// 메서드 단위로도 저장 가능
+Reflect.defineMetadata('cache', 60, Foo.prototype, 'find');
+Reflect.getMetadata('cache', Foo.prototype, 'find'); // 60
+```
+
+> **포인트**: Nest 패키지(`@nestjs/common`, `@nestjs/core`)가 내부에서 `reflect-metadata`를 로드하므로 앱 코드에서 직접 import할 일은 드물다. 다만 Nest 없이 데코레이터만 테스트하는 스크립트라면 직접 import해야 한다.
+
+### 컴파일 결과로 보는 design:paramtypes
+
+다음 TS 코드를 보자.
+
+```ts
+@Injectable()
+export class UsersService {
+  constructor(
+    private readonly usersRepository: UsersRepository,
+    private readonly config: ConfigService,
+  ) {}
+}
+```
+
+`tsc`가 출력하는 JS(CommonJS)는 대략 다음과 같다.
+
+```js
+let UsersService = class UsersService {
+  constructor(usersRepository, config) {
+    this.usersRepository = usersRepository;
+    this.config = config;
+  }
+};
+UsersService = __decorate(
+  [
+    (0, common_1.Injectable)(),
+    __metadata('design:paramtypes', [
+      users_repository_1.UsersRepository,
+      config_1.ConfigService,
+    ]),
+  ],
+  UsersService,
+);
+exports.UsersService = UsersService;
+```
+
+핵심은 `__metadata('design:paramtypes', [UsersRepository, ConfigService])` 한 줄이다. **타입 정보가 런타임 값(클래스 참조)으로 바뀌어 코드에 남는다.** `__metadata`는 내부적으로 `Reflect.metadata(key, value)`를 호출하는 헬퍼다.
+
+### Nest Injector가 하는 일
+
+부트스트랩 시 Nest는 대략 다음 순서로 인스턴스를 만든다.
+
+1. `@Module()` 메타데이터를 읽어 provider 목록을 수집한다(Scanner).
+2. 각 provider 클래스에 대해 `Reflect.getMetadata('design:paramtypes', UsersService)`를 호출한다 → `[UsersRepository, ConfigService]`.
+3. `@Inject()`로 덮어쓴 위치가 있는지 `self:paramtypes` 메타데이터를 확인해 토큰을 교체한다.
+4. 각 토큰(여기서는 클래스 자체)으로 모듈 그래프에서 provider를 찾아 먼저 인스턴스화한다(재귀).
+5. 모은 인스턴스로 `new UsersService(repo, config)`를 호출한다.
+
+```ts
+// 개념적으로 단순화한 Injector
+function resolve<T>(target: new (...args: any[]) => T): T {
+  const paramTypes: any[] = Reflect.getMetadata('design:paramtypes', target) ?? [];
+  const overrides: { index: number; param: unknown }[] =
+    Reflect.getMetadata('self:paramtypes', target) ?? [];
+
+  const tokens = paramTypes.map((type, i) => {
+    const override = overrides.find((o) => o.index === i);
+    return override ? override.param : type;
+  });
+
+  const deps = tokens.map((token) => container.get(token));
+  return new target(...deps);
+}
+```
+
+> **포인트**: Nest의 생성자 주입은 마법이 아니다. "컴파일러가 남긴 타입 목록"을 읽고 "토큰으로 인스턴스를 찾아" `new`를 호출하는 것뿐이다.
+
+### 인터페이스는 왜 토큰이 될 수 없나
+
+```ts
+export interface PaymentGateway {
+  charge(amount: number): Promise<void>;
+}
+
+@Injectable()
+export class OrdersService {
+  constructor(private readonly gateway: PaymentGateway) {}
+}
+```
+
+컴파일 결과는 이렇다.
+
+```js
+OrdersService = __decorate(
+  [(0, common_1.Injectable)(), __metadata('design:paramtypes', [Object])],
+  OrdersService,
+);
+```
+
+인터페이스는 **타입 시스템에만 존재하고 JS로 출력되지 않는다**. 그래서 TS 컴파일러는 그 자리에 `Object`를 넣는다. Nest는 `Object`라는 토큰으로 provider를 찾을 수 없으므로 `Nest can't resolve dependencies of the OrdersService (?)` 에러를 낸다.
+
+해결책은 **런타임 값인 토큰**을 쓰는 것이다.
+
+```ts
+export const PAYMENT_GATEWAY = Symbol('PAYMENT_GATEWAY');
+
+@Module({
+  providers: [{ provide: PAYMENT_GATEWAY, useClass: StripeGateway }, OrdersService],
+})
+export class OrdersModule {}
+
+@Injectable()
+export class OrdersService {
+  constructor(@Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway) {}
+}
+```
+
+`@Inject(PAYMENT_GATEWAY)`는 `self:paramtypes` 메타데이터에 `{ index: 0, param: PAYMENT_GATEWAY }`를 기록한다. Injector는 `design:paramtypes`의 `Object` 대신 이 토큰을 사용한다. Custom provider 문법 자체는 Provider & DI 문서를 참고.
+
+### design:paramtypes가 깨지는 상황
+
+| 상황 | 결과 | 해결 |
+| --- | --- | --- |
+| `import type { Foo }`로 가져온 클래스를 주입 | 타입 전용 import는 지워지므로 `Object`가 들어감 | 일반 `import` 사용 |
+| 순환 import로 아직 평가되지 않은 클래스 참조 | 배열에 `undefined`가 들어감 | `forwardRef(() => Foo)` 또는 구조 개선 |
+| esbuild 기반 도구(tsx, 기본 Vitest)로 실행 | esbuild는 `emitDecoratorMetadata`를 지원하지 않음 → 메타데이터 없음 | SWC(`decoratorMetadata: true`) 또는 `unplugin-swc` 사용 |
+| 클래스에 데코레이터가 하나도 없음 | TS는 데코레이터가 있는 선언에만 메타데이터 출력 | `@Injectable()` 붙이기 |
+
+> **주의**: 마지막 항목이 `@Injectable()`이 "필요한" 진짜 이유 중 하나다. 생성자 의존성이 있는 provider에 데코레이터가 없으면 `design:paramtypes`가 출력되지 않아 주입이 실패한다.
+
+## Nest 데코레이터의 실체
+
+> **비유**: `@Controller('users')`는 상자에 "users 창고로 보낼 것"이라는 스티커를 붙이는 일이지, 상자를 직접 옮기는 일이 아니다. 운반은 라우터 탐색기(RoutesResolver)가 나중에 한다.
+
+Nest의 클래스 데코레이터 구현은 놀라울 만큼 짧다. 핵심만 추리면 다음과 같다(실제 소스를 단순화).
+
+```ts
+// @nestjs/common/decorators/core/injectable.decorator.ts (단순화)
+export function Injectable(options?: InjectableOptions): ClassDecorator {
+  return (target: object) => {
+    Reflect.defineMetadata(INJECTABLE_WATERMARK, true, target); // '__injectable__'
+    Reflect.defineMetadata(SCOPE_OPTIONS_METADATA, options, target); // 'scope:options'
+  };
+}
+
+// @nestjs/common/decorators/core/controller.decorator.ts (단순화)
+export function Controller(prefixOrOptions?: string | ControllerOptions): ClassDecorator {
+  const path = typeof prefixOrOptions === 'string' ? prefixOrOptions : prefixOrOptions?.path ?? '/';
+  return (target: object) => {
+    Reflect.defineMetadata(CONTROLLER_WATERMARK, true, target); // '__controller__'
+    Reflect.defineMetadata(PATH_METADATA, path, target); // 'path'
+    // host, scope, version 옵션도 각각 메타데이터로 저장
+  };
+}
+
+// @nestjs/common/decorators/modules/module.decorator.ts (단순화)
+export function Module(metadata: ModuleMetadata): ClassDecorator {
+  return (target) => {
+    for (const property in metadata) {
+      Reflect.defineMetadata(property, (metadata as any)[property], target);
+      // 'imports', 'providers', 'controllers', 'exports' 키로 저장
+    }
+  };
+}
+```
+
+메서드 데코레이터도 같은 패턴이다.
+
+```ts
+// @Get('profile')은 대략 이렇게 동작
+Reflect.defineMetadata('path', 'profile', descriptor.value);
+Reflect.defineMetadata('method', RequestMethod.GET, descriptor.value);
+```
+
+### 주요 메타데이터 키 정리
+
+| 데코레이터 | 저장 대상 | 메타데이터 키(상수 값) |
+| --- | --- | --- |
+| `@Injectable()` | 클래스 | `__injectable__`, `scope:options` |
+| `@Controller()` | 클래스 | `__controller__`, `path`, `host`, `scope:options` |
+| `@Module()` | 클래스 | `imports`, `providers`, `controllers`, `exports` |
+| `@Global()` | 클래스 | `__module:global__` |
+| `@Get()` 등 | 메서드 함수 | `path`, `method` |
+| `@Body()`, `@Param()` 등 | 컨트롤러 클래스 + 메서드 이름 | `__routeArguments__` |
+| `@Inject(token)` | 클래스(생성자) | `self:paramtypes` |
+| `@Optional()` | 클래스(생성자) | `optional:paramtypes` |
+| `@UseGuards()` | 클래스 또는 메서드 | `__guards__` |
+
+> **포인트**: 위 키 이름은 내부 구현이므로 앱 코드에서 직접 의존하면 안 된다. "Nest 데코레이터 = 메타데이터 저장"이라는 **구조**를 이해하는 것이 목적이다.
+
+### 부트스트랩에서 메타데이터가 소비되는 흐름
+
+1. `NestFactory.create(AppModule)` 호출.
+2. **DependenciesScanner**가 `AppModule`의 `imports` 메타데이터를 따라 모듈 그래프를 만든다.
+3. 각 모듈의 `providers`, `controllers`를 컨테이너에 등록한다.
+4. **InstanceLoader**가 `design:paramtypes` + `self:paramtypes`를 읽어 인스턴스를 생성한다.
+5. **RoutesResolver / RouterExplorer**가 컨트롤러의 `path`와 각 메서드의 `path`, `method`를 읽어 Express/Fastify 라우트를 등록한다.
+6. 각 핸들러에 대해 `__routeArguments__`, `__guards__`, `__interceptors__` 등을 읽어 실행 컨텍스트(파라미터 추출기, enhancer 체인)를 미리 조립한다.
+
+> **포인트**: 메타데이터 읽기와 체인 조립은 **부트스트랩 때 한 번** 일어난다. 요청 처리 중에 매번 데코레이터를 해석하는 비용은 없다.
+
+## SetMetadata와 Reflector
+
+> **비유**: `SetMetadata`는 **포스트잇에 메모를 적어 붙이는 손**이고, `Reflector`는 **그 포스트잇을 읽는 눈**이다. 쓰는 쪽과 읽는 쪽이 같은 키를 약속해야 한다.
+
+Nest가 정의하지 않은 "우리 앱만의 정보"(필요 권한, 공개 여부, 캐시 TTL 등)를 핸들러에 붙이고 싶을 때 쓴다.
+
+### SetMetadata로 쓰기
+
+```ts
+import { SetMetadata } from '@nestjs/common';
+
+export const IS_PUBLIC_KEY = 'isPublic';
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+
+export const ROLES_KEY = 'roles';
+export const Roles = (...roles: string[]) => SetMetadata(ROLES_KEY, roles);
+```
+
+`SetMetadata`는 클래스에 붙으면 클래스에, 메서드에 붙으면 **메서드 함수 자체**(`descriptor.value`)에 메타데이터를 저장한다.
+
+### Reflector로 읽기
+
+`Reflector`는 `@nestjs/core`가 제공하는 provider로, 어디서든 주입받을 수 있다.
+
+```ts
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const roles = this.reflector.get<string[]>(ROLES_KEY, context.getHandler());
+    if (!roles) return true;
+
+    const { user } = context.switchToHttp().getRequest();
+    return roles.some((role) => user?.roles?.includes(role));
+  }
+}
+```
+
+### 세 가지 읽기 메서드
+
+| 메서드 | 동작 | 용도 |
+| --- | --- | --- |
+| `get(key, target)` | 대상 하나에서 읽음 | 메서드 또는 클래스 한 곳만 볼 때 |
+| `getAllAndOverride(key, targets)` | 배열 순서대로 보고 **처음 나온 `undefined`가 아닌 값** 반환 | 메서드가 클래스 설정을 덮어쓰게 할 때 |
+| `getAllAndMerge(key, targets)` | 모든 대상의 값을 **합침**(배열은 concat, 객체는 병합) | 클래스 + 메서드 권한을 누적할 때 |
+
+```ts
+@Controller('reports')
+@Roles('manager')
+export class ReportsController {
+  @Get()
+  list() {}
+
+  @Get('salary')
+  @Roles('admin')
+  salary() {}
+}
+
+// salary 핸들러 기준
+this.reflector.getAllAndOverride<string[]>(ROLES_KEY, [
+  context.getHandler(),
+  context.getClass(),
+]); // ['admin'] → 메서드 값이 우선
+
+this.reflector.getAllAndMerge<string[]>(ROLES_KEY, [
+  context.getHandler(),
+  context.getClass(),
+]); // ['admin', 'manager'] → 둘 다 합침
+```
+
+> **포인트**: `getAllAndOverride`에 넘기는 배열 순서가 곧 우선순위다. 보통 `[context.getHandler(), context.getClass()]` 순서로 넘겨서 "메서드가 클래스를 이긴다"는 직관적인 규칙을 만든다.
+
+### ExecutionContext의 getHandler와 getClass
+
+`ExecutionContext`는 `ArgumentsHost`를 확장해 "지금 어떤 핸들러가 실행되려는가"를 알려준다.
+
+| 메서드 | 반환 | 예시 |
+| --- | --- | --- |
+| `getHandler()` | 실행될 메서드 함수 참조 | `ReportsController.prototype.salary` |
+| `getClass()` | 컨트롤러 클래스(생성자) | `ReportsController` |
+| `getType()` | 컨텍스트 종류 | `'http'`, `'rpc'`, `'ws'`, GraphQL이면 `'graphql'` |
+
+`SetMetadata`가 메서드에 붙으면 메서드 함수 객체에, 클래스에 붙으면 클래스 객체에 저장되므로, 정확히 이 두 참조가 `Reflector`의 대상이 된다.
+
+### 전역 Guard에서 @Public 처리
+
+```ts
+@Injectable()
+export class JwtAuthGuard implements CanActivate {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly jwt: JwtService,
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (isPublic) return true;
+
+    const req = context.switchToHttp().getRequest();
+    const token = req.headers.authorization?.replace(/^Bearer /, '');
+    if (!token) throw new UnauthorizedException();
+    req.user = await this.jwt.verifyAsync(token);
+    return true;
+  }
+}
+
+// app.module.ts
+@Module({
+  providers: [{ provide: APP_GUARD, useClass: JwtAuthGuard }],
+})
+export class AppModule {}
+```
+
+> **주의**: `app.useGlobalGuards(new JwtAuthGuard(...))`처럼 직접 `new`하면 `Reflector`를 손으로 넘겨야 한다. DI를 받으려면 `APP_GUARD` provider로 등록하는 편이 낫다.
+
+## Reflector.createDecorator (v10.2+)
+
+> **비유**: `SetMetadata`가 "아무 메모지에 아무 키로 적기"라면, `createDecorator`는 **양식이 인쇄된 전용 메모지**다. 쓰는 쪽과 읽는 쪽이 같은 객체를 공유하므로 키 오타가 생길 수 없고, 타입도 따라온다.
+
+```ts
+import { Reflector } from '@nestjs/core';
+
+export const Roles = Reflector.createDecorator<string[]>();
+```
+
+데코레이터 자체가 키 역할을 하므로 별도의 문자열 상수가 필요 없다.
+
+```ts
+@Controller('admin')
+export class AdminController {
+  @Get('users')
+  @Roles(['admin'])
+  findUsers() {}
+}
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    // 반환 타입이 string[] | undefined로 자동 추론됨
+    const roles = this.reflector.get(Roles, context.getHandler());
+    if (!roles) return true;
+    const user = context.switchToHttp().getRequest().user;
+    return roles.some((r) => user?.roles?.includes(r));
+  }
+}
+```
+
+`transform` 옵션으로 입력 형태와 저장 형태를 다르게 할 수도 있다.
+
+```ts
+export const CacheTtl = Reflector.createDecorator<number, number>({
+  transform: (seconds) => seconds * 1000, // 초로 받아서 ms로 저장
+});
+```
+
+| 비교 | `SetMetadata` | `Reflector.createDecorator` |
+| --- | --- | --- |
+| 키 관리 | 문자열 상수 직접 관리 | 데코레이터 객체가 키 |
+| 읽기 타입 | 제네릭 직접 지정 | 자동 추론 |
+| 인자 형태 | 자유(가변 인자 가능) | 값 하나(배열 등) |
+| 지원 버전 | 모든 버전 | v10.2 이상 |
+
+> **주의**: `createDecorator`로 만든 `Roles`는 `Roles(['admin'])`처럼 **값 하나**를 받는다. 기존 `SetMetadata` 스타일의 `Roles('admin', 'user')` 가변 인자와 호출 형태가 다르니 마이그레이션할 때 조심하자.
+
+## 커스텀 파라미터 데코레이터: createParamDecorator
+
+> **비유**: `@Body()`, `@Param()`이 Nest가 미리 만들어 둔 **기성 국자**라면, `createParamDecorator`는 원하는 모양의 국자를 직접 깎는 도구다. "요청 냄비에서 `user`만 떠 와라" 같은 국자를 만들 수 있다.
+
+```ts
+import { createParamDecorator, ExecutionContext } from '@nestjs/common';
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  roles: string[];
+}
+
+export const CurrentUser = createParamDecorator(
+  (data: keyof AuthUser | undefined, ctx: ExecutionContext) => {
+    const request = ctx.switchToHttp().getRequest();
+    const user = request.user as AuthUser | undefined;
+    return data ? user?.[data] : user;
+  },
+);
+```
+
+```ts
+@Controller('me')
+export class MeController {
+  @Get()
+  profile(@CurrentUser() user: AuthUser) {
+    return user;
+  }
+
+  @Get('id')
+  myId(@CurrentUser('id') userId: string) {
+    return { userId };
+  }
+}
+```
+
+### 내부 동작
+
+1. `@CurrentUser('id')`는 `__routeArguments__` 메타데이터에 "N번째 파라미터는 custom 타입, factory는 이 함수, data는 `'id'`"를 기록한다.
+2. 부트스트랩 시 Nest가 이 정보로 파라미터 추출 함수를 미리 만든다.
+3. 요청이 오면 Guard → Interceptor(before)를 지난 뒤, factory를 `(data, ctx)`로 호출해 값을 얻는다.
+4. 그 값이 파이프를 거쳐 핸들러 인자로 들어간다.
+
+> **포인트**: factory는 Guard **이후**에 실행되므로, 인증 Guard가 `request.user`를 채워 둔 상태를 전제로 쓸 수 있다.
+
+### 파이프와 함께 쓰기
+
+```ts
+@Get()
+profile(@CurrentUser(new ValidationPipe({ validateCustomDecorators: true })) user: AuthUserDto) {
+  return user;
+}
+```
+
+> **주의**: 전역 `ValidationPipe`는 기본적으로 커스텀 파라미터 데코레이터의 값을 **검증하지 않는다**. 검증이 필요하면 `validateCustomDecorators: true` 옵션을 켜야 한다.
+
+### GraphQL 등 다른 컨텍스트 지원
+
+```ts
+export const CurrentUser = createParamDecorator((data: unknown, ctx: ExecutionContext) => {
+  if (ctx.getType<'http' | 'graphql'>() === 'graphql') {
+    // GqlExecutionContext는 @nestjs/graphql에서 import
+    return GqlExecutionContext.create(ctx).getContext().req.user;
+  }
+  return ctx.switchToHttp().getRequest().user;
+});
+```
+
+## applyDecorators로 데코레이터 합성
+
+> **비유**: 매번 "취급주의 + 냉장 + 이쪽이 위" 스티커 세 장을 따로 붙이는 대신, 세 개가 합쳐진 **세트 스티커**를 한 장 만들어 쓰는 것이다.
+
+인증 관련 데코레이터는 보통 여러 개가 같이 붙는다. `applyDecorators`로 하나로 묶을 수 있다.
+
+```ts
+import { applyDecorators, SetMetadata, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiForbiddenResponse, ApiUnauthorizedResponse } from '@nestjs/swagger';
+
+export function Auth(...roles: string[]) {
+  return applyDecorators(
+    SetMetadata(ROLES_KEY, roles),
+    UseGuards(JwtAuthGuard, RolesGuard),
+    ApiBearerAuth(),
+    ApiUnauthorizedResponse({ description: 'Unauthorized' }),
+    ApiForbiddenResponse({ description: 'Forbidden' }),
+  );
+}
+```
+
+```ts
+@Controller('billing')
+export class BillingController {
+  @Post('refund')
+  @Auth('admin')
+  refund(@Body() dto: RefundDto) {}
+
+  @Get('invoices')
+  @Auth('admin', 'accountant')
+  invoices() {}
+}
+```
+
+`applyDecorators`의 구현은 단순하다. 받은 데코레이터 배열을 **같은 target에 순서대로 적용**하는 데코레이터 하나를 반환한다. 그래서 클래스와 메서드 양쪽에 붙일 수 있다.
+
+> **포인트**: Guard의 실행 순서는 `UseGuards(JwtAuthGuard, RolesGuard)`에 적은 순서다. 인증(JWT) → 인가(Roles) 순서를 합성 데코레이터 안에 고정해 두면 실수할 여지가 줄어든다.
+
+### 합성 데코레이터 설계 팁
+
+| 상황 | 추천 |
+| --- | --- |
+| 공개 API 표시 | `Public()` 하나만 두고 전역 Guard가 확인 |
+| 인증 + 역할 + Swagger | `Auth(...roles)`로 합성 |
+| 반복되는 응답 문서화 | `ApiPaginatedResponse(Model)` 같은 합성 데코레이터 |
+| 여러 컨텍스트 공통 파라미터 | `createParamDecorator` 안에서 `getType()` 분기 |
+
+## 셀프 체크
+
+**Q1. `@Injectable()`을 붙이지 않은 클래스가 생성자 의존성을 가지면 왜 주입이 실패하는가?**
+
+**A.** TS 컴파일러는 데코레이터가 붙은 선언에만 `design:paramtypes` 메타데이터를 출력한다. 데코레이터가 하나도 없으면 생성자 파라미터 타입 정보가 JS에 남지 않으므로, Nest Injector가 무엇을 주입해야 할지 알 수 없다.
+
+**Q2. 생성자 파라미터 타입을 interface로 선언하면 컴파일된 JS에는 무엇이 들어가며, 어떻게 해결하는가?**
+
+**A.** interface는 런타임에 존재하지 않으므로 `design:paramtypes` 배열에 `Object`가 들어간다. `Symbol`이나 문자열 같은 런타임 토큰으로 provider를 등록하고 `@Inject(TOKEN)`으로 주입 위치를 지정해 해결한다.
+
+**Q3. `getAllAndOverride`와 `getAllAndMerge`의 차이를 클래스에 `@Roles('manager')`, 메서드에 `@Roles('admin')`이 있는 경우로 설명하라.**
+
+**A.** `[getHandler(), getClass()]` 순서로 넘길 때 `getAllAndOverride`는 처음 발견한 값인 `['admin']`만 반환하고, `getAllAndMerge`는 두 값을 합친 `['admin', 'manager']`를 반환한다.
+
+**Q4. 데코레이터는 언제 실행되며, 같은 대상에 여러 개가 붙어 있을 때 적용 순서는?**
+
+**A.** 클래스 정의가 평가되는 시점(모듈 로드 시)에 한 번 실행된다. 팩토리 표현식은 위에서 아래로 평가되고, 반환된 데코레이터 함수는 아래에서 위로 적용된다. 클래스 데코레이터는 멤버 데코레이터가 모두 처리된 뒤 마지막에 적용된다.
+
+**Q5. Vitest(esbuild 기반)로 Nest 서비스를 테스트했더니 의존성이 `undefined`로 들어온다. 원인과 해결책은?**
+
+**A.** esbuild는 `emitDecoratorMetadata`를 지원하지 않아 `design:paramtypes`가 생성되지 않기 때문이다. `unplugin-swc` 같은 SWC 플러그인으로 변환기를 바꾸고 `decoratorMetadata` 옵션을 켜면 해결된다.
+
+## 핵심 정리
+
+- 데코레이터는 클래스 정의 시점에 한 번 실행되는 함수이며, Nest 데코레이터는 대부분 `Reflect.defineMetadata`로 메타데이터를 저장하는 일만 한다.
+- `emitDecoratorMetadata`가 생성자 파라미터 타입을 `design:paramtypes`로 JS에 남기고, Nest Injector는 이를 읽어 토큰별 인스턴스를 찾아 `new`를 호출한다.
+- interface, `import type`, 순환 import, esbuild 환경에서는 타입 정보가 사라지거나 깨진다. 런타임 토큰과 `@Inject`, `forwardRef`, SWC로 대응한다.
+- 커스텀 메타데이터는 `SetMetadata` 또는 타입 안전한 `Reflector.createDecorator`로 쓰고, Guard/Interceptor에서 `Reflector.get / getAllAndOverride / getAllAndMerge`로 읽는다.
+- `ExecutionContext.getHandler()`와 `getClass()`는 메타데이터가 저장된 정확한 대상(메서드 함수, 컨트롤러 클래스)을 돌려준다.
+- `createParamDecorator`는 요청에서 값을 꺼내는 재사용 가능한 추출기를, `applyDecorators`는 여러 데코레이터를 한 이름으로 묶는 합성 수단을 제공한다.

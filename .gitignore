@@ -1,0 +1,12 @@
+node_modules
+.next
+out
+.vercel
+*.tsbuildinfo
+next-env.d.ts
+.env*.local
+.DS_Store
+.env*
+# Artifact 빌드 결과물과 로컬 도구 설정
+artifact/
+.claude/

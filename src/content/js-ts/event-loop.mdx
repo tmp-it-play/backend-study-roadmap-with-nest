@@ -1,0 +1,600 @@
+---
+title: "이벤트 루프"
+description: "싱글 스레드 JS가 비동기를 처리하는 원리. Call Stack, Task Queue, Microtask Queue의 실행 순서와 Node.js 이벤트 루프 phase, 블로킹 해결법까지."
+order: 7
+---
+
+## 한눈에 보기
+
+- JS 코드는 **Call Stack 하나**에서 실행되는 싱글 스레드지만, 타이머·네트워크·I/O는 브라우저(Web APIs)나 Node(libuv)가 대신 처리한다.
+- 끝난 작업의 콜백은 큐에서 기다리고, **이벤트 루프**가 Call Stack이 비었을 때 꺼내서 실행한다.
+- 순서 규칙: 동기 코드 → **Microtask 전부** → 렌더링 → **Task 하나** → 반복.
+- `await` 뒤 코드는 microtask로 예약된다. Node에서는 `process.nextTick`이 Promise보다도 먼저다.
+- CPU를 오래 쓰는 동기 작업은 모든 걸 멈춘다 → 청크 분할 또는 Worker로 분리.
+
+## JS는 싱글 스레드다
+
+> **비유**: 셰프(JS 엔진)는 **한 명**이고 도마(Call Stack)도 **하나**다. 하지만 주방에는 오븐, 타이머, 배달 기사 같은 보조 인력(Web APIs / libuv)이 있다. 셰프는 "오븐에 넣고 20분 뒤 알려줘"라고 맡기고 다른 요리를 한다. 오븐이 끝나면 알림 쪽지가 **주문 대기 선반**(큐)에 꽂히고, 홀 매니저(이벤트 루프)가 셰프의 도마가 비었을 때 쪽지를 건넨다.
+
+JavaScript 엔진(V8 등)은 **하나의 Call Stack**만 가진다. 즉 한 번에 하나의 코드만 실행한다. 그런데 어떻게 `setTimeout`, `fetch`, 파일 I/O 같은 작업을 동시에 처리하는 것처럼 보일까?
+
+비밀은 **엔진 바깥의 런타임 환경**에 있다.
+
+- 브라우저: Web APIs (타이머, 네트워크, DOM 이벤트 등을 브라우저가 별도 스레드에서 처리)
+- Node.js: libuv (스레드 풀 + OS의 비동기 I/O 기능 epoll / kqueue / IOCP 사용)
+
+엔진은 "이 일 좀 해주고 끝나면 이 콜백 실행해줘"라고 런타임에 맡기고, 런타임은 작업이 끝나면 콜백을 **큐**에 넣는다. 그리고 **이벤트 루프**가 Call Stack이 비었을 때 큐에서 콜백을 꺼내 실행한다.
+
+> **포인트**: JS 코드 실행은 싱글 스레드지만, 런타임 전체는 멀티 스레드다. "JS는 싱글 스레드"라는 말은 "내 코드가 실행되는 Call Stack이 하나"라는 뜻이다.
+
+## 구성 요소
+
+### Call Stack
+
+> **비유**: 접시 쌓기. 새 접시(함수 호출)는 맨 위에 올리고, 치울 때도 맨 위부터 치운다(LIFO).
+
+함수 호출이 쌓이는 LIFO 구조. 함수가 호출되면 push, return 하면 pop 된다.
+
+```js
+function c() { console.log("c"); }
+function b() { c(); }
+function a() { b(); }
+a();
+```
+
+```text
+실행 중 Call Stack 변화
+
+[a]  →  [a, b]  →  [a, b, c]  →  [a, b]  →  [a]  →  []
+```
+
+스택이 너무 깊어지면 `RangeError: Maximum call stack size exceeded`가 발생한다.
+
+### Heap
+
+객체, 배열, 클로저 등이 저장되는 비구조화된 메모리 영역. GC(Garbage Collector)가 관리한다.
+
+### Web APIs / libuv
+
+비동기 작업을 실제로 수행하는 곳. JS 엔진 자체에는 `setTimeout`도 `fetch`도 없다. 모두 호스트 환경이 제공한다.
+
+### Task Queue (Macrotask Queue)
+
+> **비유**: 은행의 **일반 번호표 창구**. 한 번에 한 명씩 호출된다.
+
+다음 콜백들이 들어간다.
+
+- `setTimeout`, `setInterval`
+- I/O 콜백, 네트워크 응답
+- DOM 이벤트 (click, keydown 등)
+- `MessageChannel`, `postMessage`
+- Node.js의 `setImmediate`
+
+### Microtask Queue
+
+> **비유**: 은행의 **VIP 창구**. 일반 손님 한 명의 업무가 끝날 때마다, VIP 대기줄을 **한 명도 남김없이** 먼저 처리한다. VIP 처리 중에 새 VIP가 오면 그 사람까지 처리한다.
+
+우선순위가 더 높은 큐. 다음 콜백들이 들어간다.
+
+- Promise의 `then` / `catch` / `finally` 콜백
+- `await` 이후의 코드
+- `queueMicrotask(fn)`
+- `MutationObserver` 콜백
+
+```js
+queueMicrotask(() => console.log("microtask"));
+setTimeout(() => console.log("task"), 0);
+// microtask
+// task
+```
+
+## 전체 구조
+
+```text
+┌──────────────────────────── JS Engine ────────────────────────────┐
+│                                                                    │
+│   ┌──────────────┐            ┌─────────────────────────────┐      │
+│   │  Call Stack  │            │            Heap             │      │
+│   │              │            │   objects, closures, ...    │      │
+│   │   fn3()      │            └─────────────────────────────┘      │
+│   │   fn2()      │                                                 │
+│   │   fn1()      │                                                 │
+│   │   main()     │                                                 │
+│   └──────┬───────┘                                                 │
+└──────────┼─────────────────────────────────────────────────────────┘
+           │ 비동기 API 호출
+           ▼
+┌─────────────────────────────────────┐
+│  Web APIs (브라우저) / libuv (Node)   │
+│  timer, fetch, DOM event, fs ...    │
+└──────────────┬──────────────────────┘
+               │ 작업 완료 → 콜백 등록
+       ┌───────┴────────────────┐
+       ▼                        ▼
+┌──────────────────┐   ┌──────────────────────┐
+│ Microtask Queue  │   │ Task (Macro) Queue   │
+│ then, await,     │   │ setTimeout, I/O,     │
+│ queueMicrotask   │   │ click, message       │
+└────────┬─────────┘   └──────────┬───────────┘
+         │                        │
+         └──────────┬─────────────┘
+                    ▼
+            ┌───────────────┐
+            │  Event Loop   │  스택이 비면 큐에서 꺼내 실행
+            └───────────────┘
+```
+
+## 실행 순서 규칙
+
+> **비유**: 학교 선생님의 하루. 지금 하던 수업(동기 코드)을 끝까지 하고 → 쉬는 시간에 급한 질문(microtask)을 **줄 선 학생 전부** 받아주고 → 칠판 정리(렌더링) → 다음 수업(task) **하나** 시작.
+
+브라우저 이벤트 루프의 한 바퀴(tick)는 다음과 같다.
+
+```text
+1. Call Stack의 동기 코드를 끝까지 실행한다 (스크립트 자체도 하나의 Task)
+2. Call Stack이 비면 → Microtask Queue를 "완전히 빌 때까지" 전부 실행
+   (실행 중 새로 추가된 microtask도 이번에 같이 실행)
+3. 필요하면 렌더링 (requestAnimationFrame → Style → Layout → Paint)
+4. Task Queue에서 Task "하나"를 꺼내 실행
+5. 다시 2번으로
+```
+
+핵심은 두 가지다.
+
+- **Microtask는 한 번에 전부, Task는 한 번에 하나.**
+- Microtask를 무한히 추가하면 Task와 렌더링이 영원히 실행되지 않는다 (화면 멈춤).
+
+> **주의**: microtask 안에서 계속 microtask를 추가하면 Task와 렌더링 차례가 영원히 오지 않는다. 무한 루프와 똑같이 화면이 얼어붙는다.
+
+```js
+// X 브라우저가 멈춘다: microtask가 끝나지 않음
+function loop() {
+  Promise.resolve().then(loop);
+}
+loop();
+
+// O 화면은 계속 그려진다: task 사이사이 렌더링 기회가 있음
+function loop2() {
+  setTimeout(loop2, 0);
+}
+loop2();
+```
+
+> **주의**: `setTimeout(fn, 0)`은 "0ms 후 실행"이 아니라 "최소 0ms 후 Task Queue에 넣기"다. 앞에 쌓인 Task, 모든 Microtask, 렌더링이 먼저 처리된다. 브라우저는 중첩 타이머를 최소 4ms로 clamp 하기도 한다.
+
+위 규칙을 실제 코드로 한 단계씩 따라가 봅시다.
+
+```sim
+event-loop
+```
+
+## 출력 순서 퀴즈
+
+푸는 요령은 항상 같다.
+
+1. 동기 코드를 위에서부터 실행하며 출력을 적는다. 동시에 Task 큐, Microtask 큐에 무엇이 쌓이는지 메모한다.
+2. 동기 코드가 끝나면 Microtask 큐를 **전부** 비운다 (새로 생긴 것도 포함).
+3. Task 큐에서 **하나** 꺼내 실행하고, 다시 2번으로.
+
+### 퀴즈 1: 기본
+
+```js
+console.log("1");
+
+setTimeout(() => console.log("2"), 0);
+
+Promise.resolve().then(() => console.log("3"));
+
+console.log("4");
+```
+
+**정답**: `1 → 4 → 3 → 2`
+
+**해설**
+
+```text
+[동기 실행]
+  console.log("1")              → 출력 1
+  setTimeout 콜백               → Task Queue: [log2]
+  then 콜백                     → Microtask Queue: [log3]
+  console.log("4")              → 출력 4
+
+[스택 빔 → Microtask 전부]
+  log3                          → 출력 3
+
+[Task 하나]
+  log2                          → 출력 2
+```
+
+### 퀴즈 2: 중첩
+
+```js
+console.log("A");
+
+setTimeout(() => {
+  console.log("B");
+  Promise.resolve().then(() => console.log("C"));
+}, 0);
+
+Promise.resolve().then(() => {
+  console.log("D");
+  setTimeout(() => console.log("E"), 0);
+});
+
+setTimeout(() => console.log("F"), 0);
+
+console.log("G");
+```
+
+**정답**: `A → G → D → B → C → F → E`
+
+**해설**
+
+```text
+[동기 실행]
+  출력 A
+  Task Queue:      [T_B]
+  Microtask Queue: [M_D]
+  Task Queue:      [T_B, T_F]
+  출력 G
+
+[Microtask 전부]
+  M_D 실행 → 출력 D, Task Queue: [T_B, T_F, T_E]
+
+[Task 하나: T_B]
+  출력 B, Microtask Queue: [M_C]
+[Microtask 전부]
+  출력 C        ← F보다 먼저! task 하나 끝날 때마다 microtask를 비우기 때문
+
+[Task 하나: T_F]  → 출력 F
+[Task 하나: T_E]  → 출력 E
+```
+
+E가 F보다 늦는 이유는 E의 타이머가 D 안에서, 즉 F보다 **나중에** 등록됐기 때문이다.
+
+### 퀴즈 3: async/await
+
+```js
+async function a1() {
+  console.log("a1 start");
+  await a2();
+  console.log("a1 end");
+}
+
+async function a2() {
+  console.log("a2");
+}
+
+console.log("script start");
+
+setTimeout(() => console.log("timeout"), 0);
+
+a1();
+
+new Promise((resolve) => {
+  console.log("p1");
+  resolve();
+}).then(() => console.log("p2"));
+
+console.log("script end");
+```
+
+**정답**
+
+```text
+script start
+a1 start
+a2
+p1
+script end
+a1 end
+p2
+timeout
+```
+
+**해설**
+
+- async 함수는 첫 `await`를 만나기 전까지 **동기적으로** 실행된다. 그래서 `a1 start`, `a2`가 바로 찍힌다.
+- `await a2()`에서 a1은 멈추고, 나머지 코드(`a1 end`)는 microtask로 예약된다.
+- `new Promise`의 executor 함수도 **동기적으로** 실행된다 → `p1`.
+- 동기 코드가 끝나면 microtask가 등록 순서대로 실행된다 → `a1 end`, `p2`.
+- 마지막으로 Task인 `timeout`.
+
+### 퀴즈 4: Node.js (CommonJS 기준)
+
+```js
+setTimeout(() => console.log("timeout"), 0);
+setImmediate(() => console.log("immediate"));
+process.nextTick(() => console.log("nextTick"));
+Promise.resolve().then(() => console.log("promise"));
+console.log("sync");
+```
+
+**정답**
+
+```text
+sync
+nextTick
+promise
+timeout      ← 이 둘의 순서는
+immediate    ← 실행할 때마다 바뀔 수 있다!
+```
+
+**해설**
+
+- `process.nextTick` 큐는 Promise microtask 큐보다도 **먼저** 비워진다.
+- 메인 모듈에서 `setTimeout(0)`과 `setImmediate`의 순서는 **비결정적**이다. 이벤트 루프 진입 시점에 1ms 타이머가 이미 만료됐는지 여부(프로세스 성능)에 따라 달라진다.
+- 참고로 ESM(`.mjs`)에서는 모듈 평가 자체가 Promise 안에서 일어나서 `promise`가 `nextTick`보다 먼저 찍힐 수 있다.
+
+## Node.js 이벤트 루프
+
+> **비유**: 놀이공원의 **순환 셔틀버스**. 정류장(phase)이 정해진 순서대로 있고, 버스는 각 정류장에서 기다리는 승객(콜백)을 태워 처리한 뒤 다음 정류장으로 간다. timers 정류장 → ... → poll 정류장(여기서 손님이 없으면 잠시 대기) → check 정류장 → close 정류장 → 다시 timers.
+
+Node.js의 이벤트 루프는 libuv가 구현하며, 여러 **phase**를 순서대로 도는 구조다.
+
+```text
+   ┌───────────────────────────┐
+┌─▶│          timers           │  setTimeout, setInterval 콜백
+│  └─────────────┬─────────────┘
+│  ┌─────────────┴─────────────┐
+│  │     pending callbacks     │  이전 루프에서 미뤄진 일부 시스템 I/O 콜백
+│  └─────────────┬─────────────┘
+│  ┌─────────────┴─────────────┐
+│  │       idle, prepare       │  내부용
+│  └─────────────┬─────────────┘      ┌───────────────┐
+│  ┌─────────────┴─────────────┐      │   incoming:   │
+│  │           poll            │◀─────┤  connections, │
+│  └─────────────┬─────────────┘      │   data, etc.  │
+│  ┌─────────────┴─────────────┐      └───────────────┘
+│  │           check           │  setImmediate 콜백
+│  └─────────────┬─────────────┘
+│  ┌─────────────┴─────────────┐
+└──┤      close callbacks      │  socket.on('close') 등
+   └───────────────────────────┘
+
+ * 각 콜백 하나가 끝날 때마다: nextTick 큐 → Promise microtask 큐 비우기
+```
+
+| Phase | 하는 일 |
+| --- | --- |
+| timers | 만료된 `setTimeout` / `setInterval` 콜백 실행 |
+| pending callbacks | 이전 루프에서 미뤄진 TCP 에러 등 일부 시스템 콜백 |
+| idle, prepare | libuv 내부 용도 |
+| poll | 새 I/O 이벤트를 가져오고 I/O 콜백 실행. 할 일이 없으면 여기서 대기(block) |
+| check | `setImmediate` 콜백 실행 |
+| close callbacks | `close` 이벤트 콜백 실행 |
+
+> **포인트**: Node 11부터는 브라우저와 동일하게 **콜백 하나가 끝날 때마다** microtask를 비운다. 그 이전 버전은 phase가 끝날 때 한꺼번에 비웠기 때문에 결과가 달랐다.
+
+### nextTick vs setImmediate vs setTimeout 0
+
+> **비유**: `process.nextTick`은 "지금 하던 말 끝나자마자 바로 끼어들기", Promise는 "그다음 순서로 끼어들기", `setTimeout 0`과 `setImmediate`는 "버스가 다음 바퀴에 해당 정류장에 왔을 때 타기"다. 이름이 직관과 반대라서 헷갈리기 쉽다.
+
+| API | 실행 시점 | 비고 |
+| --- | --- | --- |
+| `process.nextTick` | 현재 작업 직후, Promise microtask보다도 먼저 | 이름과 달리 "다음 tick"이 아니라 "지금 즉시" |
+| `Promise.then` / `queueMicrotask` | nextTick 큐 다음 | 표준 microtask |
+| `setTimeout(fn, 0)` | 다음 timers phase | 실제로는 최소 1ms |
+| `setImmediate` | 다음 check phase | 이름과 달리 즉시가 아님 |
+
+I/O 콜백 **안에서** 호출하면 순서가 항상 결정된다. poll phase 다음이 check phase이기 때문이다.
+
+```js
+const fs = require("fs");
+
+fs.readFile(__filename, () => {
+  setTimeout(() => console.log("timeout"), 0);
+  setImmediate(() => console.log("immediate"));
+});
+// 항상:
+// immediate
+// timeout
+```
+
+> **주의**: `process.nextTick`을 재귀적으로 호출하면 이벤트 루프가 다음 phase로 넘어가지 못해 I/O가 굶는다(starvation). 일반적으로는 `setImmediate`나 `queueMicrotask` 사용이 권장된다.
+
+```js
+// X I/O starvation
+function bad() {
+  process.nextTick(bad);
+}
+```
+
+## async/await는 이벤트 루프에서 어떻게 보이나
+
+> **비유**: 책을 읽다가 `await`를 만나면 **책갈피를 꽂고 책을 덮는다**. 도마(Call Stack)를 다른 사람에게 비워주고, 기다리던 결과가 오면 VIP 창구(microtask) 줄에 서서 차례가 오면 책갈피부터 다시 읽는다.
+
+`await`는 내부적으로 Promise의 `then`과 같다. 아래 두 코드는 거의 동일하게 동작한다.
+
+```js
+async function f() {
+  console.log(1);
+  const v = await g();
+  console.log(2, v);
+  return v;
+}
+
+// 대략 이렇게 변환된다고 생각하면 된다
+function f2() {
+  console.log(1);
+  return Promise.resolve(g()).then((v) => {
+    console.log(2, v);
+    return v;
+  });
+}
+```
+
+즉,
+
+1. `await` **이전** 코드는 동기적으로 실행된다.
+2. `await`를 만나면 함수 실행 컨텍스트가 Call Stack에서 **빠져나간다** (스레드를 막지 않음).
+3. 기다리던 Promise가 settled 되면 **나머지 코드가 microtask로 예약**된다.
+4. 다른 microtask들과 순서대로 경쟁하며 재개된다.
+
+```js
+async function run() {
+  console.log("A");
+  await null;           // 이미 resolve된 값이라도 반드시 한 번 양보한다
+  console.log("B");
+}
+
+run();
+console.log("C");
+// A
+// C
+// B
+```
+
+> **포인트**: `await`는 이미 resolve된 값에도 무조건 microtask 한 번을 양보한다. 그래서 await 뒤 코드는 절대 동기적으로 실행되지 않는다.
+
+## 블로킹 작업 문제
+
+> **비유**: 셰프가 혼자 감자 1만 개를 깎기 시작하면 그동안 다른 주문은 전부 멈춘다. 해결책은 두 가지다. ① 100개 깎을 때마다 잠깐 다른 주문을 처리하거나(청크 분할), ② 감자 깎는 알바(Worker)를 따로 고용하거나.
+
+이벤트 루프는 Call Stack이 비어야만 다음 일을 할 수 있다. CPU를 오래 쓰는 동기 작업이 있으면 **모든 것이 멈춘다**.
+
+```js
+// 브라우저: 클릭, 스크롤, 애니메이션 전부 멈춤
+// Node: 모든 HTTP 요청 응답 지연
+function heavy() {
+  const end = Date.now() + 3000;
+  while (Date.now() < end) {} // 3초간 Call Stack 점유
+}
+
+setTimeout(() => console.log("1초 뒤 실행돼야 하는데..."), 1000);
+heavy();
+// 3초 뒤에야 출력됨
+```
+
+대표적인 블로킹 원인은 다음과 같다.
+
+- 큰 JSON의 `JSON.parse` / `JSON.stringify`
+- 대용량 배열 정렬, 복잡한 정규식(ReDoS)
+- 이미지/암호화 처리 (`crypto.pbkdf2Sync` 등 Sync API)
+- 동기 파일 API (`fs.readFileSync`)를 요청 처리 중에 사용
+
+### 해결 1: 청크 분할 (Chunking)
+
+작업을 잘게 나누고, 사이사이에 이벤트 루프에 제어권을 돌려준다.
+
+```js
+function processInChunks(items, handler, chunkSize = 1000) {
+  return new Promise((resolve) => {
+    let i = 0;
+
+    function runChunk() {
+      const end = Math.min(i + chunkSize, items.length);
+      for (; i < end; i++) handler(items[i]);
+
+      if (i < items.length) {
+        setTimeout(runChunk, 0); // Node에서는 setImmediate 권장
+      } else {
+        resolve();
+      }
+    }
+
+    runChunk();
+  });
+}
+
+await processInChunks(bigArray, (item) => compute(item));
+```
+
+> **주의**: 여기서 `queueMicrotask`나 `Promise.then`으로 양보하면 **소용이 없다**. microtask는 렌더링이나 다른 Task보다 먼저 전부 실행되기 때문이다. 반드시 Task(`setTimeout`, `setImmediate`, `MessageChannel`)로 양보해야 한다.
+
+브라우저에서는 `scheduler.yield()`(지원 브라우저 한정)로 더 간결하게 쓸 수 있다.
+
+```js
+async function processAll(items) {
+  for (let i = 0; i < items.length; i++) {
+    handle(items[i]);
+    if (i % 500 === 0) await scheduler.yield();
+  }
+}
+```
+
+### 해결 2: 별도 스레드로 보내기
+
+**Node.js: worker_threads**
+
+```js
+// main.js
+const { Worker } = require("worker_threads");
+
+function runHeavy(n) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker("./fib-worker.js", { workerData: n });
+    worker.once("message", resolve);
+    worker.once("error", reject);
+  });
+}
+
+runHeavy(42).then(console.log); // 메인 이벤트 루프는 계속 요청 처리 가능
+```
+
+```js
+// fib-worker.js
+const { parentPort, workerData } = require("worker_threads");
+
+function fib(n) {
+  return n < 2 ? n : fib(n - 1) + fib(n - 2);
+}
+
+parentPort.postMessage(fib(workerData));
+```
+
+**브라우저: Web Worker**
+
+```js
+// main.js
+const worker = new Worker(new URL("./worker.js", import.meta.url));
+worker.postMessage(bigData);
+worker.onmessage = (e) => render(e.data);
+
+// worker.js
+self.onmessage = (e) => {
+  const result = heavyCompute(e.data);
+  self.postMessage(result);
+};
+```
+
+Worker는 별도의 이벤트 루프와 Heap을 가지므로 DOM에 접근할 수 없고, 메시지(structured clone)로만 통신한다.
+
+| 해결책 | 장점 | 단점 |
+| --- | --- | --- |
+| 청크 분할 | 구현 간단, 추가 스레드 없음 | 총 실행 시간은 오히려 늘어남 |
+| Worker | 진짜 병렬 실행, 메인 스레드 완전 해방 | 데이터 복사 비용, 통신 코드 필요 |
+| Sync → Async API | Node의 `fs.promises`, `crypto.pbkdf2` 등은 libuv 스레드 풀 사용 | API가 있는 경우만 가능 |
+
+## 셀프 체크
+
+**Q1. `setTimeout(fn, 0)`의 콜백은 정확히 0ms 뒤에 실행되나?**
+
+**A.** 아니다. "최소 0ms 뒤에 Task Queue에 넣는다"는 뜻일 뿐이다. 현재 동기 코드, 모든 microtask, 렌더링, 앞서 대기 중인 Task가 모두 처리된 뒤에야 실행된다.
+
+**Q2. 다음의 출력 순서는? `setTimeout(() => console.log(1)); Promise.resolve().then(() => console.log(2)); console.log(3);`**
+
+**A.** `3 → 2 → 1`. 동기 코드 3이 먼저, 그다음 microtask인 2, 마지막으로 Task인 1이다.
+
+**Q3. async 함수 안에서 `await` 이전 코드와 이후 코드는 각각 언제 실행되나?**
+
+**A.** `await` 이전 코드는 함수를 호출한 즉시 동기적으로 실행된다. `await` 이후 코드는 기다리던 Promise가 settled 된 뒤 microtask로 예약되어 실행된다. 이미 resolve된 값이라도 최소 한 번은 양보한다.
+
+**Q4. Node.js에서 I/O 콜백 안에서 `setTimeout(0)`과 `setImmediate`를 등록하면 어느 쪽이 먼저인가?**
+
+**A.** 항상 `setImmediate`가 먼저다. I/O 콜백은 poll phase에서 실행되고, 바로 다음이 `setImmediate`를 처리하는 check phase이기 때문이다. timers phase는 다음 바퀴에 온다.
+
+**Q5. 무거운 계산을 청크로 나눌 때 `Promise.resolve().then(next)`로 양보하면 안 되는 이유는?**
+
+**A.** microtask는 렌더링과 다른 Task보다 먼저 **전부** 실행되므로, 결국 쉬지 않고 계산을 이어가는 것과 같다. `setTimeout`, `setImmediate`, `MessageChannel`처럼 Task 단위로 양보해야 사이사이 다른 일이 처리된다.
+
+## 핵심 정리
+
+- JS 엔진은 Call Stack이 하나인 싱글 스레드지만, 비동기 작업은 Web APIs / libuv가 대신 처리한다.
+- 이벤트 루프 규칙: 동기 코드 → **Microtask 전부** → 렌더링 → **Task 하나** → 반복.
+- Microtask: `then`, `await` 이후 코드, `queueMicrotask`, `MutationObserver`. Task: `setTimeout`, I/O, DOM 이벤트, `setImmediate`.
+- `new Promise`의 executor와 async 함수의 첫 `await` 이전 코드는 **동기적으로** 실행된다.
+- `await`는 항상 microtask 한 번을 양보하며, 이후 코드는 `then` 콜백처럼 동작한다.
+- Node 이벤트 루프 phase: timers → pending callbacks → poll → check → close. 콜백 하나마다 nextTick → Promise microtask를 비운다.
+- 우선순위: `process.nextTick` → Promise microtask → `setTimeout 0` / `setImmediate` (메인 모듈에서 둘의 순서는 비결정적, I/O 콜백 안에서는 setImmediate가 먼저).
+- 무거운 동기 작업은 이벤트 루프 전체를 멈춘다 → Task 단위 청크 분할 또는 `worker_threads` / Web Worker로 분리한다.

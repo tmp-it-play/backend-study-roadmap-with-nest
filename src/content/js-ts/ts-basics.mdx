@@ -1,0 +1,681 @@
+---
+title: "TypeScript 기초"
+description: "TypeScript가 필요한 이유, 구조적 타이핑, 기본 타입과 추론, union/intersection, type vs interface, enum 대안, narrowing, 타입 단언의 함정, tsconfig 핵심 옵션과 타입 소거까지 TS 입문에 필요한 모든 것을 정리한다."
+order: 9
+---
+
+## 한눈에 보기
+
+- TypeScript는 JS에 **정적 타입**을 얹어 실행 전에 버그를 잡는 도구이며, 컴파일 후 타입은 **전부 지워진다**.
+- TS는 이름이 아니라 **모양(structure)** 으로 타입 호환성을 판단한다(구조적 타이핑).
+- 외부 입력은 `any` 대신 `unknown`으로 받고, narrowing으로 좁혀서 쓴다.
+- 객체 모양은 `interface`/`type` 둘 다 가능하지만, union이나 계산된 타입은 `type`만 가능하다. enum 대신 union literal이나 `as const` 객체가 요즘 선호된다.
+- `strict: true` + `noUncheckedIndexedAccess`는 새 프로젝트의 기본값으로 켜자.
+
+## 1. TypeScript가 왜 필요한가
+
+> **비유**: JS는 건축 도면 없이 바로 집을 짓는 것이다. 다 짓고 들어가 봐야(런타임) 문이 벽에 막혀 있다는 걸 안다. TS는 착공 전에 도면 검토(컴파일)를 받는 것이다. 도면 검토자는 집이 완성되면 떠나므로(타입 소거) 실제 집에는 아무 흔적도 없다.
+
+```js
+// JavaScript: 실행해야 터진다
+function getLength(user) {
+  return user.name.length;
+}
+getLength({ nmae: "Kim" }); // TypeError: Cannot read properties of undefined (reading 'length')
+```
+
+```ts
+// TypeScript: 저장하는 순간 에디터가 알려준다
+function getLength(user: { name: string }) {
+  return user.name.length;
+}
+getLength({ nmae: "Kim" });
+// error TS2353: Object literal may only specify known properties,
+// and 'nmae' does not exist in type '{ name: string; }'.
+```
+
+TS가 주는 이점은 다음과 같다.
+
+| 이점 | 설명 |
+| --- | --- |
+| 조기 오류 발견 | 오타, `undefined` 접근, 잘못된 인자를 실행 전에 발견 |
+| 에디터 지원 | 자동완성, 정의로 이동, 안전한 rename |
+| 문서 역할 | 함수 시그니처만 봐도 사용법을 앎 |
+| 리팩터링 안정성 | 필드명 하나 바꾸면 영향받는 곳이 전부 빨간 줄 |
+
+> **포인트**: TS는 "런타임 검증 도구"가 아니라 "개발 시점 정적 분석 도구"다. API 응답처럼 외부에서 들어오는 데이터는 TS가 보장하지 못하므로 Zod 같은 런타임 검증이 별도로 필요하다.
+
+## 2. 구조적 타이핑 (Structural Typing)
+
+> **비유**: 오리처럼 걷고 오리처럼 꽥꽥거리면 오리다(덕 타이핑). TS는 출생증명서(클래스 이름)를 확인하지 않고, 필요한 능력(프로퍼티)이 있는지만 본다.
+
+```ts
+interface Point {
+  x: number;
+  y: number;
+}
+
+class Vector {
+  constructor(public x: number, public y: number, public z: number) {}
+}
+
+function printPoint(p: Point) {
+  console.log(p.x, p.y);
+}
+
+const v = new Vector(1, 2, 3);
+printPoint(v); // O OK — Vector는 Point를 implements 안 했지만 x, y가 있으므로 호환
+
+const obj = { x: 1, y: 2, label: "A" };
+printPoint(obj); // O OK — 추가 프로퍼티가 있어도 변수로 넘기면 허용
+```
+
+### 2.1 Excess Property Check (예외 규칙)
+
+```ts
+printPoint({ x: 1, y: 2, label: "A" });
+// X error: Object literal may only specify known properties, and 'label' does not exist in type 'Point'.
+```
+
+**객체 리터럴을 바로 넘길 때만** 추가 프로퍼티를 검사한다. 오타 가능성이 높은 상황이라 TS가 특별히 엄격하게 본다.
+
+> **주의**: 구조적 타이핑 때문에 `UserId`와 `OrderId`가 둘 다 `string`이면 서로 바꿔 넣어도 TS가 못 잡는다. 이를 막는 Branded 타입은 "TypeScript 타입 레벨 프로그래밍" 노트에서 다룬다.
+
+## 3. 기본 타입
+
+> **비유**: 타입은 그릇의 모양이다. 국그릇(`string`)에는 국만, 접시(`number`)에는 반찬만 담는다. `any`는 "아무거나 담아도 되는 비닐봉지", `unknown`은 "내용물 확인 전엔 못 여는 밀봉 택배", `never`는 "절대 존재할 수 없는 그릇"이다.
+
+### 3.1 원시 타입과 배열/튜플
+
+```ts
+let name: string = "Kim";
+let age: number = 30;          // 정수/실수 구분 없음
+let isAdmin: boolean = true;
+let big: bigint = 100n;
+let id: symbol = Symbol("id");
+
+// 배열: 두 표기는 동일
+let scores: number[] = [90, 85];
+let tags: Array<string> = ["ts", "js"];
+
+// 튜플: 길이와 위치별 타입이 고정
+let pair: [string, number] = ["age", 30];
+pair = [30, "age"]; // X Type 'number' is not assignable to type 'string'.
+
+// 이름 붙은 튜플, optional 요소
+type Range = [start: number, end?: number];
+const r: Range = [1];
+```
+
+### 3.2 object
+
+```ts
+let user: { name: string; age: number } = { name: "Kim", age: 30 };
+
+let o: object = { a: 1 };   // 원시값이 아닌 모든 것
+o = [1, 2];                  // O
+o = "str";                   // X Type 'string' is not assignable to type 'object'.
+```
+
+### 3.3 any vs unknown
+
+```ts
+let a: any = JSON.parse("{}");
+a.foo.bar.baz();  // O 컴파일 통과 → 런타임 
+
+let u: unknown = JSON.parse("{}");
+u.foo;            // X error: 'u' is of type 'unknown'.
+
+if (typeof u === "object" && u !== null && "foo" in u) {
+  console.log(u.foo); // O 좁힌 후에만 사용 가능
+}
+```
+
+| 타입 | 아무 값 대입 | 아무 연산 | 다른 타입에 대입 |
+| --- | --- | --- | --- |
+| `any` | 가능 | 가능 (검사 꺼짐) | 가능 |
+| `unknown` | 가능 | 불가 (좁혀야 함) | `any`, `unknown`에만 |
+
+> **포인트**: `any`는 타입 검사를 끄는 스위치이고 **전염된다**(`any`에서 꺼낸 값도 `any`). 모르는 값은 `unknown`으로 받는 습관을 들이자.
+
+### 3.4 void, never, null, undefined
+
+```ts
+function log(msg: string): void {
+  console.log(msg);           // 반환값 없음
+}
+
+function fail(msg: string): never {
+  throw new Error(msg);       // 절대 정상 반환하지 않음
+}
+
+function loop(): never {
+  while (true) {}
+}
+
+let n: null = null;
+let un: undefined = undefined;
+
+// strictNullChecks: true 일 때
+let s: string = null;         // X Type 'null' is not assignable to type 'string'.
+let s2: string | null = null; // O 명시해야 함
+```
+
+| 타입 | 의미 | 대표 용도 |
+| --- | --- | --- |
+| `void` | 반환값을 신경 쓰지 않음 | 콜백, side effect 함수 |
+| `never` | 값이 존재할 수 없음 | throw 함수, exhaustive check |
+| `undefined` | 값 `undefined` 하나 | optional 값 |
+| `null` | 값 `null` 하나 | "의도적으로 없음" |
+
+## 4. 타입 추론
+
+> **비유**: 숙련된 점원은 손님이 말하지 않아도 들고 온 물건만 보고 무엇을 계산할지 안다. TS도 대부분은 초기값을 보고 타입을 알아서 추론한다. 모든 곳에 타입을 적는 건 점원에게 "이건 사과입니다"를 매번 말하는 것과 같다.
+
+```ts
+let count = 0;            // number로 추론
+const nums = [1, 2, 3];   // number[]
+const user = { name: "Kim", age: 30 }; // { name: string; age: number }
+
+function add(a: number, b: number) {
+  return a + b;           // 반환 타입 number로 추론
+}
+
+// 문맥적 타이핑 (contextual typing)
+["a", "b"].map((s) => s.toUpperCase()); // s는 string으로 추론
+```
+
+어디에 타입을 적을지 기준은 다음과 같다.
+
+1. **함수 매개변수**: 반드시 적는다(추론 불가, 안 적으면 암묵적 `any`).
+2. **변수 초기화**: 대부분 생략. 추론이 충분하다.
+3. **함수 반환 타입**: 공개 API, 재귀 함수, 복잡한 함수에는 적는다(의도치 않은 반환 타입 변화 방지).
+4. **빈 배열/나중에 채우는 변수**: 적는다. `const list = []`는 원치 않는 타입이 된다.
+
+## 5. 리터럴 타입과 Widening
+
+> **비유**: `const`는 "이 상자엔 영원히 빨간 공만 들어있다"라고 봉인하는 것이라 TS도 "빨간 공"으로 기억한다. `let`은 "나중에 다른 공으로 바꿀 수 있다"이므로 TS가 "공"이라는 넓은 범주(widening)로 기억한다.
+
+```ts
+const a = "hello";  // 타입: "hello"  (리터럴 타입)
+let b = "hello";    // 타입: string   (widening)
+
+const n = 42;       // 42
+let m = 42;         // number
+
+type Direction = "up" | "down" | "left" | "right";
+function move(d: Direction) {}
+
+let dir = "up";
+move(dir);   // X Argument of type 'string' is not assignable to parameter of type 'Direction'.
+
+const dir2 = "up";
+move(dir2);  // O
+```
+
+객체 프로퍼티도 widening된다.
+
+```ts
+const config = { method: "GET" };   // { method: string }
+fetch("/api", config);              // RequestInit의 method는 string이라 OK지만...
+
+declare function request(m: "GET" | "POST"): void;
+request(config.method);             // X string은 "GET" | "POST"에 할당 불가
+
+// 해결 1: as const
+const config2 = { method: "GET" } as const; // { readonly method: "GET" }
+request(config2.method);            // O
+
+// 해결 2: 타입 명시
+const config3: { method: "GET" | "POST" } = { method: "GET" };
+```
+
+> **포인트**: `as const`는 widening을 막고, 모든 프로퍼티를 `readonly`로, 배열을 readonly 튜플로 만든다. `satisfies`와 조합하는 고급 패턴은 "TypeScript 심화"에서 다룬다.
+
+## 6. Union과 Intersection
+
+> **비유**: Union(`A | B`)은 "커피 **또는** 차" 쿠폰이다. 둘 중 하나가 오므로 둘 다 가진 기능(마실 수 있음)만 안전하게 쓸 수 있다. Intersection(`A & B`)은 "운전면허 **그리고** 요리사 자격증"을 모두 가진 사람이다. 두 자격의 모든 능력을 쓸 수 있다.
+
+```ts
+// Union
+type Id = string | number;
+
+function printId(id: Id) {
+  id.toUpperCase();  // X Property 'toUpperCase' does not exist on type 'number'.
+  if (typeof id === "string") {
+    id.toUpperCase(); // O narrowing 후
+  }
+}
+
+// Intersection
+type HasName = { name: string };
+type HasAge = { age: number };
+type Person = HasName & HasAge;
+
+const p: Person = { name: "Kim", age: 30 }; // 둘 다 필요
+
+// 충돌하는 원시 타입의 intersection은 never
+type Impossible = string & number; // never
+```
+
+| 구분 | Union `A \| B` | Intersection `A & B` |
+| --- | --- | --- |
+| 값의 범위 | 넓어짐 (A이거나 B) | 좁아짐 (A이면서 B) |
+| 쓸 수 있는 멤버 | 공통 멤버만 | 양쪽 멤버 전부 |
+| 대표 용도 | 여러 형태 중 하나 | 타입 합성, mixin |
+
+> **주의**: 집합 관점에서 이름이 직관과 반대처럼 느껴진다. `A | B`는 값 집합의 합집합이라 "할 수 있는 일"은 교집합이 되고, `A & B`는 값 집합의 교집합이라 "할 수 있는 일"은 합집합이 된다.
+
+## 7. type alias vs interface
+
+> **비유**: `interface`는 **확장 가능한 설계도 양식**이라, 같은 이름의 양식을 여러 장 제출하면 하나로 합쳐 준다(선언 병합). `type`은 **별명(alias)** 이라 무엇이든 이름 붙일 수 있지만, 같은 별명을 두 번 붙이면 충돌한다.
+
+```ts
+// 둘 다 객체 모양 정의 가능
+interface UserI {
+  name: string;
+}
+type UserT = {
+  name: string;
+};
+
+// 확장
+interface AdminI extends UserI {
+  role: string;
+}
+type AdminT = UserT & { role: string };
+
+// type만 가능
+type Status = "idle" | "loading" | "done";      // union
+type Pair = [number, number];                    // 튜플
+type Getter = () => string;                      // 함수 (interface도 가능하나 장황)
+type Keys = keyof UserT;                          // 계산된 타입
+
+// interface만 가능: 선언 병합
+interface Window {
+  myGlobal: string;
+}
+// 기존 lib.dom.d.ts의 Window와 합쳐짐
+```
+
+| 항목 | `interface` | `type` |
+| --- | --- | --- |
+| 객체 모양 | 가능 | 가능 |
+| union / 튜플 / 원시 alias | 불가 | 가능 |
+| 확장 방법 | `extends` | `&` (intersection) |
+| 선언 병합 | 가능 (같은 이름 자동 병합) | 불가 (Duplicate identifier 에러) |
+| mapped/conditional 타입 | 불가 | 가능 |
+| `implements` 대상 | 가능 | 객체 타입이면 가능 |
+| 확장 시 충돌 감지 | `extends`에서 즉시 에러 | `&`는 조용히 `never`가 될 수 있음 |
+| 에러 메시지 표시 | 이름으로 표시되어 깔끔 | 펼쳐져서 길어질 때가 있음 |
+
+```ts
+// extends vs & 충돌 처리 차이
+interface A { x: string }
+interface B extends A { x: number }
+// X Interface 'B' incorrectly extends interface 'A'.
+
+type C = { x: string } & { x: number };
+// 에러 없음. C["x"]는 never → 나중에 값 만들 때 당황
+```
+
+> **포인트**: 팀 컨벤션을 하나 정하면 된다. 흔한 기준: "객체 모양·클래스 계약은 `interface`, 그 외(union, 함수, 유틸리티 조합)는 `type`". 라이브러리의 확장 포인트(사용자가 augment해야 하는 것)는 반드시 `interface`로.
+
+## 8. Optional과 Readonly
+
+```ts
+interface Profile {
+  readonly id: string;
+  name: string;
+  bio?: string;          // string | undefined
+}
+
+const p: Profile = { id: "u1", name: "Kim" };
+p.id = "u2";             // X Cannot assign to 'id' because it is a read-only property.
+p.bio?.toUpperCase();    // optional chaining
+
+// readonly 배열
+const list: readonly number[] = [1, 2, 3];
+list.push(4);            // X Property 'push' does not exist on type 'readonly number[]'.
+```
+
+> **주의**: `readonly`는 **얕다**(shallow). `readonly user: User`여도 `user.name`은 바꿀 수 있다. 그리고 컴파일 타임 검사일 뿐 런타임에서 `Object.freeze`처럼 막지 않는다.
+
+> **주의**: `bio?: string`과 `bio: string | undefined`는 다르다. 전자는 키 자체를 생략할 수 있고, 후자는 키를 반드시 써야 한다(`bio: undefined`라도). `exactOptionalPropertyTypes`를 켜면 전자에 `undefined`를 명시적으로 넣는 것도 막는다.
+
+## 9. 함수 타입
+
+```ts
+// 함수 선언
+function greet(name: string, greeting = "Hi"): string {
+  return `${greeting}, ${name}`;
+}
+
+// 함수 타입 표현식
+type BinaryOp = (a: number, b: number) => number;
+const mul: BinaryOp = (a, b) => a * b; // a, b 추론됨
+
+// optional / rest 매개변수
+function sum(label?: string, ...nums: number[]) {
+  return nums.reduce((acc, n) => acc + n, 0);
+}
+
+// call signature (프로퍼티가 있는 함수)
+type Counter = {
+  (): number;
+  reset(): void;
+};
+
+// void 반환 콜백은 반환값을 무시할 뿐 금지하지 않음
+const arr: number[] = [];
+[1, 2].forEach((n) => arr.push(n)); // push는 number 반환하지만 OK
+```
+
+> **포인트**: 함수 오버로드, 제네릭 함수, 매개변수 공변/반공변은 "TypeScript 심화"와 "타입 레벨 프로그래밍" 노트에서 이어서 다룬다.
+
+## 10. 인덱스 시그니처
+
+> **비유**: 사물함 번호가 미리 정해지지 않은 보관소다. "어떤 이름표든 붙일 수 있지만, 안에는 반드시 신발만 넣어야 한다"는 규칙만 있다.
+
+```ts
+interface ScoreMap {
+  [studentName: string]: number;
+}
+
+const scores: ScoreMap = { kim: 90, lee: 85 };
+scores.park = 77;     // O
+scores.choi = "A";    // X Type 'string' is not assignable to type 'number'.
+
+const s = scores.nobody; // 타입은 number... 하지만 실제 값은 undefined!
+
+// Record 유틸리티로 동일하게 표현
+type ScoreMap2 = Record<string, number>;
+
+// 키가 정해져 있다면 union 키로
+type Grade = Record<"math" | "eng", number>;
+const g: Grade = { math: 90 }; // X Property 'eng' is missing
+```
+
+> **주의**: 인덱스 시그니처는 "존재하지 않는 키도 값이 있다"고 거짓말한다. 이를 잡으려면 `noUncheckedIndexedAccess`를 켠다(아래 tsconfig 절 참고). 동적 키-값 저장소가 필요하면 `Map`도 고려하자.
+
+## 11. enum vs union literal vs as const 객체
+
+> **비유**: `enum`은 TS 전용 특수 부품이라 런타임에도 실물 객체가 생긴다. union literal은 설계도에만 존재하는 메모, `as const` 객체는 평범한 JS 객체에 "변경 금지" 스티커를 붙인 것이다.
+
+```ts
+// 1) enum — 런타임 객체가 생성됨
+enum Color {
+  Red = "RED",
+  Green = "GREEN",
+}
+const c: Color = Color.Red;
+const c2: Color = "RED"; // X string enum은 리터럴 직접 대입 불가 (nominal처럼 동작)
+
+// 숫자 enum의 함정
+enum Level { Low, High }
+const lv: Level = 99;    // TS 5.0 이전엔 통과! (5.0+에선 에러)
+Level[0];                // "Low" — reverse mapping
+
+// 2) union literal — 런타임 코드 0
+type ColorU = "RED" | "GREEN";
+const cu: ColorU = "RED"; // O
+
+// 3) as const 객체 — 값과 타입을 둘 다 얻음
+const COLOR = {
+  Red: "RED",
+  Green: "GREEN",
+} as const;
+type ColorC = (typeof COLOR)[keyof typeof COLOR]; // "RED" | "GREEN"
+
+const cc: ColorC = COLOR.Red; // O
+const cc2: ColorC = "GREEN";  // O
+Object.values(COLOR);          // ["RED", "GREEN"] 런타임 순회 가능
+```
+
+| 항목 | `enum` | union literal | `as const` 객체 |
+| --- | --- | --- | --- |
+| 런타임 코드 | 생성됨 (IIFE) | 없음 | 일반 객체 |
+| 값 목록 순회 | 가능 (숫자 enum은 역매핑 섞임) | 불가 | `Object.values` 가능 |
+| 리터럴 직접 대입 | string enum은 불가 | 가능 | 가능 |
+| tree shaking | 불리 | 해당 없음 | 유리 |
+| `isolatedModules`/`erasableSyntaxOnly` | `const enum` 문제, enum 자체도 제한 | 문제 없음 | 문제 없음 |
+| Node `--experimental-strip-types` | 지원 안 함 | 지원 | 지원 |
+
+> **포인트**: 값 목록이 필요 없으면 union literal, 런타임에서도 값 목록이 필요하면 `as const` 객체를 쓰자. enum은 "타입 소거만으로 JS가 되는" TS의 방향성과 맞지 않아 점점 덜 쓰인다.
+
+## 12. 타입 좁히기 (Narrowing) 기초
+
+> **비유**: 공항 보안 검색대다. 처음엔 "승객"(넓은 타입)이지만, 여권을 확인하면 "내국인", 탑승권을 보면 "A게이트 승객"으로 점점 구체화된다. 검사를 통과한 구역 안에서는 더 구체적인 대우를 받는다.
+
+```ts
+function format(input: string | number | Date | null) {
+  // 1) truthiness / equality
+  if (input === null) return "없음";
+
+  // 2) typeof
+  if (typeof input === "string") return input.trim();   // string
+  if (typeof input === "number") return input.toFixed(2); // number
+
+  // 3) instanceof
+  if (input instanceof Date) return input.toISOString(); // Date
+
+  const _exhaustive: never = input; // 모든 경우를 처리했는지 검사
+}
+
+// 4) in 연산자
+type Fish = { swim: () => void };
+type Bird = { fly: () => void };
+function move(a: Fish | Bird) {
+  if ("swim" in a) a.swim(); // Fish
+  else a.fly();              // Bird
+}
+
+// 5) 판별 프로퍼티 (discriminated union 맛보기)
+type Result = { ok: true; data: string } | { ok: false; error: Error };
+function handle(r: Result) {
+  if (r.ok) console.log(r.data);
+  else console.error(r.error.message);
+}
+```
+
+| 방법 | 적합한 대상 |
+| --- | --- |
+| `typeof` | 원시 타입, 함수 |
+| `instanceof` | 클래스 인스턴스 |
+| `in` | 프로퍼티 존재로 구분되는 객체 |
+| `===` 리터럴 비교 | 판별 프로퍼티(`kind`, `type`) |
+| `Array.isArray` | 배열 |
+
+> **주의**: `typeof null === "object"`다. `typeof x === "object"`만으로는 `null`이 걸러지지 않으니 `x !== null`을 함께 쓴다.
+
+> **포인트**: 사용자 정의 type guard(`x is Foo`), assertion function, discriminated union 심화는 "TypeScript 심화" 노트를 참고.
+
+## 13. 타입 단언(as)과 Non-null(!) 주의
+
+> **비유**: `as`는 검사관에게 "내가 책임질게, 그냥 통과시켜줘"라고 말하는 것이다. 검사관(TS)은 믿고 통과시키지만, 거짓말이었다면 사고는 런타임에 난다.
+
+```ts
+const el = document.getElementById("app") as HTMLDivElement;
+// 실제로 없거나 <span>이면 런타임 에러 가능
+
+const data = JSON.parse(text) as User; // 검증 없이 User라고 "주장"만 함
+
+// 너무 무리한 단언은 막힘
+const n = "hello" as number;
+// X Conversion of type 'string' to type 'number' may be a mistake.
+
+// 이중 단언으로 강제 가능 (사실상 any와 같은 위험)
+const n2 = "hello" as unknown as number; // 컴파일 통과
+
+// Non-null assertion
+const input = document.querySelector("input")!; // null이 아니라고 단언
+input.value;
+```
+
+| 방법 | 안전성 | 대안 |
+| --- | --- | --- |
+| `x as T` | 낮음 (검증 없음) | narrowing, 런타임 검증(Zod) |
+| `x!` | 낮음 | `if (!x) throw ...`, `?.`, `??` |
+| `x as unknown as T` | 매우 낮음 | 설계 재검토 |
+| `x satisfies T` | 높음 (검사만, 타입 유지) | "TypeScript 심화" 참고 |
+
+```ts
+// 더 안전한 방식
+const el2 = document.getElementById("app");
+if (!el2) throw new Error("#app not found");
+el2.textContent = "ready"; // HTMLElement로 좁혀짐
+```
+
+> **주의**: `!`과 `as`는 코드 리뷰에서 "왜 여기서 확신할 수 있는가?"를 설명할 수 있을 때만 쓴다. 남발하면 TS를 쓰는 의미가 사라진다.
+
+## 14. tsconfig 핵심 옵션
+
+> **비유**: tsconfig는 검사관의 엄격도 다이얼이다. 다이얼을 낮추면 편하지만 놓치는 버그가 많고, `strict`로 올리면 처음엔 귀찮아도 출시 후 사고가 줄어든다.
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "nodenext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "outDir": "dist"
+  }
+}
+```
+
+### 14.1 strict 계열
+
+`strict: true`는 아래 옵션을 한꺼번에 켠다(새 strict 옵션이 추가되면 자동 포함).
+
+| 옵션 | 잡아주는 것 |
+| --- | --- |
+| `noImplicitAny` | 타입 없는 매개변수가 암묵적 `any`가 되는 것 |
+| `strictNullChecks` | `null`/`undefined`를 모든 타입에서 분리 |
+| `strictFunctionTypes` | 함수 매개변수 반공변 검사 |
+| `strictBindCallApply` | `bind`/`call`/`apply` 인자 검사 |
+| `strictPropertyInitialization` | 생성자에서 초기화 안 된 클래스 필드 |
+| `noImplicitThis` | 타입 불명확한 `this` |
+| `useUnknownInCatchVariables` | `catch (e)`의 `e`를 `unknown`으로 |
+| `alwaysStrict` | 출력에 `"use strict"` |
+
+```ts
+try {
+  riskyWork();
+} catch (e) {
+  e.message;                           // X 'e' is of type 'unknown'.
+  if (e instanceof Error) e.message;   // O
+}
+```
+
+### 14.2 noUncheckedIndexedAccess
+
+```ts
+const arr = [1, 2, 3];
+const first = arr[0];
+// 끔: number   켬: number | undefined
+
+const map: Record<string, string> = {};
+map["x"].toUpperCase();
+// 끔: 통과 → 런타임 
+// 켬: X Object is possibly 'undefined'.
+```
+
+> **포인트**: `strict`에 포함되지 않지만 실무 버그를 많이 잡는다. 대신 `for...of`나 `.map`을 선호하게 되어 인덱스 접근이 자연히 줄어든다.
+
+### 14.3 target과 lib
+
+| 옵션 | 결정하는 것 | 예시 |
+| --- | --- | --- |
+| `target` | 출력 JS 문법 수준 (다운레벨링) | `ES2022`면 class field, top-level await 유지 |
+| `lib` | 타입 검사 시 "존재한다고 믿을" 내장 API | `DOM` 빼면 `document` 사용 시 에러 |
+
+> **주의**: `lib`에 `ES2023`을 넣으면 `arr.findLast()`를 타입상 쓸 수 있지만, TS는 **polyfill을 넣지 않는다**. 실행 환경이 지원하지 않으면 런타임 에러다. `target`도 문법만 변환하고 API는 변환하지 않는다.
+
+## 15. 타입 소거: 런타임엔 타입이 없다
+
+> **비유**: 타입은 공사장의 비계(scaffolding)다. 건물을 짓는 동안엔 꼭 필요하지만, 완공되면 철거되어 건물(JS)에는 남지 않는다.
+
+```ts
+// 입력 (TS)
+interface User { name: string; age: number }
+type Id = string;
+function greet(u: User, id: Id): string {
+  return `${id}: ${u.name}`;
+}
+const x = value as number;
+```
+
+```js
+// 출력 (JS) — 타입 관련 코드가 모두 사라짐
+function greet(u, id) {
+  return `${id}: ${u.name}`;
+}
+const x = value;
+```
+
+그래서 다음은 불가능하다.
+
+```ts
+interface Cat { meow(): void }
+
+function isCat(x: unknown) {
+  return x instanceof Cat;
+  // X 'Cat' only refers to a type, but is being used as a value here.
+}
+
+function check<T>(value: unknown) {
+  if (typeof value === T) {} // X 타입 매개변수는 런타임에 없음
+}
+```
+
+예외적으로 **런타임 코드를 생성하는 TS 문법**이 있다.
+
+| 문법 | 런타임 영향 |
+| --- | --- |
+| `enum` | 객체 생성 |
+| `namespace` (값 포함) | IIFE 생성 |
+| 생성자 parameter property (`constructor(private x)`) | `this.x = x` 생성 |
+| 레거시 decorator + `emitDecoratorMetadata` | 메타데이터 코드 생성 |
+
+> **포인트**: TS 5.8의 `erasableSyntaxOnly` 옵션은 위 문법들을 금지해 "타입만 지우면 곧바로 JS"인 코드만 허용한다. Node의 type stripping(`node app.ts`)과 궁합이 맞는 방향이다.
+
+## 셀프 체크
+
+**Q1. 클래스 `Vector`가 `Point` 인터페이스를 `implements`하지 않았는데도 `Point` 매개변수에 넘길 수 있는 이유는? 그런데 객체 리터럴에 추가 프로퍼티를 넣으면 왜 에러가 나는가?**
+
+**A.** TS는 구조적 타이핑을 사용하므로 `x`, `y` 프로퍼티만 있으면 이름과 무관하게 호환된다. 다만 객체 리터럴을 직접 넘길 때는 오타 가능성이 높아서 excess property check가 추가로 적용되어, 선언에 없는 프로퍼티를 에러로 처리한다.
+
+**Q2. `any`와 `unknown`의 차이를 "대입"과 "사용" 관점에서 설명하라.**
+
+**A.** 둘 다 어떤 값이든 대입받을 수 있다. 하지만 `any`는 검사를 끄므로 아무 연산이나 허용하고 다른 타입 변수에도 그대로 대입된다. `unknown`은 narrowing으로 타입을 좁히기 전에는 프로퍼티 접근·호출이 금지되고, `any`/`unknown` 외의 타입에는 대입할 수 없다.
+
+**Q3. `let dir = "up"`을 `"up" | "down"` 매개변수에 넘기면 에러가 나는 이유와 해결 방법 두 가지는?**
+
+**A.** `let`은 재할당 가능하므로 리터럴 타입 `"up"`이 `string`으로 widening되기 때문이다. `const`로 선언하거나, 변수에 `Direction` 타입을 명시하거나, `as const`를 붙여 리터럴 타입을 유지하면 된다.
+
+**Q4. `interface`로만 할 수 있는 것과 `type`으로만 할 수 있는 것을 하나씩 들어라.**
+
+**A.** `interface`는 같은 이름으로 여러 번 선언하면 자동으로 합쳐지는 선언 병합이 가능하다(예: 전역 `Window` 확장). `type`은 union(`"a" | "b"` 같은 형태), 튜플, mapped/conditional 타입처럼 객체 모양이 아닌 타입에 이름을 붙일 수 있다.
+
+**Q5. `function isCat(x) { return x instanceof Cat }`에서 `Cat`이 interface라면 왜 에러인가?**
+
+**A.** interface는 컴파일 후 완전히 지워지는(타입 소거) 순수 타입이라 런타임에 존재하는 값이 아니다. `instanceof`는 런타임 생성자 함수가 필요하므로 클래스를 쓰거나, `"meow" in x` 같은 프로퍼티 검사 기반 type guard를 만들어야 한다.
+
+## 핵심 정리
+
+- TS는 개발 시점 정적 분석 도구이고 컴파일 결과에는 타입이 남지 않는다(enum 등 일부 예외).
+- 타입 호환성은 이름이 아닌 구조로 판단하며, 객체 리터럴에는 excess property check가 추가된다.
+- `unknown` + narrowing을 `any`보다 우선. `never`는 exhaustive check에 활용.
+- 매개변수는 명시, 지역 변수는 추론에 맡기고, 공개 함수 반환 타입은 명시.
+- `const`는 리터럴 타입, `let`은 widening. `as const`로 widening을 막는다.
+- Union은 "여러 형태 중 하나"(공통 멤버만 사용), intersection은 "합성"(모든 멤버 사용).
+- 객체 계약과 확장 포인트는 `interface`, union과 계산된 타입은 `type`.
+- enum 대신 union literal 또는 `as const` 객체를 선호.
+- `as`와 `!`는 검증이 아닌 주장이다. 가능하면 narrowing이나 런타임 검증으로 대체.
+- `strict: true` + `noUncheckedIndexedAccess`를 기본으로, `target`/`lib`는 polyfill이 아님을 기억.

@@ -1,0 +1,616 @@
+---
+title: "모듈 시스템 & 런타임"
+description: "CommonJS와 ESM의 차이, package.json의 type/exports, dual package hazard, 동적 import, 순환 참조, 번들러와 tree shaking, TypeScript의 module/moduleResolution 옵션까지 JS 모듈 생태계를 한 번에 정리한다."
+order: 8
+---
+
+## 한눈에 보기
+
+- **CommonJS**는 `require`/`module.exports`로 **동기**로 로딩하고, export 시점의 **값을 복사**해서 넘긴다.
+- **ESM**은 `import`/`export`로 **정적 분석 + 비동기** 로딩을 하고, 원본 변수와 연결된 **live binding**을 넘긴다.
+- Node는 `package.json`의 `"type"`과 확장자(`.mjs`/`.cjs`)로 모듈 형식을 결정하고, `"exports"`로 패키지의 공개 진입점을 통제한다.
+- Tree shaking은 ESM의 정적 구조 덕분에 가능하며, `"sideEffects": false`가 있어야 번들러가 과감하게 지운다.
+- TypeScript에서는 Node 프로젝트면 `module: "nodenext"`, 번들러(Vite, Next.js 등)를 쓰면 `moduleResolution: "bundler"`가 기본 선택지다.
+
+## 1. 모듈이 왜 필요한가
+
+> **비유**: 모듈은 아파트의 각 세대다. 세대마다 자기 살림(변수)을 따로 두고, 택배함(export)을 통해서만 물건을 주고받는다. 모듈이 없던 시절의 JS는 칸막이 없는 기숙사 한 방에서 모두가 같은 냉장고(전역 스코프)를 쓰는 상황이었다.
+
+모듈 이전의 브라우저 JS는 `<script>` 태그로 파일을 나열했고, 모든 파일이 전역 스코프를 공유했다. 그래서 이름 충돌을 피하려고 IIFE 패턴을 썼다.
+
+```js
+// 모듈 이전: IIFE로 스코프를 흉내냄
+var MyLib = (function () {
+  var privateCount = 0; // 외부에서 접근 불가
+  return {
+    inc: function () { return ++privateCount; },
+  };
+})();
+
+MyLib.inc(); // 1
+```
+
+이후 등장한 표준과 사실상 표준은 다음과 같다.
+
+| 시스템 | 등장 | 주 사용처 | 문법 |
+| --- | --- | --- | --- |
+| CommonJS (CJS) | 2009 | Node.js | `require`, `module.exports` |
+| AMD | 2011 | 브라우저 (RequireJS) | `define`, `require` |
+| UMD | - | 라이브러리 배포 | CJS/AMD/전역 겸용 래퍼 |
+| ES Modules (ESM) | ES2015 | 브라우저 + Node 12+ | `import`, `export` |
+
+> **포인트**: 오늘날 실질적으로 알아야 할 것은 CJS와 ESM 두 가지다. AMD/UMD는 레거시 라이브러리를 읽을 때나 마주친다.
+
+## 2. CommonJS vs ESM 핵심 비교
+
+> **비유**: CJS의 `require`는 **편의점에서 바로 사오는 것**이다. 필요할 때 줄 서서 바로 받아오고(동기), 받아온 물건은 내 것이 된다(복사). ESM의 `import`는 **CCTV 화면을 연결하는 것**이다. 실행 전에 어떤 카메라를 볼지 배선부터 해두고(정적 분석), 화면에는 원본의 현재 모습이 실시간으로 보인다(live binding).
+
+### 2.1 문법
+
+```js
+// ===== CommonJS =====
+// math.cjs
+const PI = 3.14;
+function area(r) { return PI * r * r; }
+module.exports = { PI, area };
+// 또는 exports.area = area;
+
+// main.cjs
+const { area } = require("./math.cjs");
+console.log(area(2)); // 12.56
+```
+
+```js
+// ===== ESM =====
+// math.mjs
+export const PI = 3.14;
+export function area(r) { return PI * r * r; }
+export default function hello() { return "hi"; }
+
+// main.mjs
+import hello, { area, PI as pi } from "./math.mjs";
+import * as math from "./math.mjs";
+console.log(area(2), pi, hello()); // 12.56 3.14 hi
+```
+
+> **주의**: `exports = { ... }`처럼 `exports` 자체를 재할당하면 export가 안 된다. `exports`는 `module.exports`를 가리키는 지역 변수일 뿐이라, 재할당하면 연결이 끊긴다. 객체 통째로 내보낼 땐 반드시 `module.exports = ...`를 쓴다.
+
+### 2.2 한눈에 보는 차이
+
+| 항목 | CommonJS | ESM |
+| --- | --- | --- |
+| 문법 | `require()` / `module.exports` | `import` / `export` |
+| 로딩 | 동기 (런타임에 실행하며 로딩) | 비동기 가능, 파싱 단계에서 의존성 그래프 확정 |
+| 분석 | 동적 (조건문 안에서도 `require` 가능) | 정적 (최상위에서만 `import` 선언) |
+| 바인딩 | 값 복사 (객체는 참조 복사) | live binding (읽기 전용 참조) |
+| top-level `this` | `module.exports` | `undefined` |
+| strict mode | 기본 아님 | 항상 strict |
+| `__dirname`, `__filename` | 있음 | 없음 → `import.meta` 사용 |
+| top-level `await` | 불가 | 가능 |
+| 확장자 생략 | 가능 (`./util`) | Node에서는 불가 (`./util.js` 필수) |
+| Tree shaking | 어려움 | 쉬움 |
+
+### 2.3 동기 vs 비동기 로딩
+
+CJS는 `require`를 만나는 순간 파일을 읽고, 실행하고, 결과를 반환한다. 서버 디스크에서 읽으니 동기여도 괜찮았다.
+
+ESM은 3단계로 나뉜다.
+
+1. **Construction**: 모든 `import`를 따라가며 파일을 가져오고 파싱해서 의존성 그래프(module record)를 만든다. 코드는 아직 실행 안 함.
+2. **Instantiation**: export/import 사이의 메모리 슬롯을 연결한다(live binding의 정체).
+3. **Evaluation**: 그래프의 잎(leaf)부터 코드를 실행해 슬롯에 값을 채운다.
+
+```js
+// CJS: 조건부 로딩 가능
+if (process.env.DEBUG) {
+  const debug = require("./debug.cjs"); // OK
+}
+
+// ESM: 정적 import는 최상위에서만
+if (process.env.DEBUG) {
+  import debug from "./debug.mjs"; // SyntaxError: Cannot use import statement here
+}
+```
+
+> **포인트**: ESM이 "실행 전에 그래프를 다 안다"는 사실이 tree shaking, 순환 참조 처리, top-level await 모두의 기반이다.
+
+### 2.4 live binding vs 값 복사
+
+```js
+// counter.cjs
+let count = 0;
+function inc() { count++; }
+module.exports = { count, inc };
+
+// main.cjs
+const c = require("./counter.cjs");
+c.inc();
+c.inc();
+console.log(c.count); // 0  ← export 시점 값이 복사됨
+```
+
+```js
+// counter.mjs
+export let count = 0;
+export function inc() { count++; }
+
+// main.mjs
+import { count, inc } from "./counter.mjs";
+inc();
+inc();
+console.log(count); // 2  ← 원본 변수를 그대로 바라봄
+
+count = 10; // TypeError: Assignment to constant variable.
+```
+
+> **주의**: ESM의 import 바인딩은 **읽기 전용**이다. 값을 바꾸고 싶으면 export한 쪽의 함수(`inc`)를 통해야 한다. 단, import한 객체의 **프로퍼티**는 수정할 수 있다(바인딩이 아니라 객체 내부이므로).
+
+### 2.5 top-level this와 `__dirname` 대체
+
+```js
+// a.cjs
+console.log(this === module.exports); // true
+
+// a.mjs
+console.log(this); // undefined
+```
+
+ESM에는 `__dirname`, `__filename`, `require`가 없다. 대신 `import.meta`를 쓴다.
+
+```js
+// ESM에서 경로 다루기
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+console.log(import.meta.url);
+// file:///Users/me/project/src/app.mjs
+
+// Node 20.11+ / 21.2+
+console.log(import.meta.dirname);  // /Users/me/project/src
+console.log(import.meta.filename); // /Users/me/project/src/app.mjs
+
+// 구버전 호환 방식
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ESM에서 CJS 모듈을 require로 불러야 할 때
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const pkg = require("./package.json");
+```
+
+## 3. Node는 어떻게 형식을 판단하나
+
+> **비유**: 우체국이 소포를 분류할 때 겉면 스티커(확장자)를 먼저 보고, 스티커가 없으면 그 동네 규칙(가장 가까운 `package.json`의 `"type"`)을 따른다.
+
+### 3.1 판단 순서
+
+1. 확장자가 `.mjs`면 무조건 ESM, `.cjs`면 무조건 CJS.
+2. `.js`면 가장 가까운 상위 `package.json`의 `"type"`을 본다.
+3. `"type": "module"`이면 ESM, `"commonjs"`이거나 없으면 CJS.
+4. (Node 22.7+ 등 최근 버전) `"type"`이 없는데 ESM 문법이 감지되면 ESM으로 재시도하는 syntax detection이 동작한다. 하지만 명시가 원칙이다.
+
+```json
+{
+  "name": "my-app",
+  "type": "module"
+}
+```
+
+| 파일 | `"type"` 없음 | `"type": "module"` |
+| --- | --- | --- |
+| `index.js` | CJS | ESM |
+| `index.mjs` | ESM | ESM |
+| `index.cjs` | CJS | CJS |
+
+### 3.2 `"main"` vs `"exports"`
+
+`"main"`은 옛날 방식의 단일 진입점이다. `"exports"`는 Node 12.7+에서 도입된 **진입점 화이트리스트**다.
+
+```json
+{
+  "name": "my-lib",
+  "main": "./dist/index.cjs",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./utils": "./dist/utils.mjs",
+    "./package.json": "./package.json"
+  }
+}
+```
+
+- `import "my-lib"` → `./dist/index.mjs`
+- `require("my-lib")` → `./dist/index.cjs`
+- `import "my-lib/utils"` → `./dist/utils.mjs`
+- `import "my-lib/dist/internal.js"` → **에러** `ERR_PACKAGE_PATH_NOT_EXPORTED`
+
+> **포인트**: `"exports"`가 있으면 `"main"`보다 우선하고, 명시되지 않은 하위 경로는 **모두 막힌다**. 즉 `"exports"`는 패키지의 public API 경계다. 라이브러리 메이저 버전 업 때 `"exports"`를 추가하면 deep import하던 사용자가 깨질 수 있다.
+
+> **주의**: conditional exports에서 키 순서가 중요하다. 위에서부터 첫 매칭이 이긴다. `"types"`는 항상 맨 앞에, `"default"`는 항상 맨 뒤에 둔다.
+
+자주 쓰는 condition 키는 다음과 같다.
+
+| 조건 | 의미 |
+| --- | --- |
+| `types` | TypeScript가 타입 선언을 찾을 때 |
+| `import` | `import`/`import()`로 불릴 때 |
+| `require` | `require()`로 불릴 때 |
+| `node` / `browser` | 실행 환경별 |
+| `development` / `production` | 번들러 모드별 (번들러 지원 필요) |
+| `default` | 위에서 매칭 안 될 때 fallback |
+
+## 4. CJS와 ESM의 상호 운용
+
+> **비유**: 220V(ESM) 기기와 110V(CJS) 기기를 섞어 쓰려면 어댑터가 필요하다. 어떤 방향은 어댑터가 기본 제공되지만, 반대 방향은 제한이 있다.
+
+```js
+// ESM → CJS 가져오기: 가능
+// lodash는 CJS
+import _ from "lodash";          // OK: module.exports가 default로 들어옴
+import { map } from "lodash";    // 대부분 OK (Node가 정적 분석으로 named export 추론, 실패할 수도 있음)
+```
+
+```js
+// CJS → ESM 가져오기
+const esm = require("./esm-only.mjs");
+// Node 22.12+ / 20.19+: top-level await가 없는 ESM이면 동기 require 가능
+// 구버전: ERR_REQUIRE_ESM
+
+// 언제나 되는 방법: 동적 import (비동기)
+async function main() {
+  const { default: chalk } = await import("chalk");
+}
+```
+
+| 방향 | 방법 | 비고 |
+| --- | --- | --- |
+| ESM → CJS | `import x from "cjs"` | `module.exports`가 default |
+| CJS → ESM | `await import("esm")` | 항상 가능, 비동기 |
+| CJS → ESM | `require("esm")` | 최신 Node만, top-level await 있으면 실패 |
+
+## 5. Dual Package Hazard
+
+> **비유**: 같은 사람이 두 개의 신분증을 갖고 있어서, 은행 A에서는 "김철수(CJS)"로, 은행 B에서는 "김철수(ESM)"로 따로 등록된 상황이다. 한쪽 계좌에 입금해도 다른 쪽에는 반영이 안 된다.
+
+라이브러리가 CJS 빌드와 ESM 빌드를 모두 제공하면, 한 앱 안에서 **두 개의 인스턴스**가 동시에 로딩될 수 있다.
+
+```js
+// 앱 코드 (ESM)
+import { registry } from "my-lib";      // dist/index.mjs 로딩
+registry.set("a", 1);
+
+// 어떤 CJS 의존성 내부
+const { registry } = require("my-lib"); // dist/index.cjs 로딩 (별개 인스턴스!)
+registry.get("a"); // undefined 
+```
+
+증상은 다음과 같다.
+
+1. 싱글톤 상태가 둘로 쪼개짐 (캐시, 레지스트리, 설정)
+2. `instanceof` 실패: ESM 쪽 `MyError`와 CJS 쪽 `MyError`는 다른 클래스
+3. 번들 크기 2배
+
+해결 전략은 다음과 같다.
+
+- **ESM wrapper 방식**: 실제 구현은 CJS 하나만 두고, ESM 진입점은 CJS를 re-export하는 얇은 래퍼로 만든다.
+- **상태를 외부로 분리**: 상태를 `globalThis`의 Symbol 키 등에 두어 인스턴스가 둘이어도 공유.
+- **ESM only로 배포**: 최신 Node가 `require(esm)`을 지원하므로 점점 현실적인 선택이 되었다.
+
+```js
+// wrapper.mjs — CJS 구현을 ESM으로 노출
+import cjs from "./index.cjs";
+export const { registry, createClient } = cjs;
+export default cjs;
+```
+
+> **포인트**: `instanceof` 대신 `Symbol.for("my-lib.MyError")` 같은 brand 체크를 쓰면 인스턴스가 둘이어도 안전하게 판별할 수 있다.
+
+## 6. 동적 import()
+
+> **비유**: 정적 import는 이사 올 때 가구를 전부 들여놓는 것, 동적 `import()`는 필요할 때 창고에서 꺼내오는 것이다.
+
+`import()`는 **함수처럼 생긴 문법**이며 Promise를 반환한다. CJS와 ESM 양쪽에서 모두 쓸 수 있다.
+
+```js
+// 조건부 / 지연 로딩
+button.addEventListener("click", async () => {
+  const { openEditor } = await import("./editor.js");
+  openEditor();
+});
+
+// 경로를 변수로
+const locale = "ko";
+const messages = await import(`./locales/${locale}.js`);
+
+// JSON (import attributes, Node 22+ / 최신 브라우저)
+const config = await import("./config.json", { with: { type: "json" } });
+console.log(config.default);
+```
+
+용도는 다음과 같다.
+
+| 용도 | 예시 |
+| --- | --- |
+| Code splitting | 라우트별 청크 분리 (`React.lazy`) |
+| 조건부 로딩 | 환경에 따라 다른 구현 |
+| CJS에서 ESM 사용 | `await import("esm-only")` |
+| 무거운 라이브러리 지연 | 차트, 에디터, PDF 뷰어 |
+
+> **주의**: 번들러는 `import(variable)`처럼 완전히 동적인 경로는 분석하지 못한다. 템플릿 리터럴의 앞부분(`./locales/`)처럼 정적인 단서가 있어야 해당 디렉터리를 청크로 묶을 수 있다.
+
+## 7. 순환 import 동작 차이
+
+> **비유**: A와 B가 서로 "네가 먼저 자기소개 해"라고 하는 상황이다. CJS는 A가 말하다 만 상태(반쯤 채워진 명함)를 B에게 건네고, ESM은 명함 자리만 예약해두고 나중에 채운다. 그래서 너무 일찍 읽으면 ESM은 "아직 못 읽음(TDZ)" 에러를 낸다.
+
+### 7.1 CommonJS: 미완성 객체를 받는다
+
+```js
+// a.cjs
+exports.loaded = false;
+const b = require("./b.cjs");
+console.log("in a, b.loaded =", b.loaded);
+exports.loaded = true;
+
+// b.cjs
+const a = require("./a.cjs"); // a는 아직 실행 중
+console.log("in b, a.loaded =", a.loaded);
+exports.loaded = true;
+
+// main.cjs
+require("./a.cjs");
+// in b, a.loaded = false   ← 미완성 exports
+// in a, b.loaded = true
+```
+
+실행 흐름은 다음과 같다.
+
+1. `a` 실행 시작, `exports.loaded = false`
+2. `require("./b")` → `b` 실행 시작
+3. `b`가 `require("./a")` → 캐시에 있는 **미완성 a.exports** 반환
+4. `b` 완료 → `a`로 복귀
+
+> **주의**: CJS 순환에서 `module.exports = { ... }`로 **재할당**하면, 상대방은 재할당 전의 빈 객체를 계속 들고 있게 된다. 순환 가능성이 있다면 `exports.x = ...` 방식이 그나마 안전하다.
+
+### 7.2 ESM: 바인딩은 연결되지만 TDZ
+
+```js
+// a.mjs
+import { b } from "./b.mjs";
+export const a = "A";
+console.log("a sees", b);
+
+// b.mjs
+import { a } from "./a.mjs";
+export const b = "B";
+console.log("b sees", a); // ReferenceError: Cannot access 'a' before initialization
+```
+
+```js
+// 함수 선언은 호이스팅되므로 순환에서도 동작
+// a.mjs
+import { helperB } from "./b.mjs";
+export function helperA() { return "A"; }
+console.log(helperB()); // "B uses A"
+
+// b.mjs
+import { helperA } from "./a.mjs";
+export function helperB() { return "B uses " + helperA(); }
+```
+
+> **포인트**: ESM 순환 참조는 "최상위에서 즉시 값을 읽지 말고, 함수 안에서 나중에 읽어라"가 원칙이다. live binding이라 실행 시점에 값이 채워져 있으면 정상 동작한다. 근본적으로는 공통 부분을 제3의 모듈로 빼서 순환을 끊는 게 최선이다.
+
+## 8. 번들러의 역할
+
+> **비유**: 번들러는 이삿짐센터다. 수백 개의 작은 상자(모듈)를 목적지(브라우저)에 맞게 몇 개의 큰 컨테이너(청크)로 재포장하고, 안 쓰는 물건은 버리고(tree shaking), 부피를 줄인다(minify).
+
+브라우저도 이제 ESM을 지원하는데 왜 번들러가 필요할까?
+
+1. **요청 수 감소**: 수백 개 모듈을 각각 HTTP 요청하면 waterfall이 생긴다.
+2. **bare specifier 해석**: 브라우저는 `import React from "react"`의 `"react"`가 어디인지 모른다(import map 없이는).
+3. **변환**: TS, JSX, CSS Modules, 이미지 import 등 비표준 자원 처리.
+4. **최적화**: tree shaking, minify, code splitting, 해시 기반 캐싱.
+5. **CJS 호환**: npm의 CJS 패키지를 ESM 환경에서 쓸 수 있게 변환.
+
+| 도구 | 특징 |
+| --- | --- |
+| webpack | 가장 오래되고 설정 유연, 생태계 거대 |
+| Rollup | 라이브러리 번들에 강함, ESM 출력 깔끔 |
+| esbuild | Go로 작성, 매우 빠름 |
+| Vite | 개발은 네이티브 ESM + esbuild, 빌드는 Rollup(→ Rolldown) |
+| Turbopack | Next.js용 Rust 기반 |
+
+## 9. Tree Shaking과 sideEffects
+
+> **비유**: 나무를 흔들어 죽은 잎(쓰지 않는 export)을 떨어뜨린다. 그런데 어떤 잎은 떨어지면 안 되는 "장식"(side effect)일 수 있다. `sideEffects: false`는 "이 나무엔 장식이 없으니 마음껏 흔들어도 된다"는 보증서다.
+
+### 9.1 동작 원리
+
+```js
+// utils.js
+export function used() { return 1; }
+export function unused() { return 2; }
+
+// main.js
+import { used } from "./utils.js";
+console.log(used());
+
+// 번들 결과: unused는 제거됨
+```
+
+ESM은 import/export가 정적이므로 "누가 무엇을 쓰는지" 빌드 타임에 확정할 수 있다. CJS는 `module.exports[name] = ...`처럼 동적이라 분석이 어렵다.
+
+### 9.2 side effect란
+
+모듈을 **import하는 것만으로** 외부에 영향을 주는 코드다.
+
+```js
+// polyfill.js — import만 해도 전역을 바꿈
+Array.prototype.last = function () { return this[this.length - 1]; };
+
+// styles.css import — import만으로 스타일 주입
+import "./styles.css";
+
+// 최상위 함수 호출 — 번들러는 이게 순수한지 모름
+export const config = createConfig(); // 지워도 되나? 확신 불가
+```
+
+### 9.3 sideEffects 설정
+
+```json
+{
+  "name": "my-lib",
+  "sideEffects": false
+}
+```
+
+```json
+{
+  "name": "my-ui",
+  "sideEffects": ["*.css", "./src/polyfills.js"]
+}
+```
+
+- `false`: 이 패키지의 어떤 파일도 import만으로 부작용이 없다 → 사용하지 않는 모듈은 **파일째** 제거.
+- 배열: 나열된 파일만 부작용이 있으니 보존.
+
+```js
+// 개별 호출에 순수함을 표시하는 주석
+export const config = /*#__PURE__*/ createConfig();
+```
+
+> **주의**: CSS를 import하는 라이브러리에서 `"sideEffects": false`로 설정하면 `import "./button.css"`가 통째로 사라져 스타일이 깨진다. CSS는 반드시 배열로 예외 처리한다.
+
+> **포인트**: barrel 파일(`index.ts`에서 `export * from ...` 나열)은 `sideEffects` 설정이 없으면 tree shaking을 크게 방해한다. 하나만 import해도 barrel이 끌어오는 모든 모듈을 평가해야 할 수 있기 때문이다.
+
+## 10. TypeScript의 module / moduleResolution
+
+> **비유**: `module`은 "어떤 언어로 번역해서 출력할지", `moduleResolution`은 "`import` 문의 주소를 어떤 지도로 찾을지"다. 실제 런타임(Node인지 번들러인지)과 지도가 다르면 TS는 통과했는데 실행하면 파일을 못 찾는 사고가 난다.
+
+### 10.1 두 옵션의 역할
+
+| 옵션 | 결정하는 것 |
+| --- | --- |
+| `module` | 출력 JS의 모듈 문법 (`import` 유지할지 `require`로 바꿀지), 그리고 허용되는 문법 |
+| `moduleResolution` | `import "x"`를 실제 파일로 찾는 알고리즘 |
+
+### 10.2 주요 조합
+
+| 시나리오 | `module` | `moduleResolution` | 특징 |
+| --- | --- | --- | --- |
+| Node.js 앱/라이브러리 | `nodenext` | `nodenext` (자동) | Node 규칙 그대로, 상대 경로 확장자 필수 |
+| Vite/Next.js/webpack 앱 | `esnext` 또는 `preserve` | `bundler` | 확장자 생략 OK, `exports` 지원 |
+| 레거시 | `commonjs` | `node10` (구 `node`) | `exports` 미지원, 비권장 |
+
+### 10.3 nodenext: 확장자를 써야 한다
+
+```ts
+// src/index.ts  (package.json "type": "module")
+import { add } from "./math";     // X error TS2835: Relative import paths need explicit file extensions
+import { add } from "./math.js";  // O .ts 파일인데 .js로 쓴다!
+```
+
+TS는 import 경로를 **다시 쓰지 않는다**. 컴파일 후 `math.ts`는 `math.js`가 되므로, 실행 시점 경로인 `.js`를 소스에 미리 적는 것이다.
+
+`nodenext`는 파일마다 형식을 판별한다.
+
+```ts
+// package.json에 "type"이 없을 때
+// src/a.ts  → CJS로 출력 (import가 require로 변환)
+// src/b.mts → ESM으로 출력 (.mjs)
+// src/c.cts → CJS로 출력 (.cjs)
+```
+
+### 10.4 bundler: 번들러가 알아서 해준다
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true
+  }
+}
+```
+
+```ts
+import { add } from "./math";      // O 확장자 생략 OK
+import { Button } from "@/ui";      // O paths alias (번들러 설정과 맞춰야 함)
+```
+
+> **주의**: `bundler`로 설정하고 결과물을 Node로 직접 실행하면 `ERR_MODULE_NOT_FOUND`가 난다. TS는 통과시켰지만 Node는 확장자 없는 경로를 못 찾기 때문이다. "실제로 누가 import를 해석하느냐"에 맞춰 고른다.
+
+### 10.5 같이 알아두면 좋은 옵션
+
+| 옵션 | 역할 |
+| --- | --- |
+| `esModuleInterop` | CJS 모듈을 `import x from`으로 가져올 때 default 처리 헬퍼 생성 |
+| `verbatimModuleSyntax` | `import type`이 아닌 import는 그대로 남김. 타입 전용 import는 `import type` 강제 |
+| `isolatedModules` | 파일 단위 트랜스파일러(esbuild, SWC)와 호환되게 제한 |
+| `resolveJsonModule` | `.json` import 허용 |
+
+```ts
+// verbatimModuleSyntax: true 일 때
+import { User } from "./types";       // X User가 타입뿐이면 에러 (런타임에 남아 실패하므로)
+import type { User } from "./types";  // O 컴파일 시 완전히 제거됨
+import { type User, createUser } from "./user"; // O 혼합
+```
+
+> **포인트**: 타입 시스템 자체(제네릭, 유틸리티 타입 등)는 "TypeScript 기초"와 "TypeScript 심화" 노트에서 다룬다. 여기서는 "TS가 모듈 경로를 어떻게 해석하고 무엇을 출력하는가"만 기억하면 된다.
+
+## 11. 실전 체크리스트
+
+새 프로젝트를 시작할 때 다음 순서로 결정한다.
+
+1. **런타임 결정**: Node 직접 실행인가, 번들러를 거치는가?
+2. **`package.json`**: 새 프로젝트면 `"type": "module"`을 기본으로.
+3. **tsconfig**: Node면 `nodenext`, 번들러면 `bundler`.
+4. **라이브러리 배포라면**: `"exports"`에 `types`/`import`/`require` 조건 명시, dual 배포 시 hazard 대비.
+5. **`"sideEffects"`**: 부작용 없는 라이브러리면 `false`, CSS가 있으면 배열.
+6. **경로**: ESM + Node면 상대 경로에 `.js` 확장자.
+
+```bash
+# 패키지의 exports/types 설정이 올바른지 검사
+npx @arethetypeswrong/cli --pack .
+npx publint
+```
+
+## 셀프 체크
+
+**Q1. CJS에서 `let count`를 export한 뒤 내부 함수로 증가시켜도 import한 쪽 값이 바뀌지 않는 이유는? ESM은 왜 바뀌나?**
+
+**A.** CJS는 `module.exports = { count }` 시점에 원시값을 객체 프로퍼티로 **복사**하기 때문에, 이후 모듈 내부의 `count` 변수가 바뀌어도 복사본은 그대로다. ESM은 Instantiation 단계에서 export 변수와 import 이름을 같은 메모리 슬롯으로 연결(live binding)하므로 원본 변화가 그대로 보인다.
+
+**Q2. `package.json`에 `"exports"`를 추가했더니 사용자 코드의 `import "my-lib/dist/helpers.js"`가 깨졌다. 왜인가?**
+
+**A.** `"exports"` 필드가 존재하면 거기 명시된 경로만 공개되고 나머지 하위 경로는 모두 `ERR_PACKAGE_PATH_NOT_EXPORTED`로 차단된다. `"exports"`는 패키지의 공개 API 경계이므로, 추가 자체가 breaking change가 될 수 있다.
+
+**Q3. Dual package hazard란 무엇이며, 대표적인 증상 두 가지는?**
+
+**A.** 같은 패키지의 CJS 빌드와 ESM 빌드가 한 앱에 동시에 로딩되어 서로 다른 두 인스턴스가 생기는 문제다. 싱글톤 상태가 쪼개지고, 한쪽에서 만든 객체가 다른 쪽 클래스에 대해 `instanceof` 검사에 실패한다.
+
+**Q4. ESM 순환 import에서 `ReferenceError: Cannot access 'a' before initialization`이 나는 이유와 해결책은?**
+
+**A.** 바인딩은 연결되어 있지만 상대 모듈이 아직 평가되지 않아 `const`/`let` 변수가 TDZ 상태인데, 최상위 코드에서 즉시 읽었기 때문이다. 값을 함수 내부에서 나중에 읽도록 바꾸거나(함수 선언은 호이스팅됨), 공통 부분을 별도 모듈로 분리해 순환을 끊는다.
+
+**Q5. Vite 프로젝트에서 `moduleResolution: "bundler"`를 쓰는 이유와, 같은 설정으로 Node 서버를 만들면 생기는 문제는?**
+
+**A.** 실제 import 해석은 번들러가 하므로 확장자 생략, `paths` alias 등 번들러 규칙에 맞추기 위해서다. 같은 설정으로 `tsc` 결과를 Node에서 직접 실행하면 Node ESM은 확장자 없는 상대 경로를 해석하지 못해 `ERR_MODULE_NOT_FOUND`가 난다. Node 직접 실행이면 `nodenext`를 써야 한다.
+
+## 핵심 정리
+
+- CJS: `require` 동기 로딩, 값 복사, 동적 분석, top-level `this`는 `module.exports`.
+- ESM: 정적 그래프 → Instantiation → Evaluation, live binding(읽기 전용), strict, top-level `this`는 `undefined`, 경로는 `import.meta`.
+- Node 형식 판단: `.mjs`/`.cjs` 확장자 → 가장 가까운 `package.json`의 `"type"`.
+- `"exports"`는 진입점 화이트리스트이자 조건부 분기(`types` 맨 앞, `default` 맨 뒤).
+- Dual package hazard는 인스턴스 이중화 문제 → wrapper, 상태 외부화, ESM only로 대응.
+- 동적 `import()`는 어디서나 쓸 수 있는 Promise 기반 로딩이며 code splitting의 핵심.
+- 순환 참조: CJS는 미완성 객체, ESM은 TDZ. 최상위에서 즉시 읽지 말 것.
+- Tree shaking은 ESM 정적 구조 + `"sideEffects"` 선언이 함께 있어야 제대로 동작한다.
+- TS: Node면 `nodenext`(상대 경로에 `.js`), 번들러면 `bundler`. 누가 import를 해석하는지에 맞춘다.

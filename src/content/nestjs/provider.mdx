@@ -1,0 +1,612 @@
+---
+title: "Provider & DI"
+description: "IoC/DI 개념부터 Custom Provider, 토큰, Scope 전파, durable provider, 비동기 provider까지"
+order: 2
+---
+
+## 한눈에 보기
+
+- **IoC**: 객체를 만들고 연결하는 일을 프레임워크에 맡긴다. **DI**: 필요한 것을 생성자로 받는다.
+- Nest는 **토큰**(클래스, string, symbol)으로 provider를 찾는다. `interface`는 토큰이 될 수 없다.
+- Custom Provider 4종: `useClass`, `useValue`, `useFactory`, `useExisting`.
+- Scope는 DEFAULT(싱글톤) / REQUEST / TRANSIENT. REQUEST는 의존 체인 위로 **전파**된다.
+- `async useFactory`로 DB 연결 같은 비동기 provider를 만들 수 있다.
+
+## IoC와 DI
+
+> **비유**: 레스토랑 셰프는 요리에 필요한 재료를 **직접 농장에 가서 구해 오지 않는다**. "토마토 3개, 바질 한 줌"이라고 주문서(생성자 파라미터)만 쓰면, 식자재 공급 업체(IoC Container)가 알맞은 재료를 가져다 준다. 공급 업체를 바꿔도(구현체 교체) 셰프의 레시피는 그대로다.
+
+### 제어 역전 (Inversion of Control)
+
+전통적인 코드에서는 객체가 자신이 사용할 의존성을 **직접 생성**한다.
+
+```ts
+// X 직접 생성: OrdersService가 구체 구현과 생성 방법을 모두 알고 있음
+export class OrdersService {
+  private readonly repo = new OrdersRepository(new DataSource({ /* ... */ }));
+  private readonly mailer = new SmtpMailer('smtp.example.com', 587);
+}
+```
+
+IoC는 이 "객체를 만들고 연결하는 제어권"을 프레임워크(IoC Container)에 넘기는 것이다. NestJS에서는 `NestContainer`와 `Injector`가 이 역할을 한다. 클래스는 "무엇이 필요한지"만 선언하고, "어떻게 만들어서 넣어줄지"는 컨테이너가 결정한다.
+
+### 의존성 주입 (Dependency Injection)
+
+DI는 IoC를 구현하는 대표적인 방법이다. NestJS는 **생성자 주입(constructor injection)** 을 기본으로 사용한다.
+
+```ts
+@Injectable()
+export class OrdersService {
+  constructor(
+    private readonly repo: OrdersRepository,
+    private readonly mailer: MailService,
+  ) {}
+}
+```
+
+Nest는 TypeScript의 `emitDecoratorMetadata`가 생성한 `design:paramtypes` 메타데이터를 읽어 생성자 파라미터의 **타입(클래스)** 을 알아내고, 그 클래스를 **토큰**으로 삼아 provider를 찾는다.
+
+```text
+OrdersService 생성 요청
+  → design:paramtypes 읽기 → [OrdersRepository, MailService]
+  → 각 토큰으로 현재 모듈 / import한 모듈의 exports 탐색
+  → 의존성 먼저 재귀적으로 생성 (이미 있으면 재사용)
+  → new OrdersService(repoInstance, mailInstance)
+```
+
+### 토큰 (Injection Token)
+
+> **비유**: 토큰은 **물품 보관함 번호표**다. 번호표(토큰)를 내밀면 해당 칸의 물건(provider 인스턴스)을 꺼내 준다. 번호표는 클래스 이름일 수도, 직접 정한 문자열/symbol일 수도 있다.
+
+토큰은 "어떤 provider인가"를 식별하는 키다. 다음 타입이 토큰이 될 수 있다.
+
+| 토큰 종류 | 예시 | 주입 방법 |
+| --- | --- | --- |
+| 클래스 | `UsersService` | 타입 선언만으로 자동 |
+| string | `'CONFIG'` | `@Inject('CONFIG')` |
+| symbol | `Symbol('CACHE')` | `@Inject(CACHE)` |
+| abstract class | `abstract class PaymentGateway` | 타입 선언만으로 자동 |
+
+> **포인트**: TypeScript의 `interface`는 런타임에 사라지므로 토큰이 될 수 없다. 인터페이스로 추상화하고 싶다면 string/symbol 토큰 + `@Inject()`, 또는 **abstract class**를 토큰으로 쓴다.
+
+DI 컨테이너가 실제로 인스턴스를 만드는 순서를 따라가 봅시다. exports를 빠뜨리거나 순환 의존이 생기면 어떤 에러가 나는지도 확인할 수 있습니다.
+
+```sim
+di-resolve
+```
+
+## @Injectable
+
+> **비유**: 직원의 **사원증**이다. 사원증이 있어야 회사 시스템(컨테이너)이 그 사람을 관리할 수 있다. 하지만 사원증만 있다고 부서 배치가 끝난 것은 아니다. 어느 부서(`providers`)에 소속될지도 정해야 한다.
+
+`@Injectable()`은 이 클래스가 Nest IoC 컨테이너가 관리할 수 있는 provider임을 표시하는 메타데이터를 붙인다. 사실 생성자 파라미터가 있는 클래스라면 **어떤 데코레이터든** 붙어 있어야 TypeScript가 `design:paramtypes`를 emit하므로, `@Injectable()`은 DI를 위한 필수 표시라고 생각하면 된다.
+
+```ts
+import { Injectable, Scope } from '@nestjs/common';
+
+@Injectable()                            // 기본: Scope.DEFAULT (싱글톤)
+export class UsersService {}
+
+@Injectable({ scope: Scope.REQUEST })    // 옵션으로 scope 지정
+export class RequestContextService {}
+```
+
+> **주의**: provider는 반드시 어떤 모듈의 `providers` 배열에 등록되어야 컨테이너에 들어간다. `@Injectable()`만 붙여서는 등록되지 않는다.
+
+## Custom Provider
+
+> **비유**: 카페 주문 방식 4가지로 생각하자.
+> - `useClass`: "이 레시피로 새로 만들어 주세요" (클래스를 `new`)
+> - `useValue`: "진열대에 있는 완제품 주세요" (이미 만든 값)
+> - `useFactory`: "바리스타가 상황 보고 알아서 만들어 주세요" (함수가 만들어 반환)
+> - `useExisting`: "아까 그 음료를 다른 이름으로 불러 주세요" (같은 것에 별칭)
+
+`providers: [UsersService]`는 사실 아래의 축약형이다.
+
+```ts
+providers: [
+  { provide: UsersService, useClass: UsersService },
+]
+```
+
+`provide`(토큰)와 `use*`(값을 만드는 방법)를 분리하면 4가지 Custom Provider를 만들 수 있다.
+
+### useClass
+
+토큰에 대해 **어떤 클래스를 인스턴스화할지** 지정한다. 환경에 따라 구현체를 바꾸거나, 추상 클래스에 구체 구현을 바인딩할 때 쓴다.
+
+```ts
+export abstract class PaymentGateway {
+  abstract charge(amount: number, orderId: string): Promise<{ txId: string }>;
+}
+
+@Injectable()
+export class TossPaymentGateway extends PaymentGateway {
+  async charge(amount: number, orderId: string) {
+    // 실제 PG 호출
+    return { txId: `toss_${orderId}` };
+  }
+}
+
+@Injectable()
+export class FakePaymentGateway extends PaymentGateway {
+  async charge(amount: number, orderId: string) {
+    return { txId: `fake_${orderId}` };
+  }
+}
+
+@Module({
+  providers: [
+    {
+      provide: PaymentGateway,
+      useClass: process.env.NODE_ENV === 'production'
+        ? TossPaymentGateway
+        : FakePaymentGateway,
+    },
+    OrdersService,
+  ],
+})
+export class OrdersModule {}
+
+@Injectable()
+export class OrdersService {
+  constructor(private readonly payment: PaymentGateway) {} // abstract class 토큰
+}
+```
+
+**사용 시나리오**: 전략 패턴, 환경별 구현 교체, 포트/어댑터(헥사고날) 구조에서 포트에 어댑터 바인딩.
+
+### useValue
+
+**이미 만들어진 값**(상수, 객체, mock)을 그대로 주입한다. Nest는 인스턴스화하지 않는다.
+
+```ts
+export const APP_CONFIG = Symbol('APP_CONFIG');
+
+@Module({
+  providers: [
+    {
+      provide: APP_CONFIG,
+      useValue: { pageSize: 20, featureFlags: { newCheckout: true } },
+    },
+  ],
+})
+export class AppModule {}
+```
+
+테스트에서 실제 provider를 mock으로 교체할 때 특히 많이 쓴다.
+
+```ts
+const mockUsersService = {
+  findOne: jest.fn().mockResolvedValue({ id: 1, name: 'kim' }),
+};
+
+const moduleRef = await Test.createTestingModule({
+  providers: [
+    OrdersService,
+    { provide: UsersService, useValue: mockUsersService },
+  ],
+}).compile();
+
+// 또는 overrideProvider
+const moduleRef2 = await Test.createTestingModule({ imports: [OrdersModule] })
+  .overrideProvider(UsersService)
+  .useValue(mockUsersService)
+  .compile();
+```
+
+**사용 시나리오**: 설정 상수, 외부 라이브러리 인스턴스(이미 생성된 클라이언트), 테스트 mock.
+
+### useFactory + inject
+
+**함수의 반환값**을 provider로 쓴다. `inject` 배열에 적은 토큰들이 순서대로 factory 인자로 전달된다. factory는 `async`일 수 있다.
+
+```ts
+export const REDIS_CLIENT = Symbol('REDIS_CLIENT');
+
+@Module({
+  providers: [
+    {
+      provide: REDIS_CLIENT,
+      useFactory: (config: ConfigService, logger?: AppLogger) => {
+        const client = new Redis({
+          host: config.getOrThrow<string>('REDIS_HOST'),
+          port: config.get<number>('REDIS_PORT', 6379),
+        });
+        client.on('error', (e) => logger?.error(e));
+        return client;
+      },
+      inject: [
+        ConfigService,
+        { token: AppLogger, optional: true }, // optional 의존성
+      ],
+    },
+  ],
+  exports: [REDIS_CLIENT],
+})
+export class RedisModule {}
+```
+
+**사용 시나리오**: 설정값에 따라 생성 방식이 달라지는 외부 클라이언트(DB, Redis, SDK), 다른 provider를 조합한 값, 비동기 초기화가 필요한 리소스.
+
+### useExisting (alias)
+
+이미 존재하는 provider에 **다른 토큰으로 접근할 수 있는 별칭**을 만든다. 새 인스턴스를 만들지 않는다.
+
+```ts
+@Injectable()
+export class WinstonLogger implements LoggerService {
+  log(message: string) { /* ... */ }
+  error(message: string, trace?: string) { /* ... */ }
+  warn(message: string) { /* ... */ }
+}
+
+@Module({
+  providers: [
+    WinstonLogger,
+    { provide: 'LOGGER', useExisting: WinstonLogger },
+  ],
+  exports: ['LOGGER', WinstonLogger],
+})
+export class LoggerModule {}
+
+// 아래 두 주입은 동일한 인스턴스를 받는다
+constructor(
+  private readonly a: WinstonLogger,
+  @Inject('LOGGER') private readonly b: LoggerService,
+) {}
+```
+
+> **주의**: `useClass`로 같은 클래스를 다른 토큰에 등록하면 **별개 인스턴스**가 두 개 생긴다. 같은 인스턴스를 공유하려면 반드시 `useExisting`을 써야 한다.
+
+**사용 시나리오**: 레거시 토큰 호환, 하나의 구현을 여러 인터페이스 토큰으로 노출.
+
+### 4가지 비교
+
+| 방식 | 값을 만드는 주체 | 인스턴스화 | 대표 용도 |
+| --- | --- | --- | --- |
+| `useClass` | Nest가 클래스 `new` | O | 구현체 교체, 추상 클래스 바인딩 |
+| `useValue` | 개발자가 미리 만든 값 | X | 상수, mock |
+| `useFactory` | factory 함수 반환값 | 함수 호출 | 동적/비동기 생성, 외부 클라이언트 |
+| `useExisting` | 기존 provider 참조 | X (alias) | 별칭, 다중 토큰 노출 |
+
+## 비클래스 토큰과 InjectionToken 패턴
+
+> **비유**: 손글씨 번호표(string)는 "CONFIG"와 "C0NFIG"처럼 헷갈리기 쉽다. symbol은 **위조 불가능한 바코드 번호표**라서 이름이 같아도 절대 겹치지 않는다.
+
+> **주의**: string 토큰은 오타와 충돌에 취약하다. 실무에서는 **symbol 상수 + 전용 파일**로 관리하는 패턴을 많이 쓴다.
+
+```ts
+// tokens.ts
+export const USER_REPOSITORY = Symbol('USER_REPOSITORY');
+export const CLOCK = Symbol('CLOCK');
+
+// user-repository.interface.ts
+export interface UserRepository {
+  findById(id: number): Promise<User | null>;
+  save(user: User): Promise<User>;
+}
+
+export interface Clock {
+  now(): Date;
+}
+```
+
+```ts
+@Module({
+  providers: [
+    { provide: USER_REPOSITORY, useClass: TypeOrmUserRepository },
+    { provide: CLOCK, useValue: { now: () => new Date() } satisfies Clock },
+    UsersService,
+  ],
+})
+export class UsersModule {}
+
+@Injectable()
+export class UsersService {
+  constructor(
+    @Inject(USER_REPOSITORY) private readonly users: UserRepository,
+    @Inject(CLOCK) private readonly clock: Clock,
+  ) {}
+}
+```
+
+반복되는 `@Inject(TOKEN)`은 커스텀 데코레이터로 감쌀 수 있다.
+
+```ts
+export const InjectUserRepository = () => Inject(USER_REPOSITORY);
+
+constructor(@InjectUserRepository() private readonly users: UserRepository) {}
+```
+
+`@nestjs/typeorm`의 `@InjectRepository(User)`도 내부적으로 같은 원리다. 엔티티별로 토큰을 생성해 `@Inject(token)`을 호출한다.
+
+참고로 Nest의 타입 정의상 토큰 타입은 `InjectionToken`으로, 클래스 타입, `string`, `symbol`, `Abstract`, `Function` 등을 포함하는 유니온이다.
+
+## Optional Provider
+
+> **비유**: 레시피의 "취향에 따라 파슬리(생략 가능)"와 같다. 없으면 에러로 요리를 멈추는 대신 그냥 빼고 진행한다.
+
+의존성이 없을 수도 있을 때 `@Optional()`을 붙이면, 해결되지 않아도 에러 대신 `undefined`가 주입된다.
+
+```ts
+export const HTTP_OPTIONS = Symbol('HTTP_OPTIONS');
+
+@Injectable()
+export class HttpClient {
+  constructor(
+    @Optional() @Inject(HTTP_OPTIONS) private readonly options: HttpOptions = { timeout: 3000 },
+  ) {}
+}
+```
+
+Factory provider에서는 `inject` 배열에 `{ token, optional: true }` 형태를 쓴다 (위 Redis 예시 참고).
+
+## 프로퍼티 주입 (Property-based Injection)
+
+> **비유**: 생성자 주입은 **입사 첫날 장비를 모두 지급**받는 것, 프로퍼티 주입은 **책상에 앉은 뒤 나중에 장비가 배달**되는 것이다. 배달 전(생성자 실행 중)에는 쓸 수 없다.
+
+생성자 대신 프로퍼티에 `@Inject()`를 붙여 주입할 수도 있다. 주로 **상속 구조**에서 하위 클래스가 `super(...)`로 의존성을 일일이 넘기기 번거로울 때 사용한다.
+
+```ts
+export abstract class BaseCrudService<T> {
+  @Inject(AppLogger)
+  protected readonly logger: AppLogger;
+
+  protected abstract readonly entityName: string;
+
+  protected logCreated(id: number) {
+    this.logger.log(`${this.entityName} created: ${id}`);
+  }
+}
+
+@Injectable()
+export class ProductsService extends BaseCrudService<Product> {
+  protected readonly entityName = 'Product';
+  constructor(private readonly repo: ProductsRepository) {
+    super(); // logger를 넘길 필요 없음
+  }
+}
+```
+
+> **포인트**: 프로퍼티 주입은 생성자 실행 **이후**에 값이 채워지므로 생성자 안에서는 사용할 수 없다. 의존성이 코드에 덜 드러나므로 공식 문서도 특별한 이유가 없으면 생성자 주입을 권장한다.
+
+## Scope
+
+> **비유**: 사무실 물건으로 생각하자.
+> - **DEFAULT(싱글톤)**: 사무실 **공용 프린터**. 하나를 모두가 같이 쓴다.
+> - **REQUEST**: 손님마다 새로 주는 **일회용 컵**. 손님(요청)이 떠나면 버린다.
+> - **TRANSIENT**: 직원마다 지급하는 **개인 머그컵**. 쓰는 사람(consumer)마다 따로 있다.
+
+### 3가지 Scope
+
+| Scope | 인스턴스 수명 | 특징 |
+| --- | --- | --- |
+| `Scope.DEFAULT` | 앱 전체에서 1개 (싱글톤) | 부트스트랩 시 생성, 캐싱. 기본값이며 가장 빠름 |
+| `Scope.REQUEST` | 요청마다 새 인스턴스 | 요청 처리 후 GC 대상 |
+| `Scope.TRANSIENT` | 주입받는 consumer마다 새 인스턴스 | consumer끼리 공유하지 않음 |
+
+```ts
+@Injectable({ scope: Scope.REQUEST })
+export class RequestContext {
+  readonly startedAt = Date.now();
+  userId?: number;
+}
+
+@Injectable({ scope: Scope.TRANSIENT })
+export class ScopedLogger {
+  private context = 'Default';
+  setContext(ctx: string) { this.context = ctx; }
+  log(msg: string) { console.log(`[${this.context}] ${msg}`); }
+}
+
+// custom provider는 객체에 scope 지정
+{ provide: 'CACHE_MANAGER', useClass: CacheManager, scope: Scope.TRANSIENT }
+
+// controller에도 scope 지정 가능
+@Controller({ path: 'cats', scope: Scope.REQUEST })
+export class CatsController {}
+```
+
+> **주의**: Node.js는 요청마다 스레드를 갖는 모델이 아니므로 싱글톤이 안전하고 일반적이다. 싱글톤 provider에 **요청별 상태를 필드로 저장하면** 동시 요청 간에 섞이는 버그가 생긴다.
+
+### Scope 전파 (bubbling up)
+
+> **비유**: 일회용 컵(REQUEST)을 꼭 받아야 하는 음료 세트는 그 세트 자체도 손님마다 새로 만들어야 한다. 부품 하나가 "요청마다"이면 그걸 품은 상위 객체도 "요청마다"가 된다.
+
+REQUEST scope는 **의존성 체인을 따라 위로 전파**된다. REQUEST scope provider를 주입받는 provider는 자동으로 REQUEST scope가 된다.
+
+```text
+CatsController  ←  CatsService  ←  CatsRepository (Scope.REQUEST)
+     │                  │                 │
+ REQUEST로 승격     REQUEST로 승격       REQUEST
+```
+
+```ts
+@Injectable({ scope: Scope.REQUEST })
+export class CatsRepository {}
+
+@Injectable() // 선언은 DEFAULT지만
+export class CatsService {
+  constructor(private readonly repo: CatsRepository) {} // → 실제로는 요청마다 생성
+}
+
+@Controller('cats')
+export class CatsController {
+  constructor(private readonly cats: CatsService) {} // → 이것도 요청마다 생성
+}
+```
+
+반면 **TRANSIENT는 전파되지 않는다**. 싱글톤 `DogsService`가 TRANSIENT `LoggerService`를 주입받으면, `DogsService`는 여전히 싱글톤이고 자기 전용 logger 인스턴스 하나를 갖는다. 단, 그 TRANSIENT provider가 내부적으로 REQUEST scope에 의존하면 결국 REQUEST로 동작한다.
+
+### REQUEST 객체 주입
+
+REQUEST scope provider에서는 `@nestjs/core`의 `REQUEST` 토큰으로 현재 요청 객체를 받을 수 있다.
+
+```ts
+import { Inject, Injectable, Scope } from '@nestjs/common';
+import { REQUEST } from '@nestjs/core';
+import { Request } from 'express';
+
+@Injectable({ scope: Scope.REQUEST })
+export class TenantService {
+  constructor(@Inject(REQUEST) private readonly request: Request) {}
+
+  get tenantId(): string {
+    return this.request.headers['x-tenant-id'] as string;
+  }
+}
+```
+
+- GraphQL에서는 `REQUEST` 대신 `CONTEXT` 토큰을 쓴다.
+- TRANSIENT provider는 `INQUIRER` 토큰으로 **자신을 주입받은 클래스**를 알 수 있다.
+
+```ts
+import { INQUIRER } from '@nestjs/core';
+
+@Injectable({ scope: Scope.TRANSIENT })
+export class ContextLogger {
+  constructor(@Inject(INQUIRER) private readonly parent: object) {}
+
+  log(msg: string) {
+    console.log(`[${this.parent?.constructor?.name}] ${msg}`);
+  }
+}
+```
+
+### 성능 영향
+
+> **주의**: REQUEST scope는 생각보다 비싸다.
+
+- REQUEST scope는 요청마다 **해당 체인의 모든 인스턴스를 새로 생성**한다. 체인이 깊으면 할당과 GC 부담이 커지고 응답 지연이 늘어난다.
+- 공식 문서 기준으로 적절히 설계된 경우 latency 증가는 약 5% 이하 수준이라고 하지만, 루트 가까운 곳(예: 공통 Repository)에 REQUEST scope를 두면 거의 모든 controller가 요청 단위로 바뀌는 대참사가 일어난다.
+- REQUEST scope provider를 쓰는 enhancer(guard 등)나 controller는 부트스트랩 시점에 미리 만들어지지 않으므로 `onModuleInit` 같은 lifecycle hook도 호출되지 않는다.
+
+> **포인트**: (대안) 요청 컨텍스트(유저 ID, trace ID, tenant)만 필요하다면 `AsyncLocalStorage` 기반 패턴(예: `nestjs-cls`)으로 싱글톤을 유지한 채 요청별 데이터를 다루는 것이 성능상 유리하다.
+
+### Durable Provider와 ContextIdStrategy
+
+> **비유**: 손님마다 컵을 새로 주는 대신 **단골 손님(테넌트)마다 전용 컵을 보관**해 두고 다시 꺼내 주는 방식이다. `ContextIdStrategy`는 "이 손님이 어느 단골인지" 판별하는 규칙이다.
+
+멀티 테넌트 앱에서 "요청마다"가 아니라 "**테넌트마다**" 인스턴스를 재사용하고 싶을 때 durable provider를 쓴다. `ContextIdStrategy`로 요청을 어떤 context ID(DI 서브트리)에 매핑할지 정의한다.
+
+```ts
+import { ContextId, ContextIdFactory, ContextIdStrategy, HostComponentInfo } from '@nestjs/core';
+import { Request } from 'express';
+
+const tenants = new Map<string, ContextId>();
+
+export class AggregateByTenantContextIdStrategy implements ContextIdStrategy {
+  attach(contextId: ContextId, request: Request) {
+    const tenantId = request.headers['x-tenant-id'] as string;
+    let tenantSubTreeId: ContextId;
+
+    if (tenants.has(tenantId)) {
+      tenantSubTreeId = tenants.get(tenantId)!;
+    } else {
+      tenantSubTreeId = ContextIdFactory.create();
+      tenants.set(tenantId, tenantSubTreeId);
+    }
+
+    // durable provider는 테넌트 서브트리, 나머지는 요청별 contextId 사용
+    return {
+      resolve: (info: HostComponentInfo) =>
+        info.isTreeDurable ? tenantSubTreeId : contextId,
+      payload: { tenantId },
+    };
+  }
+}
+```
+
+```ts
+// main.ts
+ContextIdFactory.apply(new AggregateByTenantContextIdStrategy());
+
+// durable provider 선언
+@Injectable({ scope: Scope.REQUEST, durable: true })
+export class TenantDbService {
+  constructor(@Inject(REQUEST) private readonly payload: { tenantId: string }) {}
+}
+```
+
+durable provider에서 `REQUEST`로 주입받는 값은 실제 요청 객체가 아니라 strategy가 반환한 `payload`다.
+
+세 가지 스코프의 차이를 요청을 보내 가며 직접 확인해 보세요.
+
+```sim
+provider-scope
+```
+
+## 비동기 Provider
+
+> **비유**: 가게 오픈 전에 **오븐 예열이 끝나야** 손님을 받을 수 있는 것과 같다. Nest는 예열(Promise)이 끝날 때까지 개점(부트스트랩 완료)을 미룬다.
+
+앱이 요청을 받기 전에 **비동기 초기화가 완료되어야 하는** 리소스(DB 연결 등)는 `useFactory`에 `async` 함수를 쓰면 된다. Nest는 Promise가 resolve될 때까지 해당 provider에 의존하는 클래스의 인스턴스화를 기다린다.
+
+```ts
+export const DATABASE_CONNECTION = Symbol('DATABASE_CONNECTION');
+
+export const databaseProviders = [
+  {
+    provide: DATABASE_CONNECTION,
+    useFactory: async (config: ConfigService): Promise<DataSource> => {
+      const dataSource = new DataSource({
+        type: 'postgres',
+        url: config.getOrThrow<string>('DATABASE_URL'),
+        entities: [User, Order],
+      });
+      return dataSource.initialize(); // 연결 완료까지 부트스트랩 대기
+    },
+    inject: [ConfigService],
+  },
+];
+
+@Module({
+  providers: [...databaseProviders],
+  exports: [...databaseProviders],
+})
+export class DatabaseModule {}
+```
+
+```ts
+@Injectable()
+export class UsersRepository {
+  constructor(@Inject(DATABASE_CONNECTION) private readonly ds: DataSource) {}
+  // 이 시점에 ds는 이미 initialize 완료된 상태
+}
+```
+
+> **주의**: 비동기 provider가 reject되면 앱 부트스트랩 자체가 실패한다. 연결 재시도 로직은 factory 안에 넣거나 라이브러리 옵션(예: TypeORM의 `retryAttempts`)을 활용하자.
+
+## 셀프 체크
+
+**Q1. `interface PaymentGateway`를 생성자 타입으로 선언했더니 주입이 안 된다. 왜이고, 어떻게 고치나?**
+
+**A.** TypeScript의 interface는 컴파일 후 사라져 런타임 토큰이 될 수 없다. symbol 토큰을 만들어 `@Inject(PAYMENT_GATEWAY)`로 주입하거나, interface 대신 abstract class를 토큰으로 쓰면 된다.
+
+**Q2. 같은 클래스를 `useClass`로 두 토큰에 등록한 것과 `useExisting`으로 alias한 것의 차이는?**
+
+**A.** `useClass`는 토큰마다 별도 인스턴스를 만들고, `useExisting`은 기존 인스턴스 하나를 다른 토큰으로도 꺼낼 수 있게 할 뿐이다.
+
+**Q3. 싱글톤으로 선언한 `OrdersService`가 REQUEST scope인 `TenantService`를 주입받으면 `OrdersService`의 실제 scope는?**
+
+**A.** REQUEST scope가 된다. REQUEST scope는 의존 체인을 따라 위로 전파(bubbling up)되므로, 이를 주입받는 provider와 controller도 요청마다 생성된다.
+
+**Q4. TRANSIENT scope도 REQUEST처럼 위로 전파되나?**
+
+**A.** 아니다. TRANSIENT는 주입받는 consumer마다 전용 인스턴스를 줄 뿐, consumer의 scope를 바꾸지 않는다.
+
+**Q5. DB 연결이 끝난 후에만 Repository가 생성되도록 하려면?**
+
+**A.** `useFactory`에 `async` 함수를 쓰고 연결 완료된 객체를 반환한다. Nest는 Promise가 resolve될 때까지 이 provider에 의존하는 클래스의 인스턴스화를 기다린다.
+
+## 핵심 정리
+
+- **IoC**: 객체 생성·연결의 제어권을 컨테이너에 넘김. **DI**: 필요한 의존성을 외부에서 주입. Nest는 `design:paramtypes` 메타데이터로 생성자 파라미터 타입을 읽어 **토큰**으로 provider를 찾는다.
+- 토큰은 클래스, string, symbol, abstract class가 가능하다. `interface`는 런타임에 없으므로 토큰이 될 수 없다 → symbol + `@Inject()` 또는 abstract class 사용.
+- Custom Provider 4종: `useClass`(구현 교체), `useValue`(상수/mock), `useFactory` + `inject`(동적·비동기 생성), `useExisting`(같은 인스턴스에 대한 alias).
+- `@Optional()`은 미해결 의존성을 `undefined`로, 프로퍼티 주입은 상속 구조에서 유용하지만 생성자 주입이 기본.
+- Scope: DEFAULT(싱글톤, 권장) / REQUEST(요청마다, **의존 체인 위로 전파**) / TRANSIENT(consumer마다, 전파 안 됨).
+- REQUEST scope에서는 `@Inject(REQUEST)`로 요청 객체, TRANSIENT에서는 `INQUIRER`로 주입 대상 클래스를 얻는다. 성능 비용이 있으므로 `AsyncLocalStorage` 대안도 고려.
+- 멀티 테넌트는 `durable: true` + `ContextIdStrategy`로 테넌트 단위 DI 서브트리를 재사용.
+- `async useFactory`로 비동기 provider를 만들면 Nest가 resolve될 때까지 의존 클래스 생성을 기다린다.

@@ -1,0 +1,503 @@
+---
+title: "JavaScript 꼬리 질문: 직접 구현하기"
+description: "Promise.all 폴리필, debounce, bind, deepClone, EventEmitter처럼 '설명해 보세요 → 직접 짜 보세요'로 이어지는 질문과 출력 순서 문제. 모든 코드는 Node로 실행해 검증했다."
+order: 5
+---
+
+## 이렇게 활용하세요
+
+질문을 읽고 **빈 에디터에 직접 구현해 본 다음** 답을 여세요. 라이브 코딩 면접에서 자주 나오는 단골 문제들입니다. 면접관은 정답 코드 자체보다 **엣지 케이스를 스스로 짚는지**(빈 배열, 순서 보장, this, 순환 참조)를 봅니다. 그래서 답마다 그 포인트를 같이 적었습니다.
+
+출력 순서 문제의 정답은 Node v26에서 직접 실행한 결과입니다.
+
+## Promise 직접 구현
+
+**Q. (단골) Promise.all을 직접 구현해 보세요.**
+
+**A.** 새 Promise를 반환하고, 입력의 각 항목을 `Promise.resolve`로 감싸 then을 겁니다. 핵심 포인트는 세 가지입니다. 첫째, 결과를 push가 아니라 **인덱스로 저장**해야 끝나는 순서와 상관없이 **입력 순서**가 유지됩니다. 둘째, 남은 개수를 세다가 0이 되면 resolve합니다. 셋째, **하나라도 reject되면 즉시 reject**합니다. 빈 배열이면 바로 빈 배열로 resolve해야 하고, Promise가 아닌 값도 섞여 들어올 수 있습니다.
+
+```js
+function promiseAll(iterable) {
+  return new Promise((resolve, reject) => {
+    const items = Array.from(iterable);
+    const results = new Array(items.length);
+    let remaining = items.length;
+    if (remaining === 0) return resolve(results);   // 빈 입력
+
+    items.forEach((item, i) => {
+      Promise.resolve(item).then((value) => {       // 일반 값도 허용
+        results[i] = value;                          // 순서 보장
+        if (--remaining === 0) resolve(results);
+      }, reject);                                    // 하나라도 실패하면 즉시 reject
+    });
+  });
+}
+
+const sleep = (ms, v) => new Promise((r) => setTimeout(() => r(v), ms));
+await promiseAll([sleep(30, 'a'), 'b', sleep(10, 'c')]);   // ['a', 'b', 'c']
+```
+
+> **꼬리 질문**: 하나가 실패했을 때 나머지 요청은 취소되나요? (아니요. 결과만 버려집니다. 진짜로 멈추려면 AbortController를 같이 써야 합니다)
+
+**Q. Promise.allSettled, race, any도 구현해 보세요. 각각 언제 쓰나요?**
+
+**A.** **allSettled**는 실패해도 멈추지 않고 모든 결과를 `{ status, value | reason }`으로 모읍니다. 각 항목의 성공과 실패를 객체로 바꾼 뒤 all에 넘기면 됩니다. **race**는 가장 먼저 결정된 것(성공이든 실패든)을 따르므로 모든 항목에 같은 resolve, reject를 겁니다. 타임아웃 구현에 씁니다. **any**는 처음 **성공**한 값을 반환하고, 모두 실패하면 **AggregateError**를 던집니다. 여러 미러 서버 중 가장 빠른 응답을 받을 때 씁니다.
+
+```js
+function promiseAllSettled(iterable) {
+  return promiseAll(Array.from(iterable, (p) =>
+    Promise.resolve(p).then(
+      (value) => ({ status: 'fulfilled', value }),
+      (reason) => ({ status: 'rejected', reason }),
+    )));
+}
+
+function promiseRace(iterable) {
+  return new Promise((resolve, reject) => {
+    for (const item of iterable) Promise.resolve(item).then(resolve, reject);
+  });
+}
+
+function promiseAny(iterable) {
+  return new Promise((resolve, reject) => {
+    const items = Array.from(iterable);
+    const errors = new Array(items.length);
+    let remaining = items.length;
+    if (remaining === 0) return reject(new AggregateError([], 'All promises were rejected'));
+    items.forEach((item, i) => {
+      Promise.resolve(item).then(resolve, (err) => {
+        errors[i] = err;
+        if (--remaining === 0) reject(new AggregateError(errors, 'All promises were rejected'));
+      });
+    });
+  });
+}
+```
+
+**Q. (단골) 요청 100개를 동시에 최대 5개씩만 보내도록 구현해 보세요.**
+
+**A.** **워커 풀** 패턴입니다. 동시 실행 수만큼 워커를 만들고, 각 워커는 공유 인덱스에서 다음 작업을 하나씩 꺼내 끝날 때까지 기다린 뒤 또 꺼냅니다. JS는 싱글 스레드라 `next++`가 경쟁 상태 없이 안전합니다. Promise.all로 100개를 한 번에 보내면 서버나 DB 커넥션 풀이 터질 수 있어서 실무에서도 자주 쓰는 패턴입니다.
+
+```js
+async function promisePool(tasks, limit) {
+  const results = new Array(tasks.length);
+  let next = 0;
+
+  async function worker() {
+    while (next < tasks.length) {
+      const i = next++;
+      results[i] = await tasks[i]();   // tasks는 Promise가 아니라 Promise를 만드는 함수
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+  return results;
+}
+// 동시에 실행 중인 작업 수가 limit을 넘지 않음 (검증: 최대 동시 실행 2 / limit 2)
+```
+
+> **꼬리 질문**: 왜 tasks에 Promise가 아니라 함수를 넘기나요? (Promise는 만들어지는 순간 이미 실행이 시작되기 때문입니다)
+
+**Q. 실패하면 지수 백오프로 재시도하는 retry 함수를 만들어 보세요.**
+
+**A.** 시도 횟수를 세면서 실패하면 `base * 2^attempt`만큼 기다렸다가 다시 호출합니다. 여러 클라이언트가 동시에 재시도해서 서버를 다시 때리는 것을 막으려고 **무작위 지연(jitter)** 을 더합니다. 마지막 시도까지 실패하면 원래 에러를 그대로 던집니다.
+
+```js
+async function retry(fn, { retries = 3, base = 100 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      if (attempt >= retries) throw err;
+      const delay = base * 2 ** attempt + Math.random() * base;   // 100, 200, 400… + jitter
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+```
+
+## 함수 다루기
+
+**Q. (단골) debounce를 구현해 보세요. throttle과 무엇이 다른가요?**
+
+**A.** **debounce**는 호출이 몰릴 때 **마지막 호출 후 일정 시간 조용하면 한 번만** 실행합니다. 호출될 때마다 이전 타이머를 지우고 새로 겁니다. 검색창 자동완성이나 창 크기 조절 끝 감지에 씁니다. **throttle**은 **일정 간격마다 최대 한 번** 실행을 보장합니다. 스크롤이나 마우스 이동처럼 계속 들어오는 이벤트를 주기적으로 처리할 때 씁니다. 두 경우 모두 `this`와 인자를 그대로 넘기려고 화살표 함수가 아닌 **function**과 `apply`를 씁니다.
+
+```js
+function debounce(fn, wait) {
+  let timer;
+  return function (...args) {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(this, args), wait);
+  };
+}
+// d(1); d(2); d(3) → 30ms 뒤 3만 한 번 실행
+
+function throttle(fn, wait) {
+  let last = 0, timer = null, lastArgs;
+  return function (...args) {
+    const now = Date.now();
+    const remaining = wait - (now - last);
+    lastArgs = args;
+    if (remaining <= 0) {                 // 간격이 지났으면 즉시 실행
+      clearTimeout(timer); timer = null;
+      last = now;
+      fn.apply(this, args);
+    } else if (!timer) {                  // 마지막 호출도 놓치지 않도록 예약
+      timer = setTimeout(() => {
+        last = Date.now(); timer = null;
+        fn.apply(this, lastArgs);
+      }, remaining);
+    }
+  };
+}
+// t(1); t(2); t(3) → 1은 즉시, 3은 50ms 뒤 (leading + trailing)
+```
+
+> **꼬리 질문**: 첫 호출은 바로 실행되는 leading debounce는 어떻게 바꾸나요? / React에서 debounce 함수를 컴포넌트 안에서 매번 만들면 어떤 문제가 생기나요?
+
+**Q. (단골) call, apply, bind를 직접 구현해 보세요.**
+
+**A.** `obj.method()`처럼 **객체의 메서드로 호출하면 this가 그 객체**가 되는 암시적 바인딩을 이용합니다. 대상 객체에 함수를 **Symbol 키**로 잠깐 붙여 호출하고 바로 지웁니다(기존 속성과 충돌하지 않게). apply는 인자를 배열로 받는 것만 다릅니다. bind는 this와 앞쪽 인자를 기억한 **새 함수**를 반환합니다. 이때 bind된 함수를 `new`로 호출하면 this 바인딩을 무시하고 생성자로 동작해야 한다는 점이 꼬리 질문 포인트입니다.
+
+```js
+Function.prototype.myCall = function (thisArg, ...args) {
+  const ctx = thisArg == null ? globalThis : Object(thisArg);   // 원시값은 래퍼 객체로
+  const key = Symbol('fn');
+  ctx[key] = this;                                              // this = 호출된 함수
+  try { return ctx[key](...args); } finally { delete ctx[key]; }
+};
+
+Function.prototype.myApply = function (thisArg, args = []) {
+  return this.myCall(thisArg, ...args);
+};
+
+Function.prototype.myBind = function (thisArg, ...preset) {
+  const fn = this;
+  function bound(...args) {
+    return new.target
+      ? new fn(...preset, ...args)                 // new로 호출되면 생성자로
+      : fn.myCall(thisArg, ...preset, ...args);
+  }
+  if (fn.prototype) bound.prototype = Object.create(fn.prototype);
+  return bound;
+};
+
+function greet(greeting, mark) { return `${greeting}, ${this.name}${mark}`; }
+greet.myCall({ name: '민지' }, '안녕', '!');      // '안녕, 민지!'
+greet.myBind({ name: '민지' }, '반가워')('~');    // '반가워, 민지~'
+```
+
+**Q. new 연산자가 하는 일을 함수로 구현해 보세요.**
+
+**A.** 네 단계입니다. (1) 생성자의 **prototype을 [[Prototype]]으로 갖는 빈 객체**를 만들고, (2) 그 객체를 this로 생성자를 호출하고, (3) 생성자가 **객체를 명시적으로 return하면 그것을**, (4) 아니면 만든 객체를 반환합니다. 원시값을 return하면 무시된다는 것이 함정입니다.
+
+```js
+function myNew(Ctor, ...args) {
+  const obj = Object.create(Ctor.prototype);
+  const result = Ctor.apply(obj, args);
+  const isObject = result !== null && (typeof result === 'object' || typeof result === 'function');
+  return isObject ? result : obj;
+}
+
+function Point(x, y) { this.x = x; this.y = y; }
+myNew(Point, 3, 4) instanceof Point;                       // true
+myNew(function () { this.a = 1; return { b: 2 }; });       // { b: 2 }
+```
+
+**Q. instanceof를 직접 구현해 보세요.**
+
+**A.** `obj instanceof Ctor`는 **obj의 프로토타입 체인을 따라 올라가며 `Ctor.prototype`이 있는지** 찾는 연산입니다. `Object.getPrototypeOf`로 한 칸씩 올라가다 null에 닿으면 false입니다. 원시값은 항상 false입니다.
+
+```js
+function myInstanceOf(obj, Ctor) {
+  if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) return false;
+  let proto = Object.getPrototypeOf(obj);
+  while (proto !== null) {
+    if (proto === Ctor.prototype) return true;
+    proto = Object.getPrototypeOf(proto);
+  }
+  return false;
+}
+myInstanceOf([], Object);   // true  ([] → Array.prototype → Object.prototype)
+myInstanceOf(1, Number);    // false (원시값)
+```
+
+**Q. (단골) curry 함수를 구현해 보세요. sum(1)(2)(3)()은요?**
+
+**A.** 원래 함수의 **매개변수 개수(`fn.length`)** 만큼 인자가 모일 때까지 인자를 누적하는 새 함수를 반환합니다. 다 모이면 원래 함수를 호출합니다. 인자 개수가 정해지지 않은 `sum(1)(2)(3)()`은 **빈 호출을 종료 신호**로 쓰는 변형입니다. 둘 다 클로저로 누적값을 기억하는 문제입니다.
+
+```js
+function curry(fn) {
+  return function curried(...args) {
+    return args.length >= fn.length
+      ? fn.apply(this, args)
+      : (...more) => curried.apply(this, [...args, ...more]);
+  };
+}
+const add3 = curry((a, b, c) => a + b + c);
+add3(1)(2)(3);   // 6
+add3(1, 2)(3);   // 6
+
+function sum(a) {
+  return (b) => (b === undefined ? a : sum(a + b));
+}
+sum(1)(2)(3)();  // 6
+```
+
+**Q. compose와 pipe를 구현해 보세요.**
+
+**A.** 둘 다 함수 배열을 reduce로 이어 붙입니다. **pipe는 왼쪽에서 오른쪽**(읽는 순서대로), **compose는 오른쪽에서 왼쪽**(수학의 합성 함수 순서)으로 적용합니다. 그래서 reduce와 reduceRight의 차이일 뿐입니다.
+
+```js
+const pipe = (...fns) => (x) => fns.reduce((acc, f) => f(acc), x);
+const compose = (...fns) => (x) => fns.reduceRight((acc, f) => f(acc), x);
+
+const inc = (x) => x + 1, dbl = (x) => x * 2;
+pipe(inc, dbl)(3);      // 8  = dbl(inc(3))
+compose(inc, dbl)(3);   // 7  = inc(dbl(3))
+```
+
+**Q. memoize를 구현해 보세요. 캐시 키는 어떻게 정하나요?**
+
+**A.** 클로저 안에 Map을 두고, 인자로 만든 키가 있으면 저장된 결과를, 없으면 계산해서 저장합니다. 키를 `JSON.stringify(args)`로 만들면 간단하지만 **객체 인자의 키 순서, 함수, 순환 참조**를 제대로 다루지 못합니다. 그래서 키 생성 함수를 바꿀 수 있게 열어 둡니다. 캐시가 무한히 커지는 것도 문제라서 실무에서는 아래 LRU와 합칩니다.
+
+```js
+function memoize(fn, keyFn = (...args) => JSON.stringify(args)) {
+  const cache = new Map();
+  return function (...args) {
+    const key = keyFn(...args);
+    if (!cache.has(key)) cache.set(key, fn.apply(this, args));
+    return cache.get(key);
+  };
+}
+```
+
+## 객체와 자료구조
+
+**Q. (단골) deepClone을 구현해 보세요. 순환 참조가 있으면요?**
+
+**A.** 원시값은 그대로 반환하고, 객체는 새로 만든 뒤 **모든 키를 재귀로 복사**합니다. 순환 참조(`obj.self = obj`)가 있으면 무한 재귀에 빠지므로 **WeakMap에 원본 → 복사본을 기록**하고, 이미 본 객체면 기록된 복사본을 돌려줍니다. Date, RegExp, Map, Set은 따로 처리해야 합니다. 실무에서는 `structuredClone`을 쓰면 되지만, 함수와 클래스 인스턴스의 프로토타입은 보존되지 않는다는 한계도 같이 말하면 좋습니다.
+
+```js
+function deepClone(value, seen = new WeakMap()) {
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return seen.get(value);                 // 순환 참조
+  if (value instanceof Date) return new Date(value);
+  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+  if (value instanceof Map) {
+    const m = new Map(); seen.set(value, m);
+    value.forEach((v, k) => m.set(deepClone(k, seen), deepClone(v, seen)));
+    return m;
+  }
+  if (value instanceof Set) {
+    const s = new Set(); seen.set(value, s);
+    value.forEach((v) => s.add(deepClone(v, seen)));
+    return s;
+  }
+  const copy = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+  seen.set(value, copy);                                        // 재귀 전에 먼저 기록
+  for (const key of Reflect.ownKeys(value)) copy[key] = deepClone(value[key], seen);   // symbol 키 포함
+  return copy;
+}
+
+const orig = { nested: { list: [1, { b: 2 }] } };
+orig.self = orig;
+const copy = deepClone(orig);
+copy.self === copy;              // true (순환 구조도 그대로)
+copy.nested !== orig.nested;     // true
+```
+
+> **꼬리 질문**: `JSON.parse(JSON.stringify(obj))`의 한계는? (Date가 문자열이 되고, undefined와 함수는 사라지고, 순환 참조에서 에러)
+
+**Q. 두 값이 깊은 수준에서 같은지 비교하는 deepEqual을 구현해 보세요.**
+
+**A.** `Object.is`로 같으면 바로 true입니다(NaN끼리도 같다고 처리). 둘 다 객체가 아니면 false입니다. 객체면 **배열 여부, 키 개수, 각 키의 값을 재귀 비교**합니다. 키 개수를 먼저 비교하지 않으면 `{ a: 1 }`과 `{ a: 1, b: undefined }`를 같다고 판단하는 버그가 생깁니다.
+
+```js
+function deepEqual(a, b) {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a), kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual(a[k], b[k]));
+}
+deepEqual({ a: [1, { b: NaN }] }, { a: [1, { b: NaN }] });   // true
+deepEqual({ a: 1 }, { a: 1, b: undefined });                 // false
+deepEqual([1], { 0: 1 });                                    // false
+```
+
+**Q. (단골) EventEmitter를 구현해 보세요. once는 어떻게 만드나요?**
+
+**A.** 이벤트 이름별로 **리스너 배열을 Map에** 저장합니다. emit은 그 배열을 돌며 호출합니다. once는 리스너를 **한 번 호출되면 스스로 off하는 래퍼**로 감싸 등록합니다. 두 가지 함정이 있습니다. 첫째, emit 도중 once 래퍼가 배열을 수정하므로 **복사본을 순회**해야 합니다. 둘째, 사용자가 원래 함수로 off할 수 있게 래퍼에 원본을 기억해 둬야 합니다. 메서드가 this를 반환하면 체이닝이 됩니다.
+
+```js
+class EventEmitter {
+  #events = new Map();
+
+  on(name, listener) {
+    if (!this.#events.has(name)) this.#events.set(name, []);
+    this.#events.get(name).push(listener);
+    return this;                                   // 체이닝
+  }
+
+  off(name, listener) {
+    const list = this.#events.get(name);
+    if (list) this.#events.set(name, list.filter((l) => l !== listener && l.original !== listener));
+    return this;
+  }
+
+  once(name, listener) {
+    const wrapper = (...args) => {
+      this.off(name, wrapper);
+      listener.apply(this, args);
+    };
+    wrapper.original = listener;                   // off(name, 원본)도 동작하게
+    return this.on(name, wrapper);
+  }
+
+  emit(name, ...args) {
+    const list = this.#events.get(name);
+    if (!list || list.length === 0) return false;
+    [...list].forEach((l) => l.apply(this, args)); // 순회 중 수정 대비 복사본
+    return true;
+  }
+}
+```
+
+**Q. (단골) LRU 캐시를 구현해 보세요. get과 set을 O(1)로 만들려면요?**
+
+**A.** JS의 **Map은 삽입 순서를 기억**합니다. get할 때 그 키를 지웠다가 다시 넣으면 "가장 최근"으로 이동하고, 용량을 넘으면 `keys().next()`로 꺼낸 **가장 오래된 키**를 지웁니다. 모든 연산이 O(1)입니다. 다른 언어에서는 해시맵과 이중 연결 리스트를 조합해서 같은 효과를 냅니다.
+
+```js
+class LRUCache {
+  #map = new Map();
+  constructor(capacity) { this.capacity = capacity; }
+
+  get(key) {
+    if (!this.#map.has(key)) return undefined;
+    const value = this.#map.get(key);
+    this.#map.delete(key);
+    this.#map.set(key, value);               // 맨 뒤(가장 최근)로 이동
+    return value;
+  }
+
+  set(key, value) {
+    if (this.#map.has(key)) this.#map.delete(key);
+    this.#map.set(key, value);
+    if (this.#map.size > this.capacity) {
+      this.#map.delete(this.#map.keys().next().value);   // 맨 앞(가장 오래됨) 제거
+    }
+  }
+}
+// set a, set b, get a, set c → b가 밀려남
+```
+
+**Q. Array.prototype.flat과 map, reduce를 직접 구현해 보세요.**
+
+**A.** flat은 요소가 배열이면 **depth를 1 줄여 재귀**로 펼치고 concat합니다. map은 같은 길이의 새 배열에 콜백 결과를 넣습니다. **희소 배열의 빈 칸(`i in this`가 false)은 건너뛰어야** 명세와 같습니다. reduce는 초기값이 없으면 **첫 번째 요소를 누적값으로** 쓰고, 빈 배열에 초기값도 없으면 TypeError를 던집니다. 이 엣지 케이스를 아는지가 포인트입니다.
+
+```js
+function flat(arr, depth = 1) {
+  return depth > 0
+    ? arr.reduce((acc, v) => acc.concat(Array.isArray(v) ? flat(v, depth - 1) : v), [])
+    : arr.slice();
+}
+flat([1, [2, [3, [4]]]]);              // [1, 2, [3, [4]]]
+flat([1, [2, [3, [4]]]], Infinity);    // [1, 2, 3, 4]
+
+Array.prototype.myReduce = function (cb, ...init) {
+  let i = 0, acc;
+  if (init.length) acc = init[0];
+  else {
+    while (i < this.length && !(i in this)) i++;      // 빈 칸 건너뛰기
+    if (i >= this.length) throw new TypeError('Reduce of empty array with no initial value');
+    acc = this[i++];
+  }
+  for (; i < this.length; i++) if (i in this) acc = cb(acc, this[i], i, this);
+  return acc;
+};
+```
+
+## 출력 순서와 동작 원리
+
+**Q. (단골) 다음 코드의 출력 순서는? (Node.js)**
+
+```js
+console.log('1');
+setTimeout(() => console.log('2: timeout'), 0);
+setImmediate(() => console.log('3: immediate'));
+Promise.resolve().then(() => console.log('4: then'));
+process.nextTick(() => console.log('5: nextTick'));
+console.log('6');
+```
+
+**A.** `1 → 6 → 5: nextTick → 4: then`까지는 항상 같습니다. 동기 코드가 먼저 실행되고, 콜 스택이 비면 **nextTick 큐가 Promise 마이크로태스크보다 먼저** 비워지기 때문입니다. 함정은 마지막 두 줄입니다. 메인 모듈에서는 **timeout과 immediate의 순서가 실행할 때마다 달라질 수 있습니다.** 이벤트 루프가 시작될 때 1ms 타이머가 이미 만료됐는지에 따라 timers 단계에서 잡히기도 하고, 못 잡히면 check 단계의 immediate가 먼저 나옵니다. 실제로 세 번 실행하니 한 번은 timeout이, 두 번은 immediate가 먼저 나왔습니다.
+
+```text
+1 → 6 → 5: nextTick → 4: then → (2: timeout, 3: immediate 순서는 비결정적)
+```
+
+> **꼬리 질문**: 그럼 순서를 보장하려면? (아래 질문) / nextTick을 재귀로 계속 걸면 어떻게 되나요? (I/O 단계로 못 넘어가서 이벤트 루프가 굶습니다)
+
+**Q. I/O 콜백 안에서 setTimeout(0)과 setImmediate를 걸면 순서는?**
+
+**A.** 이 경우는 **항상 immediate가 먼저**입니다. I/O 콜백은 **poll 단계**에서 실행되고, 이벤트 루프는 poll 다음에 **check 단계(setImmediate)** 를 거친 뒤 다음 바퀴의 timers 단계로 갑니다. 그래서 "I/O 직후에 실행할 일"은 setImmediate가 확실합니다.
+
+```js
+const fs = require('fs');
+fs.readFile(__filename, () => {
+  setTimeout(() => console.log('timeout'), 0);
+  setImmediate(() => console.log('immediate'));
+});
+// 출력: immediate → timeout (매번 동일)
+```
+
+**Q. (단골) async/await가 섞인 코드의 출력 순서는?**
+
+```js
+async function a() {
+  console.log('a1');
+  await b();
+  console.log('a2');
+}
+async function b() { console.log('b'); }
+
+console.log('start');
+setTimeout(() => console.log('timeout'), 0);
+a();
+new Promise((r) => { console.log('p'); r(); }).then(() => console.log('then'));
+console.log('end');
+```
+
+**A.** `start → a1 → b → p → end → a2 → then → timeout`입니다. 포인트는 **async 함수는 첫 await 전까지 동기로 실행**된다는 것입니다. 그래서 a1과 b가 바로 찍힙니다. `await` 뒤의 코드(a2)는 마이크로태스크로 예약되어 동기 코드(p, end)가 끝난 뒤에 실행됩니다. Promise 생성자에 넘긴 함수(executor)도 **동기로 즉시 실행**되므로 p는 end보다 먼저입니다. 마지막으로 매크로태스크인 timeout이 나옵니다.
+
+**Q. (단골) 다음 반복문의 출력은? var를 let으로 바꾸면 왜 달라지나요?**
+
+```js
+for (var i = 0; i < 3; i++) setTimeout(() => console.log('var', i));
+for (let j = 0; j < 3; j++) setTimeout(() => console.log('let', j));
+```
+
+**A.** var는 `3 3 3`, let은 `0 1 2`입니다. var는 **함수 스코프**라서 변수 i가 하나뿐이고, 콜백 세 개가 모두 **같은 i를 클로저로 참조**합니다. 콜백이 실행될 때는 반복이 끝나 i가 3입니다. let은 **블록 스코프**이고, for문은 **반복마다 새 바인딩**을 만들어 각 콜백이 자기 회차의 j를 기억합니다. let이 없던 시절에는 IIFE로 값을 가두는 방식으로 해결했습니다.
+
+```text
+var 3, var 3, var 3, let 0, let 1, let 2
+```
+
+**Q. Node.js의 worker_threads와 cluster는 어떻게 다르고 언제 쓰나요?**
+
+**A.** **worker_threads**는 **한 프로세스 안에서 스레드**를 띄웁니다. 메모리 공유(SharedArrayBuffer)가 가능하고 가볍습니다. 이미지 처리나 암호화처럼 **CPU를 오래 쓰는 작업**을 메인 이벤트 루프 밖으로 빼서 다른 요청이 막히지 않게 할 때 씁니다. **cluster**는 **프로세스를 여러 개** 띄워 같은 포트를 공유하게 합니다. 각자 이벤트 루프와 메모리를 가지며, **CPU 코어 수만큼 요청 처리량을 늘릴 때** 씁니다. 요즘은 cluster 대신 PM2나 컨테이너 여러 개로 같은 효과를 내는 경우가 많습니다.
+
+> **꼬리 질문**: 스트림의 backpressure란? (쓰는 쪽이 느릴 때 `write()`가 false를 반환하면 읽기를 멈추고 drain 이벤트를 기다리는 흐름 제어. `pipeline()`을 쓰면 자동으로 처리됩니다)
+
+## 출처
+
+- [GreatFrontEnd: JavaScript Coding Interviews](https://www.greatfrontend.com/front-end-interview-playbook/javascript): Promise.all, debounce, deepClone 등 단골 구현 문제 목록
+- [GreatFrontEnd: 10 Must-know JavaScript Coding Interview Questions](https://www.greatfrontend.com/zh-CN/blog/10-must-know-javascript-coding-interview-questions)
+- [NamasteDev: JavaScript interview questions by company](https://namastedev.com/topics/namaste-interview-introduction/javascript-interview-questions-by-company): curry, Promise.all 폴리필, 배열 메서드 폴리필
+- [30 seconds of code: debounce promise](https://30secondsofcode.org/js/s/debounce-promise)
+- [Node.js: Understanding process.nextTick()](https://nodejs.org/en/learn/asynchronous-work/understanding-processnexttick)
+- [GreatFrontEnd: setTimeout vs setImmediate vs process.nextTick](https://www.greatfrontend.com/questions/quiz/what-is-the-difference-between-settimeout-setimmediate-and-processnexttick)
+- [GreatFrontEnd: Senior Node.js Developer Interview Questions](https://www.greatfrontend.com/blog/senior-nodejs-developer-interview-questions-advanced-topics-and-answers): worker_threads, cluster, stream backpressure
+- [OpenReplay: 10 JS interview questions and what they test](https://blog.openreplay.com/10-js-interview-questions-testing/)

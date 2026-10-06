@@ -1,0 +1,393 @@
+---
+title: "TypeScript 꼬리 질문: 직접 구현하기"
+description: "타입 좁히기, Exclude·Omit 직접 구현처럼 '아시나요 → 직접 만들어 보세요'로 이어지는 질문 모음. 모든 정답 코드는 tsc로 검증했다."
+order: 4
+---
+
+## 이렇게 활용하세요
+
+질문을 읽고 **답을 열기 전에 직접 타입을 짜 보세요.** 면접에서는 "아시나요?" 다음에 거의 항상 "그럼 직접 구현해 보세요", "이렇게 바꾸려면요?"가 따라옵니다. 그래서 이 문서는 질문을 **꼬리 질문 사슬** 순서로 묶었습니다.
+
+정답 코드의 `Expect<Equal<A, B>>`는 "A와 B가 정확히 같은 타입이다"를 컴파일러로 검사하는 테스트입니다. 직접 짠 타입을 이 테스트에 넣어 확인해 보세요.
+
+```ts
+// 타입 테스트 도우미 (type-challenges에서 쓰는 방식)
+type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+```
+
+## 타입 좁히기 (Narrowing)
+
+**Q. (단골) 타입스크립트에서 타입 추론의 범위를 좁혀 타입 추론을 하도록 구현할 수 있는데 이에 대해 아시나요?**
+
+**A.** 네, **타입 좁히기(narrowing)** 입니다. 유니온처럼 넓은 타입을 조건문으로 검사하면, 컴파일러가 **제어 흐름 분석(control flow analysis)** 으로 그 블록 안에서는 더 좁은 타입으로 추론합니다. 내장 방법으로 `typeof`, `instanceof`, `in`, 동등 비교(`===`), truthiness 검사가 있습니다. 직접 구현하는 방법으로는 반환 타입이 `x is T`인 **사용자 정의 타입 가드**와 `asserts x is T`인 **단언 함수(assertion function)** 가 있습니다. 실무에서는 공통 필드로 구분하는 **판별 유니온(discriminated union)** 을 가장 많이 씁니다.
+
+```ts
+function format(v: string | number | Date) {
+  if (typeof v === 'string') return v.trim();        // v: string
+  if (v instanceof Date) return v.toISOString();     // v: Date
+  return v.toFixed(2);                               // v: number (남은 것)
+}
+```
+
+> **꼬리 질문**: 그럼 직접 타입 가드 함수를 만들어 보세요. / `in` 연산자로 좁히는 건 어떤 경우에 쓰나요?
+
+**Q. (단골) 사용자 정의 타입 가드를 직접 구현해 보세요.**
+
+**A.** 반환 타입 자리에 `파라미터 is 타입`을 쓰면 됩니다. 함수가 `true`를 반환하면 호출한 쪽의 if 블록 안에서 그 파라미터가 해당 타입으로 좁혀집니다. 주의할 점은 **함수 몸체가 맞는지는 컴파일러가 검사하지 않는다**는 것입니다. 검사 로직이 틀리면 타입은 거짓말을 하게 되니, 판별 로직을 정확히 써야 합니다.
+
+```ts
+interface Fish { swim(): void }
+interface Bird { fly(): void }
+
+function isFish(p: Fish | Bird): p is Fish {
+  return 'swim' in p;
+}
+
+function move(p: Fish | Bird) {
+  if (isFish(p)) p.swim();   // p: Fish
+  else p.fly();              // p: Bird (나머지로 자동 좁혀짐)
+}
+```
+
+> **꼬리 질문**: 반환 타입을 그냥 `boolean`으로 쓰면 무엇이 달라지나요? (좁혀지지 않습니다)
+
+**Q. 타입 가드와 단언 함수(asserts)는 어떻게 다른가요?**
+
+**A.** 타입 가드는 **boolean을 반환**하고 if 안에서만 좁혀집니다. 단언 함수는 `asserts v is T`로 선언하고, 조건이 틀리면 **예외를 던집니다.** 그래서 호출한 **다음 줄부터** 그 스코프 전체에서 타입이 좁혀집니다. 입력 검증 함수나 테스트 헬퍼에 잘 맞습니다.
+
+```ts
+function assertIsString(v: unknown): asserts v is string {
+  if (typeof v !== 'string') throw new Error('not string');
+}
+
+function shout(v: unknown) {
+  assertIsString(v);
+  return v.toUpperCase();   // 여기서부터 v: string
+}
+```
+
+**Q. (단골) 판별 유니온(Discriminated Union)과 never를 이용한 exhaustive check를 설명해 주세요.**
+
+**A.** 유니온의 각 멤버에 `kind` 같은 **리터럴 타입 공통 필드**를 두면, `switch (s.kind)`만으로 각 case에서 정확한 멤버 타입으로 좁혀집니다. `default`에서 남은 값을 `never` 변수에 대입하면, 나중에 유니온에 멤버가 추가됐는데 case를 빠뜨렸을 때 **컴파일 에러**가 나서 누락을 잡을 수 있습니다.
+
+```ts
+type Shape =
+  | { kind: 'circle'; r: number }
+  | { kind: 'rect'; w: number; h: number };
+
+function area(s: Shape): number {
+  switch (s.kind) {
+    case 'circle': return Math.PI * s.r ** 2;   // s: circle
+    case 'rect': return s.w * s.h;              // s: rect
+    default: {
+      const never: never = s;   // 'triangle'이 추가되면 여기서 에러
+      return never;
+    }
+  }
+}
+```
+
+## Exclude와 Omit 직접 구현
+
+**Q. (단골) 타입스크립트에서 Exclude에 대해 아시나요?**
+
+**A.** `Exclude<T, U>`는 유니온 `T`에서 `U`에 **할당 가능한 멤버를 제거**하는 유틸리티 타입입니다. 예를 들어 `Exclude<'a' | 'b' | 'c', 'a'>`는 `'b' | 'c'`입니다. 반대로 남기는 것은 `Extract`입니다. 객체의 **키**를 빼는 것은 `Omit`이고, Exclude는 **유니온의 멤버**를 빼는 것이라는 차이가 있습니다.
+
+```ts
+type T0 = Exclude<'a' | 'b' | 'c', 'a'>;                  // 'b' | 'c'
+type T1 = Exclude<string | number | (() => void), Function>; // string | number
+type T2 = Extract<string | number | boolean, number | boolean>; // number | boolean
+```
+
+**Q. (단골) 그럼 Exclude를 직접 구현한다고 하였을 때 어떻게 구현할 수 있을까요?**
+
+**A.** **조건부 타입**으로 `T extends U ? never : T`라고 쓰면 됩니다. 핵심은 **분배 조건부 타입(distributive conditional type)** 입니다. `T`가 감싸지지 않은 타입 파라미터이고 유니온이 들어오면, 조건부 타입이 **멤버마다 따로** 적용된 뒤 결과가 다시 유니온으로 합쳐집니다. `U`에 해당하는 멤버는 `never`가 되고, 유니온에서 `never`는 사라지므로 결과적으로 제거됩니다.
+
+```ts
+type MyExclude<T, U> = T extends U ? never : T;
+type MyExtract<T, U> = T extends U ? T : never;
+
+// MyExclude<'a' | 'b' | 'c', 'a'> 가 계산되는 과정
+//   ('a' extends 'a' ? never : 'a')   → never
+// | ('b' extends 'a' ? never : 'b')   → 'b'
+// | ('c' extends 'a' ? never : 'c')   → 'c'
+// = 'b' | 'c'
+
+type t1 = Expect<Equal<MyExclude<'a' | 'b' | 'c', 'a'>, 'b' | 'c'>>;
+type t2 = Expect<Equal<MyExtract<string | number | boolean, number | boolean>, number | boolean>>;
+```
+
+> **꼬리 질문**: 분배를 막고 싶을 때는 어떻게 하나요? (아래 질문)
+
+**Q. (단골) 그 Exclude로 Omit과 동일하게 동작하게 하려면 어떻게 해야 할까요?**
+
+**A.** Omit은 "객체 `T`의 키 중 `K`를 뺀 나머지만 고른 타입"이므로, **키 유니온에 Exclude를 적용한 뒤 Pick**하면 됩니다. 즉 `Pick<T, Exclude<keyof T, K>>`입니다. TS 4.1부터는 Mapped Type의 **키 리매핑(`as`)** 으로 Pick 없이 한 번에 쓸 수도 있습니다. 키를 `never`로 바꾸면 그 속성이 사라집니다. 참고로 내장 Omit의 `K`는 `keyof T`가 아니라 **`keyof any`(string, number, symbol)** 로 제약되어 있어서, `T`에 없는 키를 넘겨도 에러가 나지 않습니다.
+
+```ts
+type MyPick<T, K extends keyof T> = { [P in K]: T[P] };
+
+// 방법 1: Exclude + Pick (내장 Omit과 같은 정의)
+type MyOmit<T, K extends keyof any> = MyPick<T, MyExclude<keyof T, K>>;
+
+// 방법 2: 키 리매핑 as
+type MyOmit2<T, K extends keyof any> = {
+  [P in keyof T as P extends K ? never : P]: T[P];
+};
+
+interface Todo { title: string; description: string; completed: boolean }
+
+type t3 = Expect<Equal<MyOmit<Todo, 'description'>, { title: string; completed: boolean }>>;
+type t4 = Expect<Equal<MyOmit2<Todo, 'description' | 'completed'>, { title: string }>>;
+type t5 = Expect<Equal<MyOmit<Todo, 'description'>, Omit<Todo, 'description'>>>;
+```
+
+> **꼬리 질문**: `K extends keyof T`로 바꾸면 어떤 장단점이 있나요? (오타 키를 잡아 주지만, 제네릭 코드에서 쓰기 불편해집니다) / 두 방법의 차이는? (방법 2는 원본의 `readonly`, `?` 수식어를 그대로 유지합니다. 방법 1도 Pick이 homomorphic이라 유지됩니다)
+
+**Q. 분배 조건부 타입을 막으려면 어떻게 하나요? 언제 막아야 하나요?**
+
+**A.** 검사 대상을 **튜플로 감싸** `[T] extends [U]`로 쓰면 분배가 일어나지 않고 유니온 전체를 한 덩어리로 검사합니다. 대표적으로 **`never` 검사**에서 꼭 필요합니다. `never`는 "멤버가 0개인 유니온"이라, 분배되면 조건부 타입이 아예 실행되지 않고 결과가 그냥 `never`가 됩니다.
+
+```ts
+type Distrib<T> = T extends string ? 'yes' : 'no';
+type NoDistrib<T> = [T] extends [string] ? 'yes' : 'no';
+
+type t6 = Expect<Equal<Distrib<string | number>, 'yes' | 'no'>>;   // 멤버별로
+type t7 = Expect<Equal<NoDistrib<string | number>, 'no'>>;         // 통째로
+
+type BadIsNever<T> = T extends never ? true : false;
+type IsNever<T> = [T] extends [never] ? true : false;
+
+type t8 = Expect<Equal<BadIsNever<never>, never>>;   // true가 아니라 never!
+type t9 = Expect<Equal<IsNever<never>, true>>;
+```
+
+## 유틸리티 타입 직접 구현
+
+**Q. (단골) Partial, Required, Readonly를 직접 구현해 보세요.**
+
+**A.** 모두 **Mapped Type** 한 줄입니다. `[P in keyof T]`로 모든 키를 순회하면서 수식어만 바꿉니다. `?`를 붙이면 Partial, **`-?`로 제거**하면 Required, `readonly`를 붙이면 Readonly입니다. `-readonly`로 readonly를 떼는 Mutable도 같은 원리입니다.
+
+```ts
+type MyPartial<T> = { [P in keyof T]?: T[P] };
+type MyRequired<T> = { [P in keyof T]-?: T[P] };
+type MyReadonly<T> = { readonly [P in keyof T]: T[P] };
+type Mutable<T> = { -readonly [P in keyof T]: T[P] };
+
+type t10 = Expect<Equal<MyPartial<Todo>, Partial<Todo>>>;
+type t11 = Expect<Equal<MyRequired<{ a?: number }>, { a: number }>>;
+type t12 = Expect<Equal<Mutable<{ readonly a: 1 }>, { a: 1 }>>;
+```
+
+> **꼬리 질문**: 중첩 객체까지 전부 Partial로 만들려면요? (아래 DeepPartial)
+
+**Q. Pick과 Record를 직접 구현해 보세요. Pick의 K에 왜 제약이 필요한가요?**
+
+**A.** Pick은 `K extends keyof T`로 제약해서 **T에 실제로 있는 키만** 받게 하고, `[P in K]: T[P]`로 그 키만 순회합니다. 제약이 없으면 `T[P]` 인덱스 접근이 성립하지 않아 에러가 납니다. Record는 키 유니온 `K`를 순회하며 모든 값을 `V`로 채웁니다.
+
+```ts
+type MyPick<T, K extends keyof T> = { [P in K]: T[P] };
+type MyRecord<K extends keyof any, V> = { [P in K]: V };
+
+type t13 = Expect<Equal<MyPick<Todo, 'title'>, { title: string }>>;
+type t14 = Expect<Equal<MyRecord<'x' | 'y', number>, { x: number; y: number }>>;
+```
+
+**Q. NonNullable을 직접 구현해 보세요.**
+
+**A.** Exclude와 같은 패턴입니다. 분배 조건부 타입으로 `null`과 `undefined`에 해당하는 멤버만 `never`로 만듭니다. (최신 내장 정의는 `T & {}`라는 더 짧은 형태를 씁니다.)
+
+```ts
+type MyNonNullable<T> = T extends null | undefined ? never : T;
+type t15 = Expect<Equal<MyNonNullable<string | null | undefined>, string>>;
+```
+
+## 조건부 타입과 infer
+
+**Q. (단골) ReturnType을 직접 구현해 보세요. infer는 무엇인가요?**
+
+**A.** `infer`는 조건부 타입의 `extends` 절 **안에서만** 쓸 수 있는 키워드로, "이 자리에 오는 타입을 **추론해서 변수에 담아라**"라는 뜻입니다. 함수 타입 패턴 `(...args: any) => infer R`과 매칭시켜 반환 자리를 `R`로 꺼내면 ReturnType이 됩니다. 같은 방식으로 인자 자리를 꺼내면 Parameters입니다.
+
+```ts
+type MyReturnType<F extends (...args: any) => any> =
+  F extends (...args: any) => infer R ? R : never;
+type MyParameters<F extends (...args: any) => any> =
+  F extends (...args: infer P) => any ? P : never;
+
+declare function fn(a: number, b: string): boolean;
+type t16 = Expect<Equal<MyReturnType<typeof fn>, boolean>>;
+type t17 = Expect<Equal<MyParameters<typeof fn>, [a: number, b: string]>>;
+```
+
+> **꼬리 질문**: 배열의 요소 타입이나 Promise 안의 타입은 어떻게 꺼내나요?
+
+**Q. (단골) Awaited를 직접 구현해 보세요. Promise가 중첩되면요?**
+
+**A.** `T extends PromiseLike<infer U>`로 감싼 값을 꺼내고, 꺼낸 `U`에 **다시 자기 자신을 재귀 적용**합니다. 그래야 `Promise<Promise<number>>`도 끝까지 풀립니다. `Promise` 대신 `PromiseLike`를 쓰는 이유는 then 메서드만 있는 **thenable**도 await로 풀리기 때문입니다.
+
+```ts
+type MyAwaited<T> = T extends PromiseLike<infer U> ? MyAwaited<U> : T;
+type t18 = Expect<Equal<MyAwaited<Promise<Promise<number>>>, number>>;
+
+type ElementOf<T> = T extends readonly (infer E)[] ? E : never;
+type t19 = Expect<Equal<ElementOf<string[]>, string>>;
+```
+
+**Q. 튜플의 첫 번째, 마지막 요소와 길이 타입을 구해 보세요.**
+
+**A.** 튜플 패턴에 `infer`를 섞습니다. `[infer F, ...unknown[]]`이면 첫 요소, `[...unknown[], infer L]`이면 마지막 요소입니다. 길이는 튜플의 `length` 속성이 **리터럴 숫자 타입**이라서 `T['length']`로 바로 꺼낼 수 있습니다. 빈 튜플이면 패턴 매칭에 실패하므로 `never`가 됩니다.
+
+```ts
+type First<T extends readonly unknown[]> = T extends readonly [infer F, ...unknown[]] ? F : never;
+type Last<T extends readonly unknown[]> = T extends readonly [...unknown[], infer L] ? L : never;
+type Length<T extends readonly unknown[]> = T['length'];
+
+type t20 = Expect<Equal<First<[1, 2, 3]>, 1>>;
+type t21 = Expect<Equal<First<[]>, never>>;
+type t22 = Expect<Equal<Last<[1, 2, 3]>, 3>>;
+type t23 = Expect<Equal<Length<readonly ['a', 'b']>, 2>>;
+```
+
+> **꼬리 질문**: 튜플을 유니온으로 바꾸려면? (`T[number]`) / `as const` 배열에서 유니온을 뽑는 방법은?
+
+**Q. 배열 상수에서 유니온 타입을 뽑아내 보세요.**
+
+**A.** `as const`로 선언하면 배열이 **readonly 튜플 리터럴 타입**이 됩니다. 여기에 숫자 인덱스 접근 `[number]`를 하면 모든 요소 타입의 유니온이 나옵니다. enum 대신 이 패턴을 쓰면 런타임 값과 타입을 한 곳에서 관리할 수 있습니다.
+
+```ts
+const ROLES = ['admin', 'member', 'guest'] as const;
+type Role = (typeof ROLES)[number];   // 'admin' | 'member' | 'guest'
+
+type TupleToUnion<T extends readonly unknown[]> = T[number];
+type t24 = Expect<Equal<TupleToUnion<['a', 1]>, 'a' | 1>>;
+```
+
+## Mapped Type 응용
+
+**Q. (단골) 중첩 객체까지 전부 readonly(또는 optional)로 만드는 DeepReadonly를 구현해 보세요.**
+
+**A.** Mapped Type 안에서 값 타입에 **자기 자신을 재귀 적용**합니다. 주의할 점이 두 가지 있습니다. 첫째, 원시 타입에서 재귀를 멈춰야 합니다(`T extends object`). 둘째, **함수는 object이기도 하므로** 따로 걸러 그대로 둬야 합니다.
+
+```ts
+type DeepReadonly<T> =
+  T extends (...args: any[]) => any ? T
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+  : T;
+
+type DR = DeepReadonly<{ a: { b: { c: number } }; f: () => void }>;
+type t25 = Expect<Equal<DR, { readonly a: { readonly b: { readonly c: number } }; readonly f: () => void }>>;
+
+type DeepPartial<T> = T extends object ? { [K in keyof T]?: DeepPartial<T[K]> } : T;
+const patch: DeepPartial<{ a: { b: number; c: string } }> = { a: { b: 1 } };   // OK
+```
+
+**Q. 객체 타입에서 getter 메서드 타입을 자동으로 만들어 보세요. (`name` → `getName`)**
+
+**A.** **키 리매핑 `as`** 와 **템플릿 리터럴 타입**을 같이 씁니다. `as` 뒤에서 키 이름을 `get${Capitalize<...>}` 형태로 바꿉니다. `keyof T`에는 symbol도 포함될 수 있으므로 `string & K`로 문자열 키만 남겨야 Capitalize를 쓸 수 있습니다.
+
+```ts
+type Getters<T> = {
+  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+
+type t26 = Expect<Equal<
+  Getters<{ name: string; age: number }>,
+  { getName: () => string; getAge: () => number }
+>>;
+```
+
+**Q. 문자열 리터럴 타입을 파싱해 보세요. '/users/:id/posts/:postId'에서 파라미터 이름을 뽑으려면요?**
+
+**A.** 템플릿 리터럴 타입 안에서도 `infer`를 쓸 수 있습니다. `:` 다음부터 `/` 전까지를 `infer P`로 꺼내고, 나머지 문자열에 **재귀**를 걸어 유니온으로 모읍니다. Express나 NestJS 라우터의 타입 안전 라우팅이 이런 방식입니다.
+
+```ts
+type RouteParams<S extends string> =
+  S extends `${string}:${infer P}/${infer Rest}` ? P | RouteParams<`/${Rest}`>
+  : S extends `${string}:${infer P}` ? P
+  : never;
+
+type t27 = Expect<Equal<RouteParams<'/users/:id/posts/:postId'>, 'id' | 'postId'>>;
+
+type TrimLeft<S extends string> = S extends `${' ' | '\n' | '\t'}${infer R}` ? TrimLeft<R> : S;
+type t28 = Expect<Equal<TrimLeft<'   hi '>, 'hi '>>;
+```
+
+## 타입 시스템 개념
+
+**Q. (단골) any, unknown, never의 차이는 무엇인가요?**
+
+**A.** **any**는 타입 검사를 끄는 탈출구로, 무엇이든 할당되고 무엇에든 할당됩니다. **unknown**은 "무엇이든 올 수 있지만 **좁히기 전에는 아무것도 할 수 없는**" 안전한 top type이라 외부 입력이나 catch의 error에 씁니다. **never**는 값이 **절대 존재할 수 없는** bottom type입니다. 항상 throw하는 함수의 반환, exhaustive check, 조건부 타입에서 멤버를 지울 때 씁니다.
+
+```ts
+function parse(input: unknown) {
+  // input.trim();                         // Error: 'input' is of type 'unknown'
+  if (typeof input === 'string') return input.trim();   // 좁힌 뒤엔 OK
+}
+function fail(msg: string): never {
+  throw new Error(msg);
+}
+```
+
+> **꼬리 질문**: 유니온에 never를 섞으면 어떻게 되나요? (`string | never`는 `string`. 그래서 Exclude가 동작합니다)
+
+**Q. keyof any는 무엇이고, 왜 Omit의 제약에 쓰이나요?**
+
+**A.** `keyof any`는 객체 키가 될 수 있는 모든 타입, 즉 **`string | number | symbol`** 입니다(`PropertyKey`와 같음). 내장 Omit은 `K extends keyof any`로 되어 있어서, `T`에 없는 키를 넘겨도 에러 없이 그냥 무시합니다. 엄격하게 막고 싶으면 `K extends keyof T`로 직접 정의해 쓰면 됩니다.
+
+```ts
+type t29 = Expect<Equal<keyof any, string | number | symbol>>;
+type O = Omit<{ a: 1 }, 'typo'>;   // 에러 없음 → { a: 1 }
+```
+
+**Q. (단골) satisfies와 타입 어노테이션(:), as의 차이를 설명해 주세요.**
+
+**A.** **어노테이션**은 변수의 타입을 그 타입으로 **넓혀서 고정**하므로 구체적인 정보가 사라집니다. **as**는 검사를 느슨하게 하는 **단언**이라 틀린 값도 통과시킬 수 있습니다. **satisfies**(TS 4.9+)는 "이 타입 조건을 만족하는지 **검사만** 하고, 추론된 구체 타입은 그대로 유지"합니다. 설정 객체처럼 형태는 검증하면서 각 값의 정확한 타입도 쓰고 싶을 때 씁니다.
+
+```ts
+type Color = 'red' | 'green';
+
+const palette = {
+  red: [255, 0, 0],
+  green: '#00ff00',
+} satisfies Record<Color, string | number[]>;
+
+palette.green.toUpperCase();   // OK: string으로 유지됨
+palette.red[0].toFixed();      // OK: number[]로 유지됨
+// 같은 객체를 ': Record<Color, string | number[]>'로 선언하면
+// palette.green은 string | number[]가 되어 toUpperCase에서 에러
+```
+
+**Q. 구조적 타이핑(Structural Typing)이란 무엇인가요? 같은 모양의 타입을 구분하려면요?**
+
+**A.** 타입스크립트는 이름이 아니라 **구조(모양)가 맞으면 호환**되는 구조적 타입 시스템입니다. 그래서 `UserId`와 `OrderId`가 둘 다 `string`이면 서로 섞여도 막지 못합니다. 이를 구분하려면 존재하지 않는 표식 속성을 교차시키는 **브랜드(branded) 타입**으로 이름 기반처럼 흉내 냅니다.
+
+```ts
+type UserId = string & { readonly __brand: 'UserId' };
+type OrderId = string & { readonly __brand: 'OrderId' };
+
+const toUserId = (s: string) => s as UserId;
+function findUser(id: UserId) {}
+
+findUser(toUserId('u1'));   // OK
+// findUser('o1' as OrderId); // Error: OrderId는 UserId에 할당 불가
+```
+
+**Q. interface와 type alias는 언제 무엇을 쓰나요?**
+
+**A.** 객체 모양을 정의할 때는 둘 다 쓸 수 있습니다. 차이는 세 가지입니다. **interface는 선언 병합(declaration merging)** 이 되어 라이브러리 타입 확장(예: Express Request에 user 추가)에 쓰입니다. **type은 유니온, 튜플, 조건부·Mapped Type** 같은 표현이 가능합니다. 확장은 interface가 `extends`, type이 `&`입니다. 팀 컨벤션을 따르되, 공개 API의 객체 모양은 interface, 조합이 필요한 타입은 type으로 나누는 경우가 많습니다.
+
+```ts
+interface Req { url: string }
+interface Req { user?: { id: number } }   // 병합되어 두 필드 모두 가짐
+
+type Result = { ok: true; data: string } | { ok: false; error: Error };   // type만 가능
+```
+
+## 출처
+
+- [type-challenges (GitHub)](https://github.com/type-challenges/type-challenges): 유틸리티 타입 직접 구현 문제와 `Equal`/`Expect` 테스트 패턴
+- [TypeScript Handbook: Narrowing](https://www.typescriptlang.org/docs/handbook/2/narrowing.html)
+- [TypeScript Handbook: Conditional Types](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html)
+- [TypeScript Handbook: Mapped Types](https://www.typescriptlang.org/docs/handbook/2/mapped-types.html)
+- [TypeScript Handbook: Utility Types](https://www.typescriptlang.org/docs/handbook/utility-types.html)
+- [TypeScript 4.9 Release Notes: satisfies](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html)

@@ -1,0 +1,1273 @@
+---
+title: "디자인 패턴"
+description: "CQRS, Saga, Transactional Outbox부터 Proxy, Strategy, Observer, Decorator, Repository, Factory까지 NestJS에서 디자인 패턴을 적용하는 방법"
+order: 13
+---
+
+## 한눈에 보기
+
+- **CQRS**: 쓰기(Command)와 읽기(Query)를 다른 길로 보낸다. `@nestjs/cqrs`의 버스 + 핸들러 구조.
+- **Saga / Outbox**: 여러 단계·여러 서비스에 걸친 작업을 "실패하면 되돌리고", "이벤트는 절대 잃어버리지 않게" 만드는 패턴.
+- **Proxy / Strategy / Factory / Repository**: NestJS DI(`useClass`, `useFactory`, 토큰 교체)만으로 거의 공짜로 구현된다.
+- **Observer / Decorator**: `@OnEvent`로 결합도를 끊고, `applyDecorators`로 반복되는 데코레이터를 하나로 묶는다.
+- 패턴은 비용이 있다. 문제가 실제로 있을 때 그 부분에만 쓰자.
+
+NestJS는 DI 컨테이너, 데코레이터, 모듈 시스템을 기본으로 제공하기 때문에 GoF 패턴이나 아키텍처 패턴을 "프레임워크 기능 그 자체"로 쓰고 있는 경우가 많다. 이 문서에서는 각 패턴을 **문제 상황 → 개념 → NestJS 코드 → 장단점/언제 쓰나** 순서로 정리한다.
+
+## CQRS (Command Query Responsibility Segregation)
+
+> **비유**: 식당에서 주문 접수 창구(쓰기)와 메뉴판·영수증 조회(읽기)를 다른 직원이 맡는 것. 주문 담당은 재고·결제 규칙을 꼼꼼히 따지고, 조회 담당은 손님이 보기 좋게 빨리 보여주는 데만 집중한다.
+
+### 문제 상황
+
+`OrdersService` 하나에 주문 생성, 취소, 목록 조회, 통계 조회, 관리자용 검색이 다 들어가 있다. 쓰기 로직은 도메인 규칙과 트랜잭션이 복잡하고, 읽기 로직은 join과 페이징, 캐싱이 복잡하다. 둘이 한 클래스에 섞이면서 서비스가 1,000줄을 넘어가고, 읽기 최적화를 하려고 엔티티를 바꾸면 쓰기 로직이 깨진다.
+
+### 개념
+
+- **Command**: 상태를 변경하는 의도 ("주문을 생성하라"). 결과는 보통 없거나 ID 정도만 반환
+- **Query**: 상태를 읽기만 하는 요청. 부수효과가 없어야 함
+- **Event**: 이미 일어난 사실 ("주문이 생성되었다")
+
+`@nestjs/cqrs`는 이 셋을 각각 `CommandBus`, `QueryBus`, `EventBus`로 디스패치하고, 각 메시지마다 핸들러 클래스 하나가 대응하는 구조를 제공한다.
+
+요청 하나가 흐르는 순서는 이렇다.
+
+1. Controller가 `new CreateOrderCommand(...)`를 만들어 `commandBus.execute()`에 넣는다.
+2. `CommandBus`가 해당 Command 클래스에 매칭된 `CreateOrderHandler`를 찾아 실행한다.
+3. Handler가 Aggregate를 만들고 저장한 뒤 `commit()` → 쌓인 이벤트가 `EventBus`로 나간다.
+4. `@EventsHandler`와 `@Saga()`가 이벤트에 반응해 후속 작업을 한다.
+5. 조회는 별도로 `queryBus.execute(new GetOrderQuery(id))` → `QueryHandler`가 처리한다.
+
+```bash
+npm i @nestjs/cqrs
+```
+
+### Command / CommandHandler
+
+```ts
+// orders/commands/create-order.command.ts
+export class CreateOrderCommand {
+  constructor(
+    public readonly userId: string,
+    public readonly items: { productId: string; quantity: number }[],
+  ) {}
+}
+```
+
+```ts
+// orders/commands/create-order.handler.ts
+import { CommandHandler, ICommandHandler, EventPublisher } from '@nestjs/cqrs';
+import { CreateOrderCommand } from './create-order.command';
+import { OrderRepository } from '../order.repository';
+import { Order } from '../domain/order.aggregate';
+
+@CommandHandler(CreateOrderCommand)
+export class CreateOrderHandler implements ICommandHandler<CreateOrderCommand> {
+  constructor(
+    private readonly orderRepository: OrderRepository,
+    private readonly publisher: EventPublisher,
+  ) {}
+
+  async execute(command: CreateOrderCommand): Promise<string> {
+    // AggregateRoot에 EventBus를 연결
+    const order = this.publisher.mergeObjectContext(
+      Order.create(command.userId, command.items),
+    );
+
+    await this.orderRepository.save(order);
+
+    // 저장이 성공한 뒤에 쌓아둔 이벤트를 실제로 발행
+    order.commit();
+    return order.id;
+  }
+}
+```
+
+### AggregateRoot + mergeObjectContext
+
+`AggregateRoot`를 상속하면 `apply(event)`로 이벤트를 **내부 큐에 쌓기만** 하고, `commit()`을 호출하는 순간 `EventBus`로 발행된다. `publisher.mergeObjectContext(obj)`는 이미 생성된 인스턴스에 publish 능력을 붙여주고, `publisher.mergeClassContext(Class)`는 클래스 자체에 붙여준다.
+
+```ts
+// orders/domain/order.aggregate.ts
+import { AggregateRoot } from '@nestjs/cqrs';
+import { randomUUID } from 'crypto';
+import { OrderCreatedEvent } from '../events/order-created.event';
+import { OrderCancelledEvent } from '../events/order-cancelled.event';
+
+type OrderStatus = 'PENDING' | 'PAID' | 'CANCELLED';
+
+export class Order extends AggregateRoot {
+  private constructor(
+    public readonly id: string,
+    public readonly userId: string,
+    public readonly items: { productId: string; quantity: number }[],
+    private _status: OrderStatus,
+  ) {
+    super();
+  }
+
+  static create(userId: string, items: { productId: string; quantity: number }[]) {
+    if (items.length === 0) throw new Error('주문 항목이 비어 있습니다');
+    const order = new Order(randomUUID(), userId, items, 'PENDING');
+    order.apply(new OrderCreatedEvent(order.id, userId, items));
+    return order;
+  }
+
+  cancel(reason: string) {
+    if (this._status === 'CANCELLED') return;
+    this._status = 'CANCELLED';
+    this.apply(new OrderCancelledEvent(this.id, reason));
+  }
+
+  get status() {
+    return this._status;
+  }
+}
+```
+
+> **포인트**: `apply()`는 즉시 발행이 아니다. 저장이 실패하면 `commit()`을 호출하지 않으면 되므로 "DB 반영 안 됐는데 이벤트만 나가는" 상황을 어느 정도 막을 수 있다.
+
+> **주의**: 저장 성공 후 `commit()` 전에 프로세스가 죽으면 이벤트는 유실된다. 또 `mergeObjectContext`를 빼먹으면 `commit()`을 호출해도 아무 일도 일어나지 않는다(흔한 실수). 유실 문제는 아래 Outbox 패턴으로 해결한다.
+
+### Query / QueryHandler
+
+```ts
+// orders/queries/get-order.query.ts
+export class GetOrderQuery {
+  constructor(public readonly orderId: string) {}
+}
+
+// orders/queries/get-order.handler.ts
+import { IQueryHandler, QueryHandler } from '@nestjs/cqrs';
+import { NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+
+export interface OrderView {
+  id: string;
+  status: string;
+  totalPrice: number;
+  itemCount: number;
+}
+
+@QueryHandler(GetOrderQuery)
+export class GetOrderHandler implements IQueryHandler<GetOrderQuery, OrderView> {
+  constructor(private readonly dataSource: DataSource) {}
+
+  async execute({ orderId }: GetOrderQuery): Promise<OrderView> {
+    // 읽기 쪽은 도메인 모델을 거치지 않고 화면에 맞는 projection을 바로 조회
+    const [row] = await this.dataSource.query(
+      `SELECT o.id, o.status, SUM(i.price * i.quantity) AS "totalPrice", COUNT(i.id) AS "itemCount"
+         FROM orders o JOIN order_items i ON i.order_id = o.id
+        WHERE o.id = $1 GROUP BY o.id`,
+      [orderId],
+    );
+    if (!row) throw new NotFoundException();
+    return row;
+  }
+}
+```
+
+### EventsHandler
+
+```ts
+// orders/events/order-created.event.ts
+export class OrderCreatedEvent {
+  constructor(
+    public readonly orderId: string,
+    public readonly userId: string,
+    public readonly items: { productId: string; quantity: number }[],
+  ) {}
+}
+
+// orders/events/order-created.handler.ts
+import { EventsHandler, IEventHandler } from '@nestjs/cqrs';
+
+@EventsHandler(OrderCreatedEvent)
+export class OrderCreatedHandler implements IEventHandler<OrderCreatedEvent> {
+  constructor(private readonly mailService: MailService) {}
+
+  async handle(event: OrderCreatedEvent) {
+    await this.mailService.sendOrderConfirmation(event.userId, event.orderId);
+  }
+}
+```
+
+### Controller와 Module 연결
+
+```ts
+@Controller('orders')
+export class OrdersController {
+  constructor(
+    private readonly commandBus: CommandBus,
+    private readonly queryBus: QueryBus,
+  ) {}
+
+  @Post()
+  async create(@Body() dto: CreateOrderDto) {
+    const id = await this.commandBus.execute(new CreateOrderCommand(dto.userId, dto.items));
+    return { id };
+  }
+
+  @Get(':id')
+  findOne(@Param('id') id: string) {
+    return this.queryBus.execute(new GetOrderQuery(id));
+  }
+}
+
+@Module({
+  imports: [CqrsModule],
+  controllers: [OrdersController],
+  providers: [
+    OrderRepository,
+    CreateOrderHandler,
+    GetOrderHandler,
+    OrderCreatedHandler,
+    OrderSagas,
+  ],
+})
+export class OrdersModule {}
+```
+
+> **주의**: 핸들러는 반드시 `providers`에 등록해야 한다. 빠뜨리면 실행 시 "handler not found" 류의 에러가 난다.
+
+핸들러를 등록해야 하는 이유는 `CqrsModule`이 부트스트랩 시 `@CommandHandler` 메타데이터가 붙은 provider를 탐색해서 버스에 등록하기 때문이다. 루트에서 `CqrsModule.forRoot()`를 한 번 호출하고 기능 모듈에서는 `CqrsModule`만 import하는 방식도 쓴다(최신 버전).
+
+### 장단점 / 언제 쓰나
+
+| 장점 | 단점 |
+| --- | --- |
+| 쓰기/읽기 모델을 독립적으로 최적화 | 파일 수가 폭증 (Command, Handler, Event, Query...) |
+| 핸들러 단위라 단일 책임이 명확, 테스트 쉬움 | 간단한 CRUD에는 과한 보일러플레이트 |
+| 이벤트 기반 확장(Saga, 알림 등)이 자연스러움 | 흐름 추적이 어려움 (버스를 거치면서 호출 그래프가 숨겨짐) |
+| 읽기 DB 분리(Read Replica, ES 등)로 확장 가능 | 읽기 모델을 분리하면 eventual consistency를 감수해야 함 |
+
+도메인 규칙이 복잡하고 읽기 패턴이 쓰기와 크게 다른 bounded context에만 부분적으로 적용하는 것을 추천한다. 전체 앱을 CQRS로 도배하면 유지보수가 오히려 힘들어진다.
+
+## Saga
+
+> **비유**: 여행 패키지 예약. 항공권 → 호텔 → 렌터카를 차례로 예약하다가 렌터카가 실패하면, 이미 잡은 호텔과 항공권을 **취소 수수료를 내고라도 하나씩 취소**한다. "처음부터 없던 일"로 되감는 게 아니라 "취소라는 새 행동"을 하는 것이 핵심이다.
+
+Saga라는 단어는 두 가지 맥락에서 쓰인다. `@nestjs/cqrs`의 `@Saga()`와, 마이크로서비스 분산 트랜잭션 관점의 Saga 패턴이다. 둘은 관련은 있지만 같은 것이 아니다.
+
+### @nestjs/cqrs의 @Saga()
+
+#### 문제 상황
+
+"주문이 생성되면 재고를 예약하고, 재고 예약이 실패하면 주문을 취소한다" 같은 흐름을 이벤트 핸들러 안에 `commandBus.execute()`로 직접 적으면 핸들러끼리 서로를 알게 되고 흐름이 여기저기 흩어진다.
+
+#### 개념
+
+`@Saga()`는 `Observable` 형태의 이벤트 스트림을 받아서 **다음 Command의 스트림**을 반환하는 메서드다. 반환된 Command는 `CqrsModule`이 자동으로 `CommandBus`에 넣어준다. 즉 "이벤트 → 커맨드" 매핑을 한 곳에 선언적으로 모아둔다.
+
+```ts
+// orders/sagas/order.sagas.ts
+import { Injectable } from '@nestjs/common';
+import { ICommand, ofType, Saga } from '@nestjs/cqrs';
+import { Observable } from 'rxjs';
+import { map, delay, filter } from 'rxjs/operators';
+import { OrderCreatedEvent } from '../events/order-created.event';
+import { StockReservationFailedEvent } from '../events/stock-reservation-failed.event';
+import { ReserveStockCommand } from '../../inventory/commands/reserve-stock.command';
+import { CancelOrderCommand } from '../commands/cancel-order.command';
+
+@Injectable()
+export class OrderSagas {
+  @Saga()
+  orderCreated = (events$: Observable<any>): Observable<ICommand> =>
+    events$.pipe(
+      ofType(OrderCreatedEvent),
+      map((event) => new ReserveStockCommand(event.orderId, event.items)),
+    );
+
+  @Saga()
+  stockFailed = (events$: Observable<any>): Observable<ICommand> =>
+    events$.pipe(
+      ofType(StockReservationFailedEvent),
+      filter((event) => event.retryable === false),
+      delay(100),
+      map((event) => new CancelOrderCommand(event.orderId, '재고 부족')),
+    );
+}
+```
+
+> **포인트**: `@Saga()`는 프로퍼티(화살표 함수)로 정의하는 것이 공식 예제 스타일이다. 실패 가능한 로직은 Saga가 아니라 Command Handler 안에 두자.
+
+> **주의**: 반환 Observable에서 에러가 나면 스트림이 죽어서 그 뒤 이벤트를 영영 처리하지 않는다. 필요하면 `catchError`로 방어하자.
+
+> **주의**: 인메모리 `EventBus` 기반이라 **프로세스가 죽으면 진행 중인 흐름 상태는 사라진다**. `@Saga()`는 단일 서비스 내부의 워크플로 연결 도구이지, 내구성 있는 분산 트랜잭션 코디네이터가 아니다.
+
+### 분산 트랜잭션 관점의 Saga
+
+#### 문제 상황
+
+주문 서비스, 결제 서비스, 재고 서비스가 각자 DB를 가진다. 하나의 비즈니스 트랜잭션(주문 → 결제 → 재고 차감)을 2PC(2-Phase Commit) 없이 일관성 있게 처리해야 한다.
+
+#### 개념
+
+Saga = **로컬 트랜잭션의 연속**. 각 단계는 자기 DB에서 커밋하고 다음 단계를 트리거한다. 중간 단계가 실패하면 이미 커밋된 앞 단계를 되돌리는 **보상 트랜잭션(compensating transaction)**을 역순으로 실행한다.
+
+```text
+정상 흐름:   CreateOrder(T1) → ChargePayment(T2) → ReserveStock(T3) → 완료
+T3 실패 시:  RefundPayment(C2) → CancelOrder(C1)
+```
+
+보상 트랜잭션은 "롤백"이 아니라 **의미적으로 반대 동작을 하는 새로운 트랜잭션**이다. 결제 취소는 결제 레코드를 삭제하는 게 아니라 환불 레코드를 만드는 것이다. 그래서 중간 상태(결제는 됐는데 주문은 아직 확정 아님)가 외부에 보일 수 있다 → 격리성(Isolation)이 없다는 것이 Saga의 근본적 trade-off다.
+
+#### Choreography vs Orchestration
+
+> **비유**: Choreography는 **즉흥 댄스** — 지휘자 없이 각자 음악(이벤트)을 듣고 알아서 움직인다. Orchestration은 **오케스트라** — 지휘자(Orchestrator)가 "이제 바이올린, 다음 첼로" 하고 순서를 지시한다.
+
+| 구분 | Choreography | Orchestration |
+| --- | --- | --- |
+| 조정 방식 | 각 서비스가 이벤트를 구독하고 스스로 다음 행동 결정 | 중앙 Orchestrator가 각 서비스에 Command를 보내고 응답을 받아 다음 단계 결정 |
+| 결합도 | 낮음 (이벤트만 공유) | Orchestrator가 모든 참여자를 앎 |
+| 흐름 가시성 | 낮음, 흐름이 여러 서비스에 분산 | 높음, 상태 머신 하나로 파악 가능 |
+| 적합한 규모 | 참여자 2~4개의 단순한 흐름 | 단계가 많고 분기/타임아웃이 복잡한 흐름 |
+| 위험 | 순환 이벤트, "누가 뭘 하는지" 모름 | Orchestrator가 단일 실패 지점/비대해짐 |
+
+Orchestration 방식에서 Orchestrator는 **상태를 DB에 저장**해야 한다. 아래는 단순화한 예시다.
+
+```ts
+// order-saga.orchestrator.ts
+type SagaStep = 'STARTED' | 'PAYMENT_CHARGED' | 'STOCK_RESERVED' | 'COMPENSATING' | 'DONE' | 'FAILED';
+
+@Injectable()
+export class OrderSagaOrchestrator {
+  constructor(
+    private readonly sagaRepo: SagaStateRepository,
+    private readonly payment: PaymentClient,
+    private readonly inventory: InventoryClient,
+    private readonly orders: OrderRepository,
+  ) {}
+
+  async run(orderId: string) {
+    const saga = await this.sagaRepo.start(orderId); // step = STARTED
+    try {
+      await this.payment.charge(orderId);
+      await this.sagaRepo.update(saga.id, 'PAYMENT_CHARGED');
+
+      await this.inventory.reserve(orderId);
+      await this.sagaRepo.update(saga.id, 'STOCK_RESERVED');
+
+      await this.orders.confirm(orderId);
+      await this.sagaRepo.update(saga.id, 'DONE');
+    } catch (e) {
+      await this.compensate(saga.id, orderId);
+    }
+  }
+
+  private async compensate(sagaId: string, orderId: string) {
+    const saga = await this.sagaRepo.findById(sagaId);
+    await this.sagaRepo.update(sagaId, 'COMPENSATING');
+
+    // 진행된 단계의 역순으로 보상. 각 보상은 멱등해야 재시도해도 안전
+    if (saga.step === 'STOCK_RESERVED') await this.inventory.release(orderId);
+    if (saga.step === 'STOCK_RESERVED' || saga.step === 'PAYMENT_CHARGED') {
+      await this.payment.refund(orderId);
+    }
+    await this.orders.cancel(orderId, 'saga compensation');
+    await this.sagaRepo.update(sagaId, 'FAILED');
+  }
+}
+```
+
+> **포인트**: 실무에서는 단계 사이 메시지 전달에 Outbox를 쓴다. Temporal 같은 워크플로 엔진을 쓰는 것도 선택지다.
+
+> **주의**: 보상 트랜잭션도 실패할 수 있다. 재시도 + 멱등성 + 수동 개입(dead letter) 경로까지 설계하지 않으면 "결제는 됐는데 주문은 취소된" 상태로 남는다.
+
+## Transactional Outbox 패턴
+
+> **비유**: 회사 **발송함(outbox) 바구니**. 직원은 서류를 처리하면서 "보낼 편지"를 같은 책상 위 발송함에 같이 넣는다(같은 트랜잭션). 우편 담당(relay)이 주기적으로 바구니를 비우며 우체국에 부친다. 우편 담당이 깜빡하고 두 번 부칠 수는 있어도, 편지가 사라지지는 않는다.
+
+### 문제 상황
+
+```ts
+await this.orderRepo.save(order);              // 1. DB 커밋
+await this.kafka.emit('order.created', order); // 2. 메시지 발행
+```
+
+1은 성공했는데 2 직전에 프로세스가 죽거나 브로커가 장애면 이벤트가 유실된다. 순서를 바꿔 발행 먼저 하면, 발행은 됐는데 DB 커밋이 실패하는 "유령 이벤트"가 생긴다. DB와 메시지 브로커는 하나의 트랜잭션으로 묶을 수 없다(dual write 문제).
+
+### 개념
+
+1. 비즈니스 데이터와 **outbox 테이블 행**을 **같은 DB 트랜잭션**으로 저장한다. 둘 다 커밋되거나 둘 다 롤백된다.
+2. 별도의 **relay(poller)**가 outbox에서 미발행 행을 읽어 브로커로 발행하고, 성공하면 발행 완료로 표시한다.
+3. relay는 발행 후 표시 전에 죽을 수 있으므로 같은 메시지가 두 번 나갈 수 있다 → **at-least-once** 보장.
+4. 따라서 consumer는 반드시 **멱등(idempotent)**하게 만들어야 한다.
+
+```text
+[API 요청] ──▶ BEGIN
+               INSERT orders ...
+               INSERT outbox (event_type, payload, published_at = NULL)
+              COMMIT
+[Relay(Cron)] ──▶ SELECT * FROM outbox WHERE published_at IS NULL ... FOR UPDATE SKIP LOCKED
+                  → broker.publish() → UPDATE outbox SET published_at = now()
+[Consumer] ──▶ processed_messages에 message_id 있으면 skip, 없으면 처리 + 기록
+```
+
+relay 방식에는 polling 외에 DB의 변경 로그를 읽는 **CDC(Change Data Capture, 예: Debezium)** 방식도 있다. polling은 구현이 쉽고, CDC는 지연이 낮고 DB 부하가 적다.
+
+### Outbox 엔티티 (TypeORM)
+
+```ts
+// outbox/outbox.entity.ts
+import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
+
+@Entity('outbox')
+@Index(['publishedAt', 'createdAt'])
+export class OutboxMessage {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column()
+  aggregateType: string; // 'Order'
+
+  @Column()
+  aggregateId: string;
+
+  @Column()
+  eventType: string; // 'order.created'
+
+  @Column({ type: 'jsonb' })
+  payload: Record<string, unknown>;
+
+  @Column({ type: 'int', default: 0 })
+  attempts: number;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  publishedAt: Date | null;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt: Date;
+}
+```
+
+### 같은 트랜잭션에 저장 (TypeORM)
+
+```ts
+// orders/orders.service.ts
+@Injectable()
+export class OrdersService {
+  constructor(private readonly dataSource: DataSource) {}
+
+  async createOrder(dto: CreateOrderDto) {
+    return this.dataSource.transaction(async (manager) => {
+      const order = manager.create(OrderEntity, {
+        userId: dto.userId,
+        status: 'PENDING',
+        items: dto.items,
+      });
+      await manager.save(order);
+
+      await manager.insert(OutboxMessage, {
+        aggregateType: 'Order',
+        aggregateId: order.id,
+        eventType: 'order.created',
+        payload: { orderId: order.id, userId: order.userId, items: dto.items },
+      });
+
+      return order;
+    });
+  }
+}
+```
+
+### 같은 트랜잭션에 저장 (Prisma)
+
+```ts
+async createOrder(dto: CreateOrderDto) {
+  return this.prisma.$transaction(async (tx) => {
+    const order = await tx.order.create({
+      data: { userId: dto.userId, status: 'PENDING' },
+    });
+
+    await tx.outbox.create({
+      data: {
+        aggregateType: 'Order',
+        aggregateId: order.id,
+        eventType: 'order.created',
+        payload: { orderId: order.id, userId: dto.userId },
+      },
+    });
+
+    return order;
+  });
+}
+```
+
+### Cron 기반 Relay (@nestjs/schedule)
+
+```bash
+npm i @nestjs/schedule
+```
+
+```ts
+// outbox/outbox.relay.ts
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { ClientKafka } from '@nestjs/microservices';
+import { DataSource } from 'typeorm';
+import { lastValueFrom } from 'rxjs';
+import { OutboxMessage } from './outbox.entity';
+
+@Injectable()
+export class OutboxRelay {
+  private readonly logger = new Logger(OutboxRelay.name);
+  private running = false;
+
+  constructor(
+    private readonly dataSource: DataSource,
+    @Inject('KAFKA') private readonly kafka: ClientKafka,
+  ) {}
+
+  @Cron(CronExpression.EVERY_5_SECONDS)
+  async relay() {
+    if (this.running) return; // 이전 실행이 아직 안 끝났으면 skip
+    this.running = true;
+    try {
+      await this.dataSource.transaction(async (manager) => {
+        // SKIP LOCKED: 여러 인스턴스가 relay를 돌려도 같은 행을 동시에 잡지 않음
+        const messages = await manager
+          .getRepository(OutboxMessage)
+          .createQueryBuilder('o')
+          .where('o.publishedAt IS NULL')
+          .andWhere('o.attempts < :max', { max: 10 })
+          .orderBy('o.createdAt', 'ASC')
+          .limit(100)
+          .setLock('pessimistic_write')
+          .setOnLocked('skip_locked')
+          .getMany();
+
+        for (const msg of messages) {
+          try {
+            await lastValueFrom(
+              this.kafka.emit(msg.eventType, {
+                key: msg.aggregateId, // 같은 aggregate는 같은 파티션 → 순서 보장
+                value: { messageId: msg.id, ...msg.payload },
+              }),
+            );
+            await manager.update(OutboxMessage, msg.id, { publishedAt: new Date() });
+          } catch (e) {
+            this.logger.warn(`publish failed: ${msg.id}`);
+            await manager.increment(OutboxMessage, { id: msg.id }, 'attempts', 1);
+          }
+        }
+      });
+    } finally {
+      this.running = false;
+    }
+  }
+}
+```
+
+```ts
+@Module({
+  imports: [ScheduleModule.forRoot(), TypeOrmModule.forFeature([OutboxMessage])],
+  providers: [OutboxRelay],
+})
+export class OutboxModule {}
+```
+
+### 멱등 Consumer
+
+```ts
+@Controller()
+export class InventoryConsumer {
+  constructor(private readonly dataSource: DataSource) {}
+
+  @EventPattern('order.created')
+  async onOrderCreated(@Payload() message: { messageId: string; orderId: string; items: any[] }) {
+    await this.dataSource.transaction(async (manager) => {
+      // processed_messages.message_id 에 UNIQUE 제약
+      const inserted: unknown[] = await manager.query(
+        `INSERT INTO processed_messages (message_id) VALUES ($1)
+         ON CONFLICT (message_id) DO NOTHING
+         RETURNING message_id`,
+        [message.messageId],
+      );
+
+      if (inserted.length === 0) {
+        return; // 이미 처리한 메시지 → 무시
+      }
+
+      await this.reserveStock(manager, message.orderId, message.items);
+    });
+  }
+}
+```
+
+> **포인트**: "처리 기록 INSERT"와 "비즈니스 처리"를 **같은 트랜잭션**에 넣어야 멱등성이 완성된다.
+
+> **주의**: 처리 기록과 비즈니스 처리를 따로 커밋하면, 처리 기록만 남고 비즈니스 처리가 롤백됐을 때 그 메시지는 영영 무시된다. 또 relay를 여러 인스턴스에서 돌리면서 `SKIP LOCKED` 같은 잠금 없이 조회하면 중복 발행이 폭증한다.
+
+### 장단점 / 언제 쓰나
+
+- 장점: DB 커밋과 이벤트 발행의 원자성 확보, 브로커 장애 시에도 이벤트 유실 없음, 재발행/감사 로그로 활용 가능
+- 단점: 발행 지연(polling 주기만큼), outbox 테이블 청소 필요, 중복 발행 가능성 → consumer 멱등성 필수, 전역 순서 보장은 어렵다(aggregate 단위로만 보장)
+- 언제: 서비스 간 이벤트로 데이터를 동기화하는 MSA, 이벤트 유실이 곧 돈/정합성 문제인 도메인(결제, 주문, 정산)
+
+## Proxy 패턴
+
+> **비유**: 연예인의 **매니저**. 팬(호출자)은 매니저를 통해 연예인(실제 객체)에게 연락한다. 매니저는 이미 답한 질문은 대신 답해주고(캐싱), 바쁘면 거절하고(접근 제어), 필요할 때만 연예인을 부른다(지연 로딩).
+
+### 문제 상황
+
+외부 환율 API 호출이 느리고 요금이 나온다. 호출하는 곳마다 캐시 로직을 넣고 싶지 않다. 또는 무거운 SDK 클라이언트를 앱 시작 시점이 아니라 실제로 쓸 때 만들고 싶다.
+
+### 개념
+
+실제 객체와 같은 인터페이스를 가진 대리 객체를 앞에 두고, 접근 제어/캐싱/지연 로딩/로깅 같은 부가 기능을 끼워 넣는다. NestJS의 **Interceptor**가 사실상 컨트롤러 핸들러에 대한 Proxy다.
+
+### 인터셉터 = 핸들러 앞의 프록시
+
+```ts
+@Injectable()
+export class HttpCacheProxyInterceptor implements NestInterceptor {
+  constructor(@Inject(CACHE_MANAGER) private readonly cache: Cache) {}
+
+  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<any>> {
+    const req = context.switchToHttp().getRequest();
+    if (req.method !== 'GET') return next.handle();
+
+    const key = `http:${req.originalUrl}`;
+    const cached = await this.cache.get(key);
+    if (cached !== undefined && cached !== null) return of(cached); // 실제 핸들러 호출 안 함
+
+    return next.handle().pipe(tap((data) => this.cache.set(key, data, 30_000)));
+  }
+}
+```
+
+`@nestjs/cache-manager`의 내장 `CacheInterceptor`도 같은 원리다.
+
+> **주의**: 사용자별 응답(예: `/me`)을 URL만으로 캐시 키를 만들면 다른 사람의 데이터가 노출된다. 캐시 키에 사용자 식별자를 넣거나 해당 라우트는 캐시하지 말자.
+
+### 캐싱 프록시 provider
+
+인터페이스를 같게 두고 DI 토큰만 프록시로 바꿔 끼우면 호출하는 쪽은 아무것도 몰라도 된다.
+
+```ts
+export interface ExchangeRateClient {
+  getRate(from: string, to: string): Promise<number>;
+}
+export const EXCHANGE_RATE_CLIENT = Symbol('EXCHANGE_RATE_CLIENT');
+
+@Injectable()
+export class HttpExchangeRateClient implements ExchangeRateClient {
+  constructor(private readonly http: HttpService) {}
+  async getRate(from: string, to: string) {
+    const { data } = await lastValueFrom(this.http.get(`/rates?from=${from}&to=${to}`));
+    return data.rate;
+  }
+}
+
+@Injectable()
+export class CachedExchangeRateClient implements ExchangeRateClient {
+  private readonly cache = new Map<string, { value: number; expiresAt: number }>();
+
+  constructor(private readonly real: HttpExchangeRateClient) {}
+
+  async getRate(from: string, to: string) {
+    const key = `${from}:${to}`;
+    const hit = this.cache.get(key);
+    if (hit && hit.expiresAt > Date.now()) return hit.value;
+
+    const value = await this.real.getRate(from, to);
+    this.cache.set(key, { value, expiresAt: Date.now() + 60_000 });
+    return value;
+  }
+}
+
+@Module({
+  providers: [
+    HttpExchangeRateClient,
+    { provide: EXCHANGE_RATE_CLIENT, useClass: CachedExchangeRateClient },
+  ],
+  exports: [EXCHANGE_RATE_CLIENT],
+})
+export class ExchangeRateModule {}
+```
+
+### 지연 로딩 프록시 (Virtual Proxy)
+
+```ts
+@Injectable()
+export class LazyPdfRenderer {
+  private renderer?: Promise<import('./heavy-pdf').PdfRenderer>;
+
+  private get instance() {
+    // 첫 호출 시에만 무거운 모듈 로드 + 초기화
+    this.renderer ??= import('./heavy-pdf').then((m) => m.PdfRenderer.create());
+    return this.renderer;
+  }
+
+  async render(html: string) {
+    return (await this.instance).render(html);
+  }
+}
+```
+
+모듈 단위로 지연 로딩하고 싶다면 `LazyModuleLoader`를 쓴다(잡기술 문서 참고).
+
+- 장점: 호출자 수정 없이 부가 기능 추가, 관심사 분리
+- 단점: 계층이 늘어 디버깅이 어려워짐, 캐시 무효화 같은 새로운 문제 발생
+- 언제: 캐싱, 권한 체크, rate limit, 로깅, 지연 초기화
+
+## Strategy 패턴
+
+> **비유**: 계산대의 **결제 단말기**. 손님이 카드를 내든 휴대폰을 대든, 점원은 "결제해 주세요"라는 같은 동작만 한다. 실제 처리 방식(전략)은 수단마다 다르지만 점원 입장에선 꽂아 쓰는 부품일 뿐이다.
+
+### 문제 상황
+
+결제 수단이 카드, 카카오페이, 토스페이, 계좌이체로 늘어나면서 `if (method === 'card') ... else if ...` 분기가 결제/환불/조회 메서드마다 반복된다. 수단 하나 추가할 때마다 서비스 전체를 수정해야 한다.
+
+### 개념
+
+알고리즘(전략)을 인터페이스로 추상화하고, 런타임 또는 설정에 따라 구현체를 교체한다. NestJS DI 자체가 Strategy 교체 도구다.
+
+### useClass / useFactory로 전략 교체
+
+```ts
+export abstract class StorageStrategy {
+  abstract upload(key: string, body: Buffer): Promise<string>;
+}
+
+@Injectable()
+export class S3Storage extends StorageStrategy { /* ... */ }
+
+@Injectable()
+export class LocalStorage extends StorageStrategy { /* ... */ }
+
+@Module({
+  providers: [
+    {
+      provide: StorageStrategy, // abstract class를 토큰으로 쓰면 @Inject 없이 타입으로 주입 가능
+      useClass: process.env.NODE_ENV === 'production' ? S3Storage : LocalStorage,
+    },
+  ],
+  exports: [StorageStrategy],
+})
+export class StorageModule {}
+```
+
+설정값에 따라 고르려면 `useFactory` + `inject: [ConfigService]`를 쓴다.
+
+### Passport 전략
+
+`@nestjs/passport`의 `PassportStrategy(Strategy, 'name')`는 이름 그대로 Strategy 패턴이다. 인증 방식(JWT, Local, Google OAuth)을 전략 클래스로 만들고, `AuthGuard('jwt')`처럼 이름으로 골라 쓴다.
+
+```ts
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
+  constructor(config: ConfigService) {
+    super({
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      secretOrKey: config.getOrThrow('JWT_SECRET'),
+    });
+  }
+
+  validate(payload: { sub: string; role: string }) {
+    return { userId: payload.sub, role: payload.role };
+  }
+}
+
+@UseGuards(AuthGuard(['jwt', 'api-key'])) // 여러 전략을 순서대로 시도
+@Get('me')
+me(@Req() req) { return req.user; }
+```
+
+### 런타임 선택: `Map<string, PaymentStrategy>`
+
+요청마다 결제 수단이 다르므로 모든 전략을 Map에 등록해두고 키로 꺼낸다.
+
+```ts
+// payment/payment.strategy.ts
+export interface PaymentStrategy {
+  readonly method: string;
+  pay(orderId: string, amount: number): Promise<{ transactionId: string }>;
+  refund(transactionId: string, amount: number): Promise<void>;
+}
+
+@Injectable()
+export class CardPayment implements PaymentStrategy {
+  readonly method = 'card';
+  async pay(orderId: string, amount: number) { /* PG 호출 */ return { transactionId: 'card_123' }; }
+  async refund(transactionId: string, amount: number) { /* ... */ }
+}
+
+@Injectable()
+export class KakaoPayPayment implements PaymentStrategy {
+  readonly method = 'kakaopay';
+  async pay(orderId: string, amount: number) { return { transactionId: 'kp_123' }; }
+  async refund(transactionId: string, amount: number) { /* ... */ }
+}
+```
+
+#### 방법 1: multi-injection 대안 (factory로 배열 주입)
+
+NestJS에는 Angular의 `multi: true` 같은 multi-provider가 없다. 대신 factory로 배열/Map을 직접 만들어 하나의 토큰으로 제공한다.
+
+```ts
+export const PAYMENT_STRATEGIES = Symbol('PAYMENT_STRATEGIES');
+
+@Module({
+  providers: [
+    CardPayment,
+    KakaoPayPayment,
+    TossPayment,
+    {
+      provide: PAYMENT_STRATEGIES,
+      useFactory: (...strategies: PaymentStrategy[]) =>
+        new Map(strategies.map((s) => [s.method, s])),
+      inject: [CardPayment, KakaoPayPayment, TossPayment],
+    },
+    PaymentService,
+  ],
+})
+export class PaymentModule {}
+
+@Injectable()
+export class PaymentService {
+  constructor(
+    @Inject(PAYMENT_STRATEGIES)
+    private readonly strategies: Map<string, PaymentStrategy>,
+  ) {}
+
+  pay(method: string, orderId: string, amount: number) {
+    const strategy = this.strategies.get(method);
+    if (!strategy) throw new BadRequestException(`지원하지 않는 결제 수단: ${method}`);
+    return strategy.pay(orderId, amount);
+  }
+}
+```
+
+새 결제 수단을 추가할 때 `inject` 배열만 수정하면 되고 `PaymentService`는 그대로다(OCP).
+
+#### 방법 2: DiscoveryService + 커스텀 데코레이터
+
+`inject` 배열 관리도 귀찮다면 `@nestjs/core`의 `DiscoveryService`로 특정 메타데이터가 붙은 provider를 자동 수집한다. `DiscoveryService.createDecorator()`는 v10.x 후반부터 제공된다.
+
+```ts
+// payment/payment-method.decorator.ts
+import { DiscoveryService } from '@nestjs/core';
+
+export const PaymentMethod = DiscoveryService.createDecorator<string>();
+
+@PaymentMethod('card')
+@Injectable()
+export class CardPayment implements PaymentStrategy { /* ... */ }
+```
+
+```ts
+// payment/payment-registry.ts
+@Injectable()
+export class PaymentRegistry implements OnModuleInit {
+  private readonly strategies = new Map<string, PaymentStrategy>();
+
+  constructor(private readonly discovery: DiscoveryService) {}
+
+  onModuleInit() {
+    const wrappers = this.discovery.getProviders({ metadataKey: PaymentMethod.KEY });
+    for (const wrapper of wrappers) {
+      const method = this.discovery.getMetadataByDecorator(PaymentMethod, wrapper);
+      if (method && wrapper.instance) this.strategies.set(method, wrapper.instance);
+    }
+  }
+
+  get(method: string) {
+    const s = this.strategies.get(method);
+    if (!s) throw new BadRequestException(`unknown method: ${method}`);
+    return s;
+  }
+}
+
+@Module({
+  imports: [DiscoveryModule],
+  providers: [CardPayment, KakaoPayPayment, TossPayment, PaymentRegistry],
+  exports: [PaymentRegistry],
+})
+export class PaymentModule {}
+```
+
+> **포인트**: DiscoveryService는 "마법"이 늘어나는 만큼 추적이 어렵다. 전략이 5개 이하면 factory 방식이 더 명시적이고 충분하다.
+
+> **주의**: request-scoped provider는 `wrapper.instance`가 없을 수 있다. 또 `DiscoveryService`는 생성자가 아니라 `onModuleInit` 이후에 조회해야 모든 provider가 준비된 상태다.
+
+| 방식 | 새 전략 추가 시 수정 | 명시성 | 추천 |
+| --- | --- | --- | --- |
+| `useClass` 토큰 교체 | 모듈 설정 1곳 | 높음 | 환경별로 하나만 고를 때 |
+| factory로 Map 주입 | `inject` 배열 | 높음 | 런타임 선택, 전략 수가 적을 때 |
+| `DiscoveryService` | 데코레이터만 붙이면 끝 | 낮음 | 전략이 많고 플러그인처럼 늘어날 때 |
+
+- 장점: OCP 준수, 분기문 제거, 전략별 독립 테스트
+- 단점: 클래스 수 증가, 전략이 2개뿐이고 안 늘어날 거면 오버엔지니어링
+- 언제: 결제 수단, 알림 채널(SMS/이메일/푸시), 파일 저장소, 할인 정책처럼 "같은 일을 다른 방법으로" 하는 경우
+
+## Observer 패턴
+
+> **비유**: **유튜브 구독**. 크리에이터(발행자)는 영상을 올리기만 하고, 구독자가 누군지 일일이 신경 쓰지 않는다. 알림을 받은 구독자들이 각자 알아서 본다. 구독자 한 명이 영상을 못 봐도 업로드는 실패하지 않는다.
+
+### 문제 상황
+
+회원 가입 후 환영 메일 발송, 쿠폰 지급, 슬랙 알림, 분석 이벤트 전송을 해야 한다. `UsersService.signUp()`이 이 모든 서비스를 주입받으면 결합도가 높아지고, 하나가 실패하면 가입까지 실패한다.
+
+### 개념
+
+Subject(발행자)는 이벤트만 알리고, Observer(구독자)들은 독립적으로 반응한다. 발행자는 누가 구독하는지 모른다.
+
+### @nestjs/event-emitter
+
+```bash
+npm i @nestjs/event-emitter
+```
+
+```ts
+@Module({
+  imports: [
+    EventEmitterModule.forRoot({
+      wildcard: true,  // 'user.*' 같은 패턴 구독 허용
+      delimiter: '.',
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+```ts
+export class UserSignedUpEvent {
+  constructor(public readonly userId: string, public readonly email: string) {}
+}
+
+@Injectable()
+export class UsersService {
+  constructor(
+    private readonly userRepo: UserRepository,
+    private readonly eventEmitter: EventEmitter2,
+  ) {}
+
+  async signUp(dto: SignUpDto) {
+    const user = await this.userRepo.create(dto);
+    this.eventEmitter.emit('user.signed-up', new UserSignedUpEvent(user.id, user.email));
+    return user;
+  }
+}
+```
+
+```ts
+@Injectable()
+export class WelcomeMailListener {
+  constructor(private readonly mail: MailService) {}
+
+  @OnEvent('user.signed-up', { async: true })
+  async handle(event: UserSignedUpEvent) {
+    await this.mail.sendWelcome(event.email);
+  }
+}
+
+@Injectable()
+export class AuditListener {
+  @OnEvent('user.*')
+  log(payload: unknown) {
+    console.log('user event', payload);
+  }
+}
+```
+
+> **포인트**: 결과를 기다려야 하면 `await this.eventEmitter.emitAsync(...)`를 쓴다.
+
+> **주의**: 흔한 실수 세 가지.
+> 1. 리스너에서 던진 에러가 발행자 쪽 흐름에 영향을 줄 수 있다 → `{ async: true }`, `suppressErrors` 옵션, 리스너 내부 try/catch로 격리.
+> 2. **인메모리**라 프로세스가 죽으면 이벤트도 사라지고 다른 인스턴스로 전파되지 않는다 → 신뢰성이 필요하면 큐(BullMQ)나 Outbox.
+> 3. `onModuleInit`에서 emit하면 리스너 등록 전이라 놓칠 수 있다 → `onApplicationBootstrap` 이후에 emit.
+
+### RxJS Subject
+
+모듈 내부 스트림이나 SSE 브로드캐스트처럼 "값의 흐름"을 다룰 때는 RxJS Subject가 자연스럽다.
+
+```ts
+@Injectable()
+export class NotificationStream implements OnModuleDestroy {
+  private readonly subject = new Subject<{ userId: string; message: string }>();
+
+  publish(userId: string, message: string) {
+    this.subject.next({ userId, message });
+  }
+
+  forUser(userId: string): Observable<MessageEvent> {
+    return this.subject.asObservable().pipe(
+      filter((n) => n.userId === userId),
+      map((n) => ({ data: n }) as MessageEvent),
+    );
+  }
+
+  onModuleDestroy() {
+    this.subject.complete();
+  }
+}
+
+@Controller('notifications')
+export class NotificationsController {
+  constructor(private readonly stream: NotificationStream) {}
+
+  @Sse('stream')
+  sse(@Req() req): Observable<MessageEvent> {
+    return this.stream.forUser(req.user.userId);
+  }
+}
+```
+
+| 비교 | EventEmitter2 | RxJS Subject |
+| --- | --- | --- |
+| 구독 방식 | 데코레이터 `@OnEvent`로 선언적 | 코드에서 `subscribe` / `pipe` |
+| 강점 | 이벤트 이름 기반, wildcard, 비동기 리스너 | 연산자(filter, debounce, buffer) 조합 |
+| 적합 | 도메인 이벤트 → 사이드이펙트 | 스트림 변환, SSE/WebSocket 푸시 |
+
+## Decorator 패턴 (applyDecorators)
+
+> **비유**: 택배 **포장 세트**. "뽁뽁이 + 박스 + 파손주의 스티커"를 매번 따로 붙이는 대신, 이걸 한 번에 해주는 "안전포장" 옵션 하나를 고른다. `applyDecorators`가 그 세트 상품이다.
+
+### 문제 상황
+
+관리자 API마다 `@UseGuards(JwtAuthGuard, RolesGuard)`, `@Roles('admin')`, `@ApiBearerAuth()`, `@ApiUnauthorizedResponse()`를 매번 4줄씩 붙인다. 하나라도 빠뜨리면 보안 구멍이 된다.
+
+### 개념
+
+GoF Decorator 패턴은 객체를 감싸 기능을 덧붙이는 것이고, TypeScript 데코레이터는 그 아이디어를 메타프로그래밍으로 구현한 것이다. NestJS의 `applyDecorators()`는 여러 데코레이터를 하나로 **합성**한다.
+
+```ts
+// auth/decorators/auth.decorator.ts
+import { applyDecorators, SetMetadata, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiForbiddenResponse, ApiUnauthorizedResponse } from '@nestjs/swagger';
+
+export const ROLES_KEY = 'roles';
+export type Role = 'user' | 'admin' | 'super-admin';
+
+export function Auth(...roles: Role[]) {
+  return applyDecorators(
+    SetMetadata(ROLES_KEY, roles),
+    UseGuards(JwtAuthGuard, RolesGuard),
+    ApiBearerAuth(),
+    ApiUnauthorizedResponse({ description: '인증 필요' }),
+    ApiForbiddenResponse({ description: '권한 없음' }),
+  );
+}
+```
+
+```ts
+@Controller('admin/users')
+export class AdminUsersController {
+  @Auth('admin')
+  @Get()
+  findAll() { /* ... */ }
+
+  @Auth('super-admin')
+  @Delete(':id')
+  remove(@Param('id') id: string) { /* ... */ }
+}
+```
+
+파라미터 데코레이터는 `createParamDecorator`로 만든다.
+
+```ts
+export const CurrentUser = createParamDecorator(
+  (field: keyof AuthUser | undefined, ctx: ExecutionContext) => {
+    const user = ctx.switchToHttp().getRequest().user as AuthUser;
+    return field ? user?.[field] : user;
+  },
+);
+
+@Get('me')
+me(@CurrentUser('userId') userId: string) { /* ... */ }
+```
+
+메타데이터 키를 문자열로 관리하기 싫다면 `Reflector.createDecorator<string[]>()`로 타입 안전한 데코레이터를 만들고 `reflector.get(Roles, context.getHandler())`로 읽을 수 있다.
+
+> **주의**: `applyDecorators` 안의 가드 순서가 중요하다. `JwtAuthGuard`가 먼저 돌아 `req.user`를 채워야 `RolesGuard`가 역할을 확인할 수 있다.
+
+- 장점: 반복 제거, 정책을 한 곳에서 변경, 빠뜨림 방지
+- 단점: 과도하게 합성하면 데코레이터 하나가 무엇을 하는지 숨겨짐
+- 언제: 인증/인가 + Swagger 문서 묶음, 공통 응답 형식, 캐시 정책 묶음
+
+## Repository 패턴
+
+> **비유**: **도서관 사서**. 이용자는 "이 책 찾아주세요"라고만 말하면 된다. 책이 어느 서고, 몇 층, 어떤 분류 체계로 꽂혀 있는지(ORM, SQL)는 사서가 알아서 한다. 서고가 이사 가도 이용자의 요청 방식은 그대로다.
+
+### 문제 상황
+
+서비스 곳곳에서 TypeORM `QueryBuilder`나 Prisma 쿼리를 직접 쓴다. ORM을 바꾸거나 쿼리를 튜닝할 때 영향 범위를 파악하기 어렵고, 단위 테스트에서 ORM을 mock하기 번거롭다.
+
+### 개념
+
+도메인 객체의 컬렉션처럼 동작하는 인터페이스를 두고, 영속성 세부사항을 그 뒤로 숨긴다. 서비스는 "무엇을" 원하는지만 표현한다.
+
+```ts
+// users/user.repository.ts
+export abstract class UserRepository {
+  abstract findById(id: string): Promise<User | null>;
+  abstract findByEmail(email: string): Promise<User | null>;
+  abstract save(user: User): Promise<void>;
+}
+
+// users/infra/typeorm-user.repository.ts
+@Injectable()
+export class TypeOrmUserRepository extends UserRepository {
+  constructor(@InjectRepository(UserEntity) private readonly repo: Repository<UserEntity>) {
+    super();
+  }
+
+  async findById(id: string) {
+    const entity = await this.repo.findOne({ where: { id } });
+    return entity ? UserMapper.toDomain(entity) : null;
+  }
+
+  async findByEmail(email: string) {
+    const entity = await this.repo.findOne({ where: { email: email.toLowerCase() } });
+    return entity ? UserMapper.toDomain(entity) : null;
+  }
+
+  async save(user: User) {
+    await this.repo.save(UserMapper.toEntity(user));
+  }
+}
+
+@Module({
+  imports: [TypeOrmModule.forFeature([UserEntity])],
+  providers: [{ provide: UserRepository, useClass: TypeOrmUserRepository }],
+  exports: [UserRepository],
+})
+export class UsersInfraModule {}
+```
+
+테스트에서는 인메모리 구현으로 교체한다.
+
+```ts
+class InMemoryUserRepository extends UserRepository {
+  private store = new Map<string, User>();
+  async findById(id: string) { return this.store.get(id) ?? null; }
+  async findByEmail(email: string) {
+    return [...this.store.values()].find((u) => u.email === email) ?? null;
+  }
+  async save(user: User) { this.store.set(user.id, user); }
+}
+
+const moduleRef = await Test.createTestingModule({
+  providers: [UsersService, { provide: UserRepository, useClass: InMemoryUserRepository }],
+}).compile();
+```
+
+> **주의**: TypeScript interface는 런타임에 사라지므로 DI 토큰으로 쓸 수 없다. 그래서 위 예제는 **abstract class**를 토큰으로 썼다. interface를 쓰고 싶다면 `Symbol` 토큰 + `@Inject(TOKEN)`이 필요하다.
+
+- 장점: 도메인/영속성 분리, 테스트 용이, 쿼리가 한 곳에 모임
+- 단점: ORM이 이미 Repository를 제공하므로 이중 추상화가 될 수 있음, 매핑 코드 증가, 트랜잭션 전파를 별도로 설계해야 함(예: `nestjs-cls` + transactional 플러그인)
+- 언제: 도메인 로직이 풍부한 서비스, ORM 교체 가능성, 단위 테스트를 중시할 때. 단순 CRUD라면 ORM Repository를 바로 써도 무방
+
+## Factory 패턴 (useFactory)
+
+> **비유**: **조립 공장**. 손님은 완제품(Redis 클라이언트)만 받아 가면 된다. 부품(설정값) 수급, 조립, 출고 전 검수(연결 확인)는 공장이 처리한다.
+
+### 문제 상황
+
+Redis 클라이언트, 외부 SDK 클라이언트처럼 생성 시 설정값이 필요하거나 비동기 연결이 필요한 객체는 `new`로 바로 만들 수 없다. 환경에 따라 다른 구현을 만들어야 할 때도 있다.
+
+### 개념
+
+객체 생성 로직을 팩토리 함수에 캡슐화한다. NestJS에서는 `useFactory` provider가 그 역할을 하며, `inject`로 의존성을 받고 `async` 함수를 반환하면 Nest가 resolve될 때까지 기다린다.
+
+```ts
+export const REDIS = Symbol('REDIS');
+
+@Module({
+  providers: [
+    {
+      provide: REDIS,
+      inject: [ConfigService],
+      useFactory: async (config: ConfigService) => {
+        const client = new Redis({
+          host: config.getOrThrow('REDIS_HOST'),
+          port: config.get('REDIS_PORT', 6379),
+          lazyConnect: true,
+        });
+        await client.connect(); // 연결이 끝나야 이 provider에 의존하는 클래스가 생성됨
+        return client;
+      },
+    },
+  ],
+  exports: [REDIS],
+})
+export class RedisModule implements OnApplicationShutdown {
+  constructor(@Inject(REDIS) private readonly redis: Redis) {}
+  async onApplicationShutdown() {
+    await this.redis.quit();
+  }
+}
+```
+
+동적 모듈의 `forRootAsync({ useFactory })` 역시 Factory 패턴이다. 런타임에 인스턴스를 여러 개 만들어야 한다면 팩토리 **클래스**를 provider로 두는 방법도 있다.
+
+```ts
+@Injectable()
+export class HttpClientFactory {
+  constructor(private readonly config: ConfigService) {}
+
+  create(baseURL: string, timeout = 3000) {
+    return axios.create({
+      baseURL,
+      timeout,
+      headers: { 'x-api-key': this.config.getOrThrow('PARTNER_API_KEY') },
+    });
+  }
+}
+```
+
+> **주의**: `inject` 배열의 순서와 factory 함수 인자 순서가 일치해야 한다. 순서가 어긋나면 타입은 맞아 보여도 엉뚱한 값이 들어온다. 또 async factory가 영원히 resolve되지 않으면(예: DB 연결 대기) 앱 부트스트랩이 조용히 멈춘다.
+
+- 장점: 복잡한 생성/비동기 초기화 캡슐화, 설정 기반 분기
+- 단점: factory 안의 로직이 길어지면 테스트가 어려움
+- 언제: DB/캐시/메시지 클라이언트, 환경별 구현 선택, 동적 모듈
+
+## 패턴 비교 표
+
+| 패턴 | 해결하는 문제 | NestJS 도구 | 비용 | 추천 상황 |
+| --- | --- | --- | --- | --- |
+| CQRS | 읽기/쓰기 모델 비대화 | `@nestjs/cqrs` (CommandBus, QueryBus, EventBus) | 높음 | 복잡한 도메인, 읽기 최적화 필요 |
+| Saga (`@Saga()`) | 이벤트 → 다음 커맨드 연결 | `@Saga()` + RxJS `ofType` | 중간 | 서비스 내부 워크플로 |
+| Saga (분산) | 2PC 없는 분산 트랜잭션 | Orchestrator, 메시지 브로커 | 매우 높음 | MSA 다단계 비즈니스 트랜잭션 |
+| Transactional Outbox | DB 커밋 + 이벤트 발행 원자성 | 트랜잭션 + `@nestjs/schedule` relay | 중간~높음 | 이벤트 유실 불가 도메인 |
+| Proxy | 부가 기능(캐싱, 지연 로딩) 투명하게 추가 | Interceptor, provider 교체 | 낮음 | 캐싱, 로깅, 권한 |
+| Strategy | 같은 일의 여러 구현 분기 | `useClass`, factory Map, `DiscoveryService`, Passport | 낮음 | 결제/알림/저장소 |
+| Observer | 발행자-구독자 결합 제거 | `@nestjs/event-emitter`, RxJS Subject | 낮음 | 도메인 사이드이펙트 |
+| Decorator | 반복되는 메타데이터/가드 조합 | `applyDecorators`, `createParamDecorator` | 낮음 | 인증 + 문서 묶음 |
+| Repository | 영속성 세부사항 은닉 | abstract class 토큰 + `useClass` | 중간 | 도메인 중심 설계, 테스트 |
+| Factory | 복잡/비동기 객체 생성 | `useFactory`, `forRootAsync` | 낮음 | 외부 클라이언트 초기화 |
+
+## 셀프 체크
+
+**Q1. `AggregateRoot`에서 `this.apply(event)`를 호출했는데 `@EventsHandler`가 실행되지 않는다. 가장 흔한 원인 두 가지는?**
+
+**A.** `publisher.mergeObjectContext()`로 Aggregate에 EventBus를 연결하지 않았거나, 저장 후 `commit()`을 호출하지 않은 경우다. `apply()`는 이벤트를 내부 큐에 쌓기만 한다.
+
+**Q2. 보상 트랜잭션은 DB 롤백과 무엇이 다른가?**
+
+**A.** 롤백은 커밋 전 변경을 없던 일로 만드는 것이고, 보상 트랜잭션은 이미 커밋된 결과를 의미적으로 되돌리는 **새로운 트랜잭션**이다(예: 결제 삭제가 아니라 환불 생성). 그래서 중간 상태가 외부에 노출될 수 있다.
+
+**Q3. Transactional Outbox를 쓰면 consumer는 왜 멱등해야 하나?**
+
+**A.** relay가 브로커에 발행한 뒤 `publishedAt`을 업데이트하기 전에 죽으면 같은 메시지를 다시 발행한다. 즉 at-least-once 전달이라 중복 수신이 가능하므로, `messageId` 기반 처리 기록 등으로 중복을 무시해야 한다.
+
+**Q4. 결제 수단이 런타임 요청마다 다를 때, NestJS에서 Strategy를 구성하는 방법 두 가지는?**
+
+**A.** (1) `useFactory` + `inject`로 모든 전략을 받아 `Map<string, PaymentStrategy>`를 하나의 토큰으로 제공하는 방법, (2) `DiscoveryService.createDecorator()`로 만든 데코레이터를 붙이고 `onModuleInit`에서 자동 수집하는 방법.
+
+**Q5. `@nestjs/event-emitter`로 "주문 완료 → 정산 서비스 반영"을 처리하면 안 되는 이유는?**
+
+**A.** 인메모리 이벤트라서 프로세스가 죽으면 유실되고, 다른 인스턴스/서비스로 전파되지도 않는다. 정합성이 중요한 이벤트는 메시지 큐 + Outbox로 처리해야 한다.
+
+## 핵심 정리
+
+- NestJS의 DI(`useClass`, `useFactory`, 토큰 교체)만으로 Strategy, Factory, Proxy, Repository 패턴 대부분을 자연스럽게 구현할 수 있다.
+- CQRS는 `CommandBus` / `QueryBus` / `EventBus`로 읽기와 쓰기를 분리하며, `AggregateRoot.apply()`로 쌓은 이벤트는 `mergeObjectContext` 후 `commit()`해야 발행된다.
+- `@Saga()`는 인메모리 이벤트 → 커맨드 매핑일 뿐이고, 분산 Saga는 상태 저장 + 보상 트랜잭션 + 멱등성까지 설계해야 한다. Choreography는 결합도가 낮고, Orchestration은 흐름이 잘 보인다.
+- Transactional Outbox는 비즈니스 데이터와 outbox 행을 같은 트랜잭션에 저장하고 relay가 발행한다. at-least-once이므로 consumer는 반드시 멱등하게 만든다.
+- `@nestjs/event-emitter`와 RxJS Subject는 프로세스 내부 Observer다. 신뢰성/수평 확장이 필요하면 큐나 Outbox로 넘어가자.
+- `applyDecorators`로 인증 + Swagger 같은 반복 데코레이터를 합성하면 실수와 중복이 줄어든다.
+- 모든 패턴은 비용이 있다. 문제 상황이 실제로 있을 때 그 부분에만 적용하는 것이 가장 좋은 패턴이다.

@@ -1,0 +1,347 @@
+<meta charset="utf-8">
+<title>백엔드 학습 로드맵</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Do+Hyeon&family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" media="print" onload="this.media='all'">
+<style>
+/*__CSS__*/
+</style>
+
+<header class="top">
+  <div class="top-inner">
+    <button class="icon-btn menu-btn" id="menuBtn" aria-label="메뉴 열기">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <a class="brand" href="#home">백엔드 <b>로드맵</b></a>
+    <button class="search-btn" id="searchBtn" aria-label="검색">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <span>개념 검색</span><kbd>⌘K</kbd>
+    </button>
+    <div class="spacer"></div>
+  </div>
+  <div class="progress" id="progress"></div>
+</header>
+
+<div class="scrim" id="scrim"></div>
+<aside class="side" id="side" aria-label="학습 단계"></aside>
+<main class="main" id="main"></main>
+
+<div class="modal" id="modal" hidden role="dialog" aria-modal="true" aria-label="문서 검색">
+  <div class="modal-box">
+    <div class="modal-in">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="q" type="search" placeholder="예: 클로저, forwardRef, infer, 이벤트 루프" autocomplete="off">
+      <kbd>esc</kbd>
+    </div>
+    <ul class="results" id="results"></ul>
+  </div>
+</div>
+
+<script>
+/*__LIB__*/
+</script>
+<script id="data" type="text/plain">__DATA__</script>
+<script>
+(async () => {
+  // 압축된 문서 데이터 풀기
+  const b64 = document.getElementById('data').textContent.trim();
+  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  const json = await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+  const { stages, docs, art } = JSON.parse(json);
+  const byId = Object.fromEntries(docs.map(d => [d.id, d]));
+  // 로드맵 순서로 평탄화한 학습 경로
+  const path = stages.flatMap((s, si) => s.docs.filter(id => byId[id]).map((id, i, arr) => ({ id, stage: s, si, i, n: arr.length })));
+  const posOf = Object.fromEntries(path.map((p, k) => [p.id, { ...p, k }]));
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const check = '<svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M2.5 6.2 5 8.6l4.6-5"/></svg>';
+  const root = document.documentElement;
+
+  /* 학습 완료 (이 브라우저에만 저장) */
+  const KEY = 'roadmap-learned';
+  let learned = [];
+  try { learned = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch {}
+  const isDone = id => learned.includes(id);
+  function setDone(id, v) {
+    learned = v ? [...new Set([...learned, id])] : learned.filter(x => x !== id);
+    try { localStorage.setItem(KEY, JSON.stringify(learned)); } catch {}
+  }
+  const dot = id => `<span class="dot ${isDone(id) ? 'on' : ''}">${isDone(id) ? check : ''}</span>`;
+  const nextUp = () => path.find(p => !isDone(p.id));
+
+  /* 사이드바 */
+  // 사이드바 단계 접기: 지금 보는 문서의 단계(홈이면 다음에 공부할 단계)를 펼친다
+  const openStages = new Set();
+  function renderSide() {
+    const cur = location.hash.slice(1);
+    const done = path.filter(p => isDone(p.id)).length;
+    const curStage = (posOf[cur] && posOf[cur].stage.id) || (nextUp() && nextUp().stage.id);
+    if (curStage) openStages.add(curStage);
+    $('side').innerHTML =
+      `<a class="side-home" href="#home"><span>로드맵 전체 보기</span><small>${done}/${path.length}</small></a>` +
+      stages.map((s, si) => {
+        const ids = s.docs.filter(id => byId[id]);
+        const dn = ids.filter(isDone).length;
+        const open = openStages.has(s.id);
+        return `<div class="stage-group"><button type="button" class="stage-toggle" data-stage="${s.id}" aria-expanded="${open}"><span class="n">${si + 1}</span><span class="t">${esc(s.title)}</span><span class="c ${dn === ids.length ? 'all' : ''}">${dn}/${ids.length}</span></button>` +
+          (open ? '<ul>' + ids.map(id =>
+            `<li><a href="#${id}" ${cur === id ? 'aria-current="page"' : ''}>${dot(id)}<span>${esc(byId[id].title)}</span></a></li>`
+          ).join('') + '</ul>' : '') + '</div>';
+      }).join('');
+    $('side').querySelectorAll('.stage-toggle').forEach(b => b.onclick = () => {
+      const id = b.dataset.stage;
+      openStages.has(id) ? openStages.delete(id) : openStages.add(id);
+      renderSide();
+    });
+  }
+  $('menuBtn').onclick = () => document.body.classList.toggle('nav-open');
+  $('scrim').onclick = () => document.body.classList.remove('nav-open');
+
+
+  /* 홈: 하늘 → 도시 → 지그재그 도로 (Next.js RoadmapHome과 같은 마크업) */
+  function renderHome() {
+    const done = path.filter(p => isDone(p.id)).length;
+    const pct = Math.round(done / path.length * 100);
+    const nx = nextUp();
+    const nd = nx && byId[nx.id];
+    const last = path[path.length - 1];
+    $('main').innerHTML = `<div class="home">
+      <section class="hero">
+        <span class="cloud c1"></span><span class="cloud c2"></span><span class="cloud c3"></span><span class="sun"></span>
+        <h1 class="hero-title">백엔드 개발자 학습</h1>
+        <div class="board"><span>로드맵</span></div>
+        <p class="hero-lead">JavaScript 기초에서 출발해 TypeScript와 NestJS를 지나 면접장까지 가는 길입니다. 표지판마다 들러서 비유로 감을 잡고, 코드로 확인하고, 셀프 체크로 마무리하세요.</p>
+        ${art.skyline}
+      </section>
+      <div class="dash"><div class="dash-inner">
+        ${nd ? `<div><p class="label">다음 목적지</p><p class="next-title">${esc(nd.title)}</p><p class="next-meta">${nx.si + 1}단계 ${esc(nx.stage.title)} · ${nx.i + 1}/${nx.n} · 약 ${nd.minutes}분</p></div><a class="go-btn" href="#${nx.id}">출발하기</a>`
+             : `<div><p class="label">완주</p><p class="next-title">모든 구간을 달렸습니다</p><p class="next-meta">면접 질문으로 마지막 점검을 해 보세요.</p></div><a class="go-btn" href="#${last.id}">면접 질문</a>`}
+        <div class="overall"><span>주행 ${done}/${path.length}</span><div class="bar"><i style="width:${pct}%"></i></div><span>${pct}%</span></div>
+      </div></div>
+      <div class="track">${stages.map((s, si) => {
+        const ids = s.docs.filter(id => byId[id]);
+        const dn = ids.filter(isDone).length;
+        const mins = ids.reduce((m, id) => m + byId[id].minutes, 0);
+        return `<section id="stage-${s.id}" class="lap ${si % 2 === 0 ? 'r' : 'l'}">
+          <div class="lap-body">
+            <div class="lap-head">
+              <div class="sign"><small>${si + 1}단계 · ${esc(s.level)}</small><strong>${esc(s.title)}</strong></div>
+              <p class="goal"><b>이 구간의 목표</b>${esc(s.goal)}</p>
+              <p class="lap-meta">문서 ${ids.length}개 · 약 ${mins}분 · ${dn}/${ids.length} 완료</p>
+            </div>
+            <ul class="stops">${ids.map((id, di) => {
+              const d = byId[id], on = isDone(id);
+              return `<li><a href="#${id}"><span class="badge ${on ? 'on' : ''}">${on ? check.replace('width="9" height="9"', 'width="16" height="16"') : di + 1}</span>
+                <span class="stop-text"><strong>${esc(d.title)}${nx && nx.id === id ? '<span class="here">다음</span>' : ''}</strong><span>${esc(d.description)}</span></span>
+                <span class="stop-min">${d.minutes}분</span></a></li>`;
+            }).join('')}</ul>
+          </div></section>`;
+      }).join('')}</div>
+      <div class="finish-line"><div class="sign"><small>도착</small><strong>면접장</strong></div>
+        <p>${nx ? `완주까지 문서 ${path.length - done}개 남았습니다` : '완주했습니다. 수고했어요!'}</p></div>
+      ${art.ground}
+    </div>`;
+    // 자동차: 스크롤을 따라 도로를 달리고, 다음 학습 단계에는 깃발을 꽂는다
+    const carStage = nx ? nx.si : stages.length - 1;
+    if (carCtl) carCtl.destroy();
+    carCtl = mountRoadCar(document.querySelector('.track'), art.car, {
+      target: carStage,
+      stageTitles: stages.map(s => s.title),
+      // 차를 끌어다 놓은 단계에서 아직 안 끝낸 첫 문서(없으면 첫 문서)를 연다
+      onPick: (i) => {
+        const ids = (stages[i]?.docs ?? []).filter(id => byId[id]);
+        const id = ids.find(x => !isDone(x)) ?? ids[0];
+        if (!id) return;
+        saveCarStage(i);
+        location.hash = id;
+      },
+    });
+    // 링크를 누르면 차가 그 단계까지 운전해 간 뒤 이동
+    $('main').querySelectorAll('.stops a, .go-btn').forEach(a => a.onclick = e => {
+      const id = a.getAttribute('href').slice(1);
+      const p = posOf[id];
+      if (!p || !carCtl) return;
+      e.preventDefault();
+      carCtl.driveTo(p.si, () => { saveCarStage(p.si); location.hash = id; });
+    });
+  }
+  let carCtl = null;
+
+  /* 문서 */
+  function enhance(container) {
+    container.querySelectorAll('figure[data-rehype-pretty-code-figure] > pre').forEach(pre => {
+      const lang = pre.dataset.language;
+      const box = document.createElement('div');
+      box.className = 'code';
+      box.innerHTML = `<div class="code-bar"><span>${lang && lang !== 'plaintext' ? esc(lang) : 'text'}</span><button type="button">복사</button></div>`;
+      pre.replaceWith(box); box.appendChild(pre);
+      const btn = box.querySelector('button');
+      btn.onclick = () => {
+        const ok = () => { btn.textContent = '복사됨'; setTimeout(() => btn.textContent = '복사', 1500); };
+        const fallback = () => { const r = document.createRange(); r.selectNodeContents(pre); const s = getSelection(); s.removeAllRanges(); s.addRange(r); btn.textContent = '선택됨'; };
+        try { navigator.clipboard.writeText(pre.innerText).then(ok, fallback); } catch { fallback(); }
+      };
+    });
+    container.querySelectorAll('table').forEach(t => { const w = document.createElement('div'); w.className = 'table-wrap'; t.replaceWith(w); w.appendChild(t); });
+  }
+
+  let tocLinks = [];
+  let docTools = null;
+  function renderDoc(d, anchor, rerender) {
+    if (docTools) { docTools.destroy(); docTools = null; }
+    const p = posOf[d.id];
+    const prev = path[p.k - 1], next = path[p.k + 1];
+    const label = q => q.stage === p.stage ? '' : `${q.si + 1}단계 · `;
+    const h2 = d.headings.filter(h => h.depth === 2).length;
+    $('main').innerHTML = `<section class="doc-hero">
+        <span class="cloud c1"></span><span class="cloud c2"></span>
+        <div class="doc-hero-inner">
+          <p class="crumb"><a href="#home">로드맵</a><span class="sep">/</span><span>${p.si + 1}단계 ${esc(p.stage.title)}</span><span class="sep">/</span><span>${p.i + 1}/${p.n}</span></p>
+          <div class="sign doc-sign"><small>${p.si + 1}단계 · ${esc(p.stage.level)}</small><h1>${esc(d.title)}</h1></div>
+          ${d.description ? `<p class="desc">${esc(d.description)}</p>` : ''}
+          <p class="meta">읽는 데 약 ${d.minutes}분 · 섹션 ${h2}개</p>
+        </div>
+        ${art.skylineSmall}
+      </section>
+      <div class="wrap">
+      <article class="article">
+        <div class="prose" id="prose">${d.html}</div>
+        <div class="finish">
+          <p>${isDone(d.id) ? '완료한 문서입니다.' : '셀프 체크까지 답해봤다면 완료로 표시하세요.'}</p>
+          <button class="learn-btn ${isDone(d.id) ? 'on' : ''}" id="learnBtn">${dot(d.id)}${isDone(d.id) ? '학습 완료' : '완료로 표시'}</button>
+        </div>
+        <div class="mini-road" id="miniRoad" aria-hidden="true"><div class="car-runner">${art.car}</div></div>
+        <nav class="pager" aria-label="이전, 다음 문서">
+          ${prev ? `<a href="#${prev.id}"><small>이전 정류장</small><span>← ${esc(byId[prev.id].title)}</span></a>` : ''}
+          ${next ? `<a class="next" href="#${next.id}"><small>${next.stage !== p.stage ? `다음 구간 · ${next.si + 1}단계 ${esc(next.stage.title)}` : '다음 정류장'}</small><span>${esc(byId[next.id].title)} →</span></a>` : ''}
+        </nav>
+      </article>
+      <aside class="toc"><div class="toc-inner"><p class="toc-title">이 문서의 목차</p><ul>${
+        d.headings.map(h => `<li><a class="d${h.depth}" data-id="${esc(h.id)}" href="#${d.id}">${esc(h.text)}</a></li>`).join('')
+      }</ul></div></aside></div>`;
+    enhance($('prose'));
+    mountSims($('prose'));
+    const toggleThis = () => {
+      const v = !isDone(d.id); setDone(d.id, v);
+      const y = scrollY; renderDoc(d, null, true); window.scrollTo(0, y); renderSide();
+    };
+    $('learnBtn').onclick = toggleThis;
+    docTools = mountDocTools({ article: document.querySelector('.article'), key: d.id, isDone: () => isDone(d.id), toggleDone: toggleThis, skipResume: !!anchor || !!rerender });
+    document.querySelectorAll('.pager a').forEach(a => a.onclick = e => {
+      e.preventDefault();
+      const back = !a.classList.contains('next');
+      const road = $('miniRoad');
+      if (road.classList.contains('go')) return;
+      if (back) road.classList.add('back');
+      requestAnimationFrame(() => road.classList.add('go'));
+      const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      setTimeout(() => { location.hash = a.getAttribute('href').slice(1); }, reduced ? 0 : 850);
+    });
+    tocLinks = [...document.querySelectorAll('.toc a')];
+    tocLinks.forEach(a => a.onclick = e => { e.preventDefault(); scrollToId(a.dataset.id); });
+    // 본문 헤딩 링크는 해시 라우팅을 깨지 않도록 스크롤만
+    $('prose').querySelectorAll('a[href^="#"]').forEach(a => a.onclick = e => { e.preventDefault(); scrollToId(a.getAttribute('href').slice(1)); });
+    if (anchor) requestAnimationFrame(() => scrollToId(anchor, true)); else window.scrollTo(0, 0);
+    onScroll();
+  }
+  function scrollToId(id, instant) {
+    const el = document.getElementById(id);
+    if (el) window.scrollTo({ top: el.getBoundingClientRect().top + scrollY - 80, behavior: instant ? 'auto' : 'smooth' });
+  }
+
+  /* 라우팅: #문서id */
+  let pendingAnchor = null;
+  function route() {
+    const id = location.hash.slice(1);
+    const d = byId[id];
+    if (d) { if (carCtl) { carCtl.destroy(); carCtl = null; } renderDoc(d, pendingAnchor); } else { if (docTools) { docTools.destroy(); docTools = null; } window.scrollTo(0, 0); renderHome(); }
+    pendingAnchor = null;
+    document.title = d ? `${d.title} · 백엔드 학습 로드맵` : '백엔드 학습 로드맵';
+    renderSide();
+    document.body.classList.remove('nav-open');
+  }
+  addEventListener('hashchange', route);
+
+  /* 스크롤: 진행바 + 목차 */
+  function onScroll() {
+    const max = root.scrollHeight - innerHeight;
+    $('progress').style.width = byId[location.hash.slice(1)] && max > 0 ? Math.min(100, scrollY / max * 100) + '%' : '0';
+    if (!tocLinks.length) return;
+    let cur = tocLinks[0];
+    for (const a of tocLinks) {
+      const h = document.getElementById(a.dataset.id);
+      if (h && h.getBoundingClientRect().top < 130) cur = a; else if (h) break;
+    }
+    tocLinks.forEach(a => a.classList.toggle('active', a === cur));
+  }
+  addEventListener('scroll', onScroll, { passive: true });
+
+  /* 검색: 헤딩 단위 인덱스 */
+  // 검색 목록은 빌드 때 미리 만들어 둔 평문을 쓴다
+  const index = docs.flatMap(d => d.search.map(e => ({ ...e, doc: d })));
+  index.forEach(e => { e.text = e.text.replace(/\s+/g, ' ').trim(); e.lh = e.heading.toLowerCase(); e.lt = e.text.toLowerCase(); e.ld = e.doc.title.toLowerCase(); });
+
+  let results = [], active = 0;
+  const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const hl = (text, terms) => {
+    if (!terms.length) return esc(text);
+    const re = new RegExp(`(${terms.map(reEsc).join('|')})`, 'gi');
+    return text.split(re).map((p, i) => i % 2 ? `<mark>${esc(p)}</mark>` : esc(p)).join('');
+  };
+  function runSearch() {
+    const q = $('q').value.trim();
+    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+    results = [];
+    if (terms.length) {
+      for (const e of index) {
+        let score = 0, ok = true;
+        for (const t of terms) {
+          const a = e.lh.includes(t), b = e.ld.includes(t), c = e.lt.includes(t);
+          if (!a && !b && !c) { ok = false; break; }
+          score += (a ? 10 : 0) + (b ? 4 : 0) + (c ? 1 : 0);
+        }
+        if (ok) results.push({ e, score });
+      }
+      results.sort((x, y) => y.score - x.score);
+      results = results.slice(0, 20);
+    }
+    active = 0;
+    const ul = $('results');
+    if (!q) { ul.innerHTML = '<li class="empty">찾을 개념을 입력하세요. 위아래 화살표로 이동, Enter로 열기</li>'; return; }
+    if (!results.length) { ul.innerHTML = `<li class="empty">“${esc(q)}”가 들어간 내용이 없습니다. 다른 표현으로 찾아보세요.</li>`; return; }
+    ul.innerHTML = results.map(({ e }, i) => {
+      const pos = e.lt.indexOf(terms[0]); const st = Math.max(0, pos - 40);
+      const snip = pos >= 0 ? (st ? '…' : '') + e.text.slice(st, st + 140) + '…' : e.text.slice(0, 140);
+      const sp = posOf[e.doc.id];
+      return `<li><button type="button" data-i="${i}" class="${i === active ? 'active' : ''}">
+        <div class="path">${sp ? `${sp.si + 1}단계 ${esc(sp.stage.title)} / ` : ''}${esc(e.doc.title)}</div>
+        <div class="h">${hl(e.heading, terms)}</div><div class="s">${hl(snip, terms)}</div></button></li>`;
+    }).join('');
+    ul.querySelectorAll('button').forEach(b => { b.onclick = () => go(+b.dataset.i); b.onmouseenter = () => { active = +b.dataset.i; mark(); }; });
+  }
+  const mark = () => $('results').querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', i === active));
+  function go(i) {
+    const r = results[i]; if (!r) return;
+    closeSearch();
+    if (location.hash.slice(1) === r.e.doc.id) { if (r.e.anchor) scrollToId(r.e.anchor); }
+    else { pendingAnchor = r.e.anchor; location.hash = r.e.doc.id; }
+  }
+  function openSearch() { $('modal').hidden = false; $('q').value = ''; runSearch(); setTimeout(() => $('q').focus(), 0); }
+  function closeSearch() { $('modal').hidden = true; }
+  $('searchBtn').onclick = openSearch;
+  $('modal').onclick = e => { if (e.target === $('modal')) closeSearch(); };
+  $('q').oninput = runSearch;
+  $('q').onkeydown = e => {
+    if (e.key === 'Escape') closeSearch();
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(active + 1, results.length - 1); mark(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); mark(); }
+    else if (e.key === 'Enter') go(active);
+  };
+  addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openSearch(); }
+    else if (e.key === '/' && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)) { e.preventDefault(); openSearch(); }
+  });
+
+  route();
+})();
+</script>
