@@ -2,7 +2,7 @@
 
 JavaScript 기초부터 TypeScript, NestJS 설계, 면접 대비까지 8단계로 공부하는 개인 학습 사이트입니다.
 
-배포 주소: https://backend-study-roadmap.vercel.app
+배포 주소: https://backend-study-roadma.vercel.app
 
 ## 특징
 
